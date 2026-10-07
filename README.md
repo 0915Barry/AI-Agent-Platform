@@ -6,12 +6,11 @@
 
 ## 项目文档
 
-规划、架构和部署设计统一存放在 [`docs/`](./docs/README.md)：
+规划和架构设计存放在 [`docs/`](./docs/README.md)，所有环境搭建与运行说明只维护在本 README：
 
 - [企划书](./docs/企划书.md)
 - [架构与实现方案汇报](./docs/架构与实现方案汇报.md)
 - [服务器单机 MVP 架构设计图](./docs/服务器单机MVP架构设计图.md)
-- [Windows 环境搭建与排错](./docs/Windows环境搭建.md)
 
 ## 当前进度
 
@@ -46,33 +45,120 @@
 - VMware 向 Ubuntu 暴露 VT-x/EPT 或 AMD-V/RVI，Ubuntu 获得可读写的 `/dev/kvm`
 - Ubuntu VM 内通过 `run-linux.sh` 执行全部构建和验收
 
-Windows 不使用 UTM；UTM 官方只面向 Apple 平台。Windows 也不直接运行 Firecracker，Firecracker 始终运行在 Linux KVM 环境中。详细的兼容性边界、公司设备安全注意事项和逐步命令见 [Windows 环境搭建](./docs/Windows环境搭建.md)。在第一台真实 Windows 设备完成全部测试前，不把 Windows 路径标记为正式支持。
+Windows 不使用 UTM，也不直接运行 Firecracker。两个平台最终都把 Firecracker 放在具有 `/dev/kvm` 的 Ubuntu VM 内：
 
-## macOS 新环境首次使用
-
-先在 UTM 中安装 ARM64 Ubuntu，并安装 OpenSSH Server。在 Ubuntu 中运行 `hostname -I` 获取 VM 地址。
-
-然后在 macOS 的仓库根目录运行：
-
-```bash
-./run.sh setup <UTM-Linux-IP> [Linux用户名]
+```text
+macOS Apple Silicon                 Windows x86_64
+└── UTM + Apple Virtualization      └── VMware Workstation
+    └── Ubuntu ARM64                    └── Ubuntu AMD64
+        └── Firecracker                     └── Firecracker
+            └── Agent microVM                  └── Agent microVM
 ```
 
-如果安装时使用了推荐用户名 `agentdev`，可以省略用户名：
+在第一台真实 Windows 设备完成全部测试前，Windows 路径仍标记为“待实机验收”。
+
+## macOS + UTM 完整环境搭建
+
+### 1. 准备宿主机
+
+要求 Apple Silicon Mac、至少 16 GB 内存、macOS 15 或更高版本，以及 UTM 4.6 或更高版本。执行：
 
 ```bash
-./run.sh setup <UTM-Linux-IP>
+sw_vers
+uname -m
+system_profiler SPHardwareDataType | sed -n '1,20p'
+/Applications/UTM.app/Contents/MacOS/utmctl version
 ```
 
-`setup` 会自动完成：
+`uname -m` 必须输出 `arm64`。下载 Ubuntu Server 24.04 ARM64 ISO，例如：
 
-1. 保存本机连接配置到被 Git 忽略的 `.env`。
-2. 检查 macOS、CPU 架构和 UTM。
-3. 通过 SSH 检查 Linux、架构和 `/dev/kvm`。
-4. 同步仓库到 Linux VM。
-5. 安装仓库固定版本的 Firecracker 和 jailer。
+```text
+ubuntu-24.04.x-live-server-arm64.iso
+```
 
-安装完成后运行最小 microVM 验收：
+不要使用 AMD64/x86_64 ISO。
+
+### 2. 创建 UTM Ubuntu VM
+
+1. 在 UTM 中选择“新建虚拟机 → Virtualize → Linux”。
+2. 使用 Apple Virtualization，并选择“Boot from ISO image”。不要使用 QEMU Emulation。
+3. 建议分配 4 个 vCPU、8 GB 内存和至少 64 GB 虚拟磁盘。
+4. 网络使用默认 Shared Network/NAT。
+5. Shared Directory 留空；Firecracker 镜像、jail 和数据盘必须位于 Ubuntu 原生 ext4 文件系统。
+6. 选择 ARM64 Ubuntu Server ISO 并启动安装。
+
+### 3. 安装 Ubuntu Server
+
+安装器建议选择：
+
+- 安装类型：`Ubuntu Server`，不必选择 minimized。
+- 第三方驱动：不勾选。
+- Proxy address：没有明确代理时留空。
+- Ubuntu mirror：使用通过测试的默认镜像。
+- 存储：`Use an entire disk`；LVM 可以保留，开发 VM 不必启用 LUKS。
+- Server name：例如 `agent-platform-dev`。
+- 用户名：推荐 `agentdev`。
+- SSH：勾选 `Install OpenSSH server`；密码认证仅用于本地开发网络。
+- Featured Server Snaps：全部不选。
+
+安装结束后重启，确保 UTM 已弹出安装 ISO，不再从 ISO 启动。
+
+### 4. 检查 Ubuntu 与嵌套 KVM
+
+在 Ubuntu 终端执行：
+
+```bash
+uname -m
+cat /etc/os-release
+ls -l /dev/kvm
+groups
+sudo dmesg | grep -Ei 'kvm|hyp|el2|virtualization'
+test -r /dev/kvm && test -w /dev/kvm && echo 'KVM access OK'
+```
+
+应看到 `aarch64`、Ubuntu 24.04、存在 `/dev/kvm`，并最终输出 `KVM access OK`。如果设备存在但用户无权限：
+
+```bash
+sudo usermod -aG kvm "$USER"
+```
+
+随后完整注销 Ubuntu 会话并重新登录。
+
+### 5. 获取 VM 地址并测试 SSH
+
+在 Ubuntu 中运行：
+
+```bash
+hostname -I
+```
+
+记下类似 `192.168.64.3` 的地址。在 macOS 终端测试：
+
+```bash
+ssh agentdev@<UTM-Linux-IP>
+```
+
+确认可以登录后输入 `exit` 返回 macOS。VM 重启后 IP 可能变化；届时重新运行后面的 `configure` 即可。
+
+### 6. 在 macOS 克隆并初始化环境
+
+仓库保留在 macOS，`run.sh` 会通过 SSH/rsync 将源码同步到 Ubuntu 的 `/opt/ai-agent-platform`：
+
+```bash
+git clone https://github.com/0915Barry/AI-Agent-Platform.git
+cd AI-Agent-Platform
+./run.sh setup <UTM-Linux-IP> agentdev
+```
+
+`setup` 会保存被 Git 忽略的本机 `.env`，检查 macOS/UTM 和 Ubuntu/KVM，同步仓库，并安装固定版本的 Firecracker 与 jailer。以后 VM 地址变化时运行：
+
+```bash
+./run.sh configure <新IP> agentdev
+```
+
+### 7. 启动最小 microVM
+
+仍在 macOS 仓库根目录运行：
 
 ```bash
 ./run.sh microvm-smoke-test
@@ -84,11 +170,92 @@ Windows 不使用 UTM；UTM 官方只面向 Apple 平台。Windows 也不直接�
 PASS: Firecracker booted the aarch64 microVM and reached guest init
 ```
 
-## Windows 新环境首次使用
+## Windows + VMware 完整环境搭建
 
-推荐让 Windows 只作为 VMware 宿主，把 Git 仓库和所有命令放进 Ubuntu VM 的原生 Linux 文件系统。这样不依赖 WSL、Git Bash、Windows `rsync` 或未经实机验证的 PowerShell 包装层。
+### 1. 明确支持边界
 
-在 Ubuntu VM 中克隆仓库后使用：
+当前试点仅支持 x86_64 Windows 10/11，不支持 Windows on ARM。Windows 只是最外层宿主；不要直接在 Windows、WSL2 或 Git Bash 中运行 Firecracker 和项目 Shell 脚本。
+
+如果公司策略不允许 VMware 获得嵌套虚拟化能力，应改用裸机或远程 Linux KVM 服务器。不要擅自关闭公司设备的 Hyper-V、VBS 或“内存完整性”。参考：
+
+- [Firecracker Getting Started](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md)
+- [Microsoft Hyper-V Nested Virtualization](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/user-guide/nested-virtualization)
+- [Broadcom VMware 嵌套虚拟化排错](https://knowledge.broadcom.com/external/article/389469/virtualized-intel-vtxept-is-not-supporte.html)
+
+### 2. 检查 Windows 与硬件
+
+要求 Intel VT-x/EPT 或 AMD-V/RVI 已在 BIOS/UEFI 中开启，建议宿主机至少 16 GB 内存。先在“任务管理器 → 性能 → CPU”确认“虚拟化：已启用”，也可以在命令提示符运行：
+
+```powershell
+systeminfo.exe
+```
+
+安装 VMware Workstation，并下载 Ubuntu Server 24.04 AMD64 ISO：
+
+```text
+ubuntu-24.04.x-live-server-amd64.iso
+```
+
+不要下载 ARM64 ISO。
+
+### 3. 创建 VMware Ubuntu VM
+
+1. 创建 Ubuntu 24.04 64-bit VM，网络建议使用 NAT。
+2. 完全关闭 VM，打开 `VM Settings → Hardware → Processors`。
+3. 勾选 `Virtualize Intel VT-x/EPT or AMD-V/RVI`。
+4. 建议分配 4 个 vCPU、8 GB 内存和至少 80 GB 虚拟磁盘。
+5. 仓库、Firecracker 镜像和数据盘必须放在 Ubuntu 原生 ext4 磁盘；不要放在 VMware Shared Folders、SMB 共享或 Windows 挂载目录。
+6. 挂载 AMD64 Ubuntu Server ISO 并启动安装。
+
+如果 VMware 报 `Virtualized Intel VT-x/EPT is not supported on this platform`，通常是 Hyper-V/VBS 正在占用虚拟化能力。公司设备先联系 IT，再按 Broadcom 官方文档处理；关闭这些功能可能影响 WSL2、Windows Sandbox 和安全保护。
+
+### 4. 安装 Ubuntu Server
+
+Ubuntu 安装选项与 macOS 路径保持一致：使用普通 `Ubuntu Server`、Proxy 留空、整盘安装、可保留 LVM、安装 OpenSSH Server、Featured Server Snaps 全部不选。推荐用户名仍为 `agentdev`。
+
+### 5. 检查 Ubuntu 与嵌套 KVM
+
+登录 Ubuntu VM，执行：
+
+```bash
+uname -m
+cat /etc/os-release
+grep -Eoc '(vmx|svm)' /proc/cpuinfo
+ls -l /dev/kvm
+groups
+test -r /dev/kvm && test -w /dev/kvm && echo 'KVM access OK'
+```
+
+正确结果必须同时满足：
+
+- `uname -m` 输出 `x86_64`。
+- `vmx`/`svm` 计数大于 `0`。
+- `/dev/kvm` 存在。
+- 最后一条输出 `KVM access OK`。
+
+如仅缺少权限，运行：
+
+```bash
+sudo usermod -aG kvm "$USER"
+```
+
+随后完整注销并重新登录。如果 `/dev/kvm` 不存在，应回到 VMware/BIOS 检查，不要继续执行项目脚本。
+
+### 6. 在 Ubuntu 原生磁盘中克隆仓库
+
+Windows 路径的 Git 和项目命令全部在 Ubuntu VM 终端执行：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git
+git clone https://github.com/0915Barry/AI-Agent-Platform.git
+cd AI-Agent-Platform
+chmod +x run-linux.sh scripts/linux/*.sh scripts/guest/*.sh
+```
+
+Git clone 通常会保留可执行位；`chmod` 用于兼容 ZIP 解压或错误的 Git 文件模式设置。不要在 Ubuntu VM 内运行面向 Mac 控制端的 `run.sh`。
+
+### 7. 检查环境并启动最小 microVM
 
 ```bash
 ./run-linux.sh doctor
@@ -96,61 +263,70 @@ PASS: Firecracker booted the aarch64 microVM and reached guest init
 ./run-linux.sh microvm-smoke-test
 ```
 
-确认最小 microVM 通过后，再按照 [Windows 环境搭建](./docs/Windows环境搭建.md) 给出的顺序运行后续测试。Windows 常见的 Ubuntu VM 是 `x86_64`，脚本会自动选择 AMD64 Ubuntu、Node.js x64 以及经过 SHA-256 校验的 x86_64 Firecracker CI 内核和 initramfs；不会下载 ARM64 构建物。
+只有 `doctor` 输出以下内容才继续：
 
-## macOS 控制端命令
-
-```bash
-./run.sh doctor
-./run.sh configure <UTM-Linux-IP> [Linux用户名]
-./run.sh vm-doctor
-./run.sh sync
-./run.sh install-firecracker
-./run.sh prepare-microvm
-./run.sh microvm-smoke-test
-./run.sh build-rootfs
-./run.sh runtime-smoke-test
-./run.sh security-smoke-test
-./run.sh network-smoke-test
-./run.sh persistence-smoke-test
-./run.sh gateway-smoke-test
-./run.sh lifecycle-smoke-test
-./run.sh configure-deepseek
-./run.sh deepseek-e2e-test
-./run.sh setup <UTM-Linux-IP> [Linux用户名]
+```text
+KVM access: OK
+Linux/KVM checks passed
 ```
+
+最小 microVM 成功标志中的架构应为 `x86_64`。脚本会自动选择 AMD64 Ubuntu、Node.js x64 和经过校验的 x86_64 Firecracker 构建物，不会下载 ARM64 文件。
+
+## 两个平台的完整验收顺序
+
+最小 microVM 成功后按顺序执行。上一项失败时不要继续下一项：
+
+| 阶段 | macOS 仓库根目录 | Windows 的 Ubuntu VM 仓库目录 |
+|---|---|---|
+| 环境检查 | `./run.sh doctor`、`./run.sh vm-doctor` | `./run-linux.sh doctor` |
+| 安装 Firecracker | 已包含在 `setup` | 已包含在 `setup` |
+| 最小 microVM | `./run.sh microvm-smoke-test` | `./run-linux.sh microvm-smoke-test` |
+| Pi 运行镜像 | `./run.sh runtime-smoke-test` | `./run-linux.sh runtime-smoke-test` |
+| 权限与 jailer | `./run.sh security-smoke-test` | `./run-linux.sh security-smoke-test` |
+| 网络策略 | `./run.sh network-smoke-test` | `./run-linux.sh network-smoke-test` |
+| 持久化 | `./run.sh persistence-smoke-test` | `./run-linux.sh persistence-smoke-test` |
+| Tool Gateway | `./run.sh gateway-smoke-test` | `./run-linux.sh gateway-smoke-test` |
+| 生命周期 | `./run.sh lifecycle-smoke-test` | `./run-linux.sh lifecycle-smoke-test` |
+| 保存 DeepSeek Key | `./run.sh configure-deepseek` | `./run-linux.sh configure-deepseek` |
+| DeepSeek 端到端 | `./run.sh deepseek-e2e-test` | `./run-linux.sh deepseek-e2e-test` |
+
+第一次 `runtime-smoke-test` 会从固定 Ubuntu 快照构建完整 rootfs，下载较多基础包并安装 Node.js 和 Pi Agent，耗时明显较长。构建指纹不变时后续测试会复用 `/srv/fc/artifacts/agent-rootfs.ext4`。
+
+### 命令作用
 
 | 命令 | 作用 |
 |---|---|
-| `doctor` | 检查 macOS、ARM64 和 UTM |
-| `configure` | 生成本机 `.env`，不提交到 Git |
-| `vm-doctor` | 通过 SSH 检查 Linux 和 KVM |
-| `sync` | 将源代码同步到 Linux VM 的部署目录 |
-| `install-firecracker` | 幂等安装固定版本的 Firecracker |
-| `prepare-microvm` | 下载并校验与 Linux VM CPU 架构匹配的测试内核和 initramfs |
+| `doctor` | 检查当前控制端或 Linux/KVM 环境 |
+| `configure`（仅 `run.sh`） | 保存 Mac 到 UTM Linux 的连接设置 |
+| `sync`（仅 `run.sh`） | 通过 rsync 将源码同步到 UTM Linux |
+| `install-firecracker` | 幂等安装固定版本 Firecracker 与 jailer |
+| `prepare-microvm` | 下载并校验与 CPU 架构匹配的内核和 initramfs |
 | `microvm-smoke-test` | 启动最小 microVM 并验证 guest init |
-| `build-rootfs` | 构建固定版本的 Ubuntu、Node.js 与 Pi Agent rootfs |
-| `runtime-smoke-test` | 启动正式 rootfs，验证 Node、Pi Agent 与非 root 用户 |
-| `security-smoke-test` | 验证实例内权限和 Firecracker jailer 加固 |
+| `build-rootfs` | 构建固定 Ubuntu、Node.js 和 Pi Agent rootfs |
+| `runtime-smoke-test` | 验证 rootfs、Node、Pi Agent 和非 root 用户 |
+| `security-smoke-test` | 验证 guest 权限与 Firecracker jailer 加固 |
 | `network-smoke-test` | 验证 TAP、HTTPS 出站和私有网络默认拒绝 |
-| `persistence-smoke-test` | 验证只读系统盘和跨 microVM 重建的数据持久化 |
-| `gateway-smoke-test` | 验证宿主侧凭据注入、路由白名单、脱敏审计和上游隔离 |
-| `lifecycle-smoke-test` | 以 6 秒阈值验证心跳续期、长任务保护、空闲回收、重启和显式销毁 |
-| `configure-deepseek` | 隐藏输入并将 DeepSeek API Key 保存到 Linux 用户私有配置目录，不进入仓库 |
-| `deepseek-e2e-test` | 让 Pi Agent 通过 Tool Gateway 调用 DeepSeek 并完成真实 `read` 工具调用 |
-| `setup` | 完成首次配置、检查、同步与 Firecracker 安装 |
+| `persistence-smoke-test` | 验证只读系统盘与独立持久化数据盘 |
+| `gateway-smoke-test` | 验证宿主侧凭据注入、脱敏审计和上游隔离 |
+| `lifecycle-smoke-test` | 以 6 秒测试阈值验证心跳、空闲回收、重启和销毁 |
+| `configure-deepseek` | 隐藏输入并将 API Key 保存到 Linux 用户私有目录 |
+| `deepseek-e2e-test` | 让 Pi Agent 经 Tool Gateway 调用 DeepSeek 并执行 `read` 工具 |
 
-Ubuntu VM 内的等价入口是 `./run-linux.sh <command>`。它不进行 SSH 和仓库同步，适合 Windows 同事直接在 Ubuntu VM 中使用；支持的命令可运行 `./run-linux.sh help` 查看。
+运行 `./run.sh help` 或 `./run-linux.sh help` 可以查看对应入口支持的完整命令。
 
 ## Agent 运行镜像
 
-最小 microVM 验收通过后，在 macOS 仓库根目录运行：
+最小 microVM 验收通过后运行：
 
 ```bash
+# macOS 仓库根目录
 ./run.sh runtime-smoke-test
+
+# Windows 的 Ubuntu VM 仓库目录
+./run-linux.sh runtime-smoke-test
 ```
 
-该命令会在 UTM Linux 中完成构建并启动验收。第一次需要下载 Ubuntu 包、Node.js 和 Pi Agent，耗时会明显长于最小启动测试；相同构建指纹再次执行时会复用已验证的镜像。Ubuntu 系统包来自配置文件中固定日期的官方快照，构建完成后还会保存实际安装的软件包清单。
+该命令会在 Ubuntu KVM 宿主中完成构建并启动验收。第一次需要下载 Ubuntu 包、Node.js 和 Pi Agent，耗时会明显长于最小启动测试；相同构建指纹再次执行时会复用已验证的镜像。Ubuntu 系统包来自配置文件中固定日期的官方快照，构建完成后还会保存实际安装的软件包清单。
 
 Ubuntu 快照服务偶尔会出现单个软件包的瞬时下载失败。构建脚本会自动重试三次；如果整个命令仍然失败，可以直接重新执行，已校验的 Node.js 和 Pi Agent 下载缓存会被复用，未完成的 rootfs 不会替换已有镜像。
 
@@ -176,19 +352,23 @@ AGENT_RUNTIME_READY node=v22.19.0 pi=1.0.0 uid=1001
 
 这证明固定版本的 Ubuntu rootfs 可以重建，Firecracker 可以从该 rootfs 启动，且 Node.js 与 Pi Agent 能够由非 root 的 `pi` 用户执行。当前仍属于功能基线：rootfs 暂时可写，Firecracker 暂时由测试脚本直接启动，jailer、网络、数据盘和生命周期管理尚未启用。
 
-## 下一里程碑：权限与 jailer
+## M4 权限与 jailer
 
 在接入网络前先完成两层安全验收：
 
 1. microVM 内部：系统运行时归 `root:root`，`pi` 只能写 `/workspace` 与 `/home/pi`，无法读取 `/etc/shadow` 或覆盖 Node/Pi。
-2. UTM Linux 上：使用专用 `firecracker` 用户和 jailer 启动 VMM，验证 chroot、seccomp、零 capabilities、空环境变量、文件描述符上限和设备访问范围。
+2. Ubuntu KVM 宿主上：使用专用 `firecracker` 用户和 jailer 启动 VMM，验证 chroot、seccomp、零 capabilities、空环境变量、文件描述符上限和设备访问范围。
 
 “隔离”指实例无法访问宿主和其他租户资源，不要求实例无法识别自己运行在虚拟化环境中。
 
-在 macOS 仓库根目录运行：
+运行对应平台命令：
 
 ```bash
+# macOS
 ./run.sh security-smoke-test
+
+# Windows 的 Ubuntu VM
+./run-linux.sh security-smoke-test
 ```
 
 成功时会同时输出 guest 权限与 jailer 进程验收标志：
@@ -213,10 +393,14 @@ JAILER_SECURITY_READY uid=999 gid=988 seccomp=all:4 capabilities=0 environment=0
 
 ## M5 网络与出站治理
 
-在 macOS 仓库根目录运行：
+运行对应平台命令：
 
 ```bash
+# macOS
 ./run.sh network-smoke-test
+
+# Windows 的 Ubuntu VM
+./run-linux.sh network-smoke-test
 ```
 
 测试会自动创建临时 TAP 和独立 `/30` 网段，自动识别 UTM Linux 的默认出口网卡，并通过独立 nftables 表仅允许 DNS 与 HTTPS 出站。RFC1918、链路本地地址、其他未授权端口以及主动进入 guest 的连接默认拒绝。规则只匹配测试 TAP，不修改 SSH 所在的普通 INPUT 流量；成功、失败或中断时都会清理 TAP、临时 jail、防火墙表并恢复原 IP 转发状态。
@@ -243,10 +427,14 @@ NETWORK_POLICY_READY tap=fc-tap-smoke subnet=172.31.254.0/30 egress=enp0s1 priva
 
 ## M6 只读系统盘与持久化数据盘
 
-在 macOS 仓库根目录运行：
+运行对应平台命令：
 
 ```bash
+# macOS
 ./run.sh persistence-smoke-test
+
+# Windows 的 Ubuntu VM
+./run-linux.sh persistence-smoke-test
 ```
 
 测试会创建一个临时工作区数据盘，使用只读 rootfs 启动第一台 jailed microVM 并由 `pi` 写入随机标记；随后停止 VMM、删除临时 jail、检查数据盘，再创建第二台 jailed microVM 挂载同一数据盘并读取标记。系统盘写入必须失败，工作区写入必须成功。
@@ -277,10 +465,14 @@ PERSISTENCE_POLICY_READY rootfs=readonly data_volume=/srv/fc/volumes/smoke/persi
 
 ## M7 Tool Gateway 与凭据外置
 
-在 macOS 仓库根目录运行：
+运行对应平台命令：
 
 ```bash
+# macOS
 ./run.sh gateway-smoke-test
+
+# Windows 的 Ubuntu VM
+./run-linux.sh gateway-smoke-test
 ```
 
 该测试不会使用真实模型密钥，也不会产生模型费用。脚本会在 UTM Linux 上生成一次性随机测试凭据，并以 `0400` 权限仅交给专用 `agent-gateway` 用户；microVM 内只有无效占位凭据。Tool Gateway 只监听测试 TAP 地址，只允许 `/v1/chat/completions` 路由，并在转发给仅监听 loopback 的模拟上游时注入真实测试凭据。
@@ -317,10 +509,14 @@ TOOL_GATEWAY_READY bind=172.31.253.1:18080 credential=host-file:0400 upstream=lo
 
 ## M8 实例生命周期与空闲回收
 
-第一次验收在 macOS 仓库根目录运行：
+运行对应平台命令：
 
 ```bash
+# macOS
 ./run.sh lifecycle-smoke-test
+
+# Windows 的 Ubuntu VM
+./run-linux.sh lifecycle-smoke-test
 ```
 
 本次测试按约定使用 6 秒空闲阈值。测试会先启动实例并写入随机数据，然后验证 `.busy` 长任务标记能够阻止回收、心跳能够刷新最后活动时间；停止发送心跳后，回收器必须自动关闭 Firecracker，并只清理该实例登记的 jail、TAP 和 nftables 表。随后使用同一数据盘重启实例，确认数据仍然存在，最后验证只有显式 `destroy` 才会删除测试数据盘。
@@ -410,6 +606,35 @@ DEEPSEEK_E2E_READY model=deepseek-flash gateway=172.31.252.1:18082 credential=ho
 这证明 Pi Agent 能通过自定义 OpenAI-compatible provider 配置调用 DeepSeek，并能完成真实工具调用；供应商密钥只存在于 Ubuntu 宿主侧，microVM 仅持有占位凭据且无法绕过 Gateway 直连供应商。实际随机标记不作为固定测试数据写入文档。
 
 配置格式与接口以 [Pi 自定义模型文档](https://pi.dev/docs/latest/models) 和 [DeepSeek API 文档](https://api-docs.deepseek.com/guides/codex) 为准；仓库仍固定 Pi Agent 版本，升级时必须重新执行全部验收。
+
+## 跨平台常见错误
+
+| 平台 | 现象 | 最可能原因 | 处理 |
+|---|---|---|---|
+| macOS | `utmctl` 报参数连在一起 | 多条命令粘贴时缺少换行 | 每条命令单独执行，或确认命令之间有换行 |
+| macOS | SSH 卡住或连接超时 | VM IP 变化、OpenSSH 未安装或 VM 网络异常 | 在 Ubuntu 重跑 `hostname -I`，用 `ssh 用户名@IP` 单独验证，再执行 `./run.sh configure` |
+| macOS | 脚本反复要求密码 | 当前使用 SSH 密码和远程 `sudo`，属于预期行为 | MVP 阶段可继续输入；后续可配置 SSH Key 和受限 sudo 规则 |
+| Windows | VMware 无法启用嵌套虚拟化 | Hyper-V、VBS 或内存完整性占用 VT-x/AMD-V | 公司设备先联系 IT，再按 VMware/Broadcom 官方文档排查 |
+| 两者 | `/dev/kvm` 不存在 | 外层虚拟机未暴露嵌套虚拟化，或 BIOS/虚拟化引擎配置不正确 | 停止项目脚本，回到 UTM/VMware 与 BIOS 设置检查 |
+| 两者 | `/dev/kvm` 存在但权限失败 | 当前用户不在 `kvm` 组，或新组尚未生效 | `sudo usermod -aG kvm "$USER"`，完整注销并重新登录 |
+| Windows | `uname -m` 输出 `aarch64` | ISO/设备架构选择错误 | 当前 Windows 路径只支持 x86_64 Windows + Ubuntu AMD64 |
+| 两者 | hard link 或 cross-device 错误 | jail、镜像或数据盘跨文件系统/位于共享目录 | 使用 Ubuntu VM 原生 ext4 磁盘，不使用 UTM/VMware 共享目录 |
+| 两者 | 出现大量 `I: Retrieving ...` | rootfs 构建指纹变化，正在重新构建最小 Ubuntu | 等待本次完成；指纹不变时下次会显示 `Verified existing runtime rootfs` |
+| 两者 | Ubuntu snapshot 单包下载失败 | 官方快照服务瞬时失败 | 脚本会自动重试三次；最终失败后重新运行同一命令 |
+| 两者 | DeepSeek 返回 401/403 | API Key 无效、过期或账户权限不足 | 重新运行 `configure-deepseek`，不要把 Key 写进 `.env` 或命令参数 |
+| 两者 | `Unknown command` | 本地仓库或同步到 VM 的代码版本过旧 | `git pull` 后重试；macOS 路径会在命令开始时自动 `sync` |
+
+Windows 首台试点设备应保存以下信息和每个阶段最后的 `PASS`/`*_READY` 行：
+
+```bash
+uname -a
+cat /etc/os-release
+ls -l /dev/kvm
+groups
+sudo dmesg | grep -Ei 'kvm|vmx|svm|virtualization' | tail -n 50
+```
+
+全部通过后，才能把 Windows 支持状态从“待实机验收”更新为“已验证”。
 
 ## 可配置参数
 
