@@ -12,17 +12,17 @@
 - [架构与实现方案汇报](./docs/架构与实现方案汇报.md)
 - [服务器单机 MVP 架构设计图](./docs/服务器单机MVP架构设计图.md)
 
-## 新同事快速开始
+## 快速开始
 
-新同事**不需要**从 M0 到 M11 逐项运行。里程碑命令是底层研发、故障定位和
-回归测试入口；正常接入只使用 `bootstrap → configure-deepseek → verify → start`。
+首次部署**不需要**从 M0 到 M11 逐项运行。里程碑命令是底层研发、故障定位和
+回归测试入口；首次运行只使用 `bootstrap → configure-deepseek → verify → start`。
 
 开始前仍需人工创建一台支持嵌套虚拟化的 Ubuntu 24.04 VM：Mac 使用 UTM +
 Apple Virtualization + ARM64 Ubuntu，Windows x86_64 使用 VMware Workstation +
 AMD64 Ubuntu。VM 必须存在可读写的 `/dev/kvm`，并将仓库/镜像放在 Ubuntu 原生
 ext4 磁盘中。这部分涉及宿主 BIOS、公司安全策略和虚拟机安装，仓库不能自动代办。
 
-### macOS 同事
+### macOS 首次部署
 
 在 Mac 克隆仓库后执行：
 
@@ -36,7 +36,7 @@ cd AI-Agent-Platform
 # 隐藏输入并把 Key 保存到 Ubuntu VM，不写入仓库或 microVM
 ./run.sh configure-deepseek
 
-# 新机器建议只执行一次完整端到端验收
+# 首次部署建议执行一次完整端到端验收
 ./run.sh verify
 
 # 日常开发只启动长期运行的控制面
@@ -46,9 +46,9 @@ cd AI-Agent-Platform
 
 结束开发时运行 `./run.sh stop`。停止控制面不会删除实例数据盘。
 
-### Windows 同事
+### Windows + VMware 首次部署
 
-Windows 同事在 VMware 的 Ubuntu VM 内克隆仓库并执行：
+在 VMware 的 Ubuntu VM 内克隆仓库并执行：
 
 ```bash
 git clone https://github.com/0915Barry/AI-Agent-Platform.git
@@ -333,7 +333,7 @@ Linux/KVM checks passed
 
 最小 microVM 成功标志中的架构应为 `x86_64`。脚本会自动选择 AMD64 Ubuntu、Node.js x64 和经过校验的 x86_64 Firecracker 构建物，不会下载 ARM64 文件。
 
-## 开发者分层验收（新同事无需逐项执行）
+## 开发者分层验收（仅用于回归与排错）
 
 最小 microVM 成功后按顺序执行。上一项失败时不要继续下一项：
 
@@ -743,7 +743,7 @@ CONTROL_PLANE_READY bind=127.0.0.1:18090 storage=sqlite runtime=firecracker idle
 ./run-linux.sh control-plane-status
 ```
 
-Windows 同事可以直接在 Ubuntu VM 中请求 `http://127.0.0.1:18090`。macOS 上需要另开一个终端建立 SSH 隧道：
+Windows 环境可以直接在 Ubuntu VM 中请求 `http://127.0.0.1:18090`。macOS 上需要另开一个终端建立 SSH 隧道：
 
 ```bash
 ssh -N -L 18090:127.0.0.1:18090 agentdev@<UTM-Linux-IP>
