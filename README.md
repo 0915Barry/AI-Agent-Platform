@@ -27,7 +27,7 @@
 | M8 | 实例生命周期与空闲回收 | ✅ 已通过，正式阈值 5 分钟 |
 | M9 | Pi Agent → Tool Gateway → DeepSeek 真实联调 | ✅ 已通过 |
 | M10 | HTTP 控制面管理真实 microVM 生命周期 | ✅ 已通过 |
-| M11 | 控制面向 Pi Agent 下发任务并经 DeepSeek 返回结果 | ⏳ 已实现，待当前 ARM64 环境实机验收 |
+| M11 | 控制面向 Pi Agent 下发任务并经 DeepSeek 返回结果 | ✅ 已通过 |
 
 ## 当前支持范围
 
@@ -746,7 +746,21 @@ PASS: control plane completed a real Pi Agent task through DeepSeek
 AGENT_TASK_READY transport=http-poll events=ordered gateway=isolated persistence=preserved idle_timeout=300s
 ```
 
-在实际出现这两行之前，M11 保持“待实机验收”，不能视为完成。
+### M11 验收结果
+
+已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境中完成真实验收：
+
+```text
+Starting managed Pi Agent microVM with isolated Gateway and task bridge...
+Restarting the managed instance with a host-seeded persistent marker...
+PASS: control plane completed a real Pi Agent task through DeepSeek
+AGENT_TASK_READY transport=http-poll events=ordered gateway=isolated persistence=preserved idle_timeout=300s
+```
+
+这证明控制面能够向真实 microVM 内的 Pi Agent 下发任务；Pi 只能通过宿主 Tool
+Gateway 使用 DeepSeek，并能读取 prompt 中未知的工作区随机标记。停止并重启计算
+实例后，同一数据盘内容仍然保留，任务事件按 `queued → started → completed` 顺序
+记录，正式空闲回收阈值保持为 5 分钟。
 
 ## 跨平台常见错误
 
