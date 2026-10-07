@@ -87,6 +87,30 @@ def process_matches(metadata: dict) -> bool:
     return state != "Z" and start_ticks == int(metadata["processStartTicks"])
 
 
+def stop_sidecars(metadata: dict) -> None:
+    """停止登记过的 Gateway/bridge，并用启动时钟避免误杀复用 PID。"""
+
+    for sidecar in metadata.get("sidecars", []):
+        candidate = {
+            "pid": sidecar.get("pid"),
+            "processStartTicks": sidecar.get("processStartTicks"),
+        }
+        if candidate["pid"] is None or candidate["processStartTicks"] is None:
+            continue
+        if process_matches(candidate):
+            try:
+                os.kill(int(candidate["pid"]), signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            wait_for_exit(candidate, 2)
+        if process_matches(candidate):
+            try:
+                os.kill(int(candidate["pid"]), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            wait_for_exit(candidate, 1)
+
+
 def run_cleanup_command(arguments: list[str]) -> None:
     """执行幂等清理命令；资源已经消失时不阻断后续清理。"""
     try:
@@ -191,6 +215,7 @@ def stop_instance(state_root: Path, instance_id: str, reason: str) -> dict:
     """停止实例、清理临时资源，并保留可供重启的数据盘和元数据。"""
     metadata_path, metadata = load_metadata(state_root, instance_id)
     stop_method = stop_process(metadata)
+    stop_sidecars(metadata)
     cleanup_ephemeral(metadata)
     metadata.update(
         {
@@ -233,6 +258,12 @@ def command_register(args: argparse.Namespace) -> None:
         raise SystemExit("volume path must be below /srv/fc/volumes")
 
     now = int(time.time())
+    sidecars = []
+    for sidecar_pid in args.sidecar_pid:
+        sidecar_ticks = process_start_ticks(sidecar_pid)
+        if sidecar_ticks is None:
+            raise SystemExit(f"sidecar process does not exist: {sidecar_pid}")
+        sidecars.append({"pid": sidecar_pid, "processStartTicks": sidecar_ticks})
     metadata = {
         "apiSocket": str(expected_socket),
         "createdAt": now,
@@ -244,6 +275,7 @@ def command_register(args: argparse.Namespace) -> None:
         "pid": args.pid,
         "processStartTicks": start_ticks,
         "status": "running",
+        "sidecars": sidecars,
         "tapName": args.tap_name,
         "volumePath": str(volume_path),
     }
@@ -306,6 +338,7 @@ def command_watch(args: argparse.Namespace) -> None:
         if metadata.get("status") != "running":
             return
         if not process_matches(metadata):
+            stop_sidecars(metadata)
             cleanup_ephemeral(metadata)
             metadata_path, _ = load_metadata(args.state_root, instance_id)
             metadata.update(
@@ -382,6 +415,7 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--nft-family", default="inet")
     register.add_argument("--nft-table", default="")
     register.add_argument("--activity-uid", default=0, type=int)
+    register.add_argument("--sidecar-pid", action="append", default=[], type=int)
     register.set_defaults(handler=command_register)
 
     heartbeat = commands.add_parser("heartbeat")

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""M10 单机控制面 HTTP API。
+"""M10/M11 单机控制面与 Agent 任务 HTTP API。
 
 该服务把前端将来需要的“创建、启动、查询、心跳、停止、销毁”操作转换为
 InstanceRuntime 调用。产品状态保存在 SQLite；Firecracker 的实时进程状态仍以
 lifecycle.py 元数据和 /proc 为准，查询时会自动对两者进行校准。
 
+M11 在同一控制面增加任务队列；guest 通过独立 TAP bridge 领取任务并回传事件。
 当前没有身份认证，因此 main() 强制只允许 loopback 监听。macOS 开发者应通过
 SSH 隧道访问，绝不能为了省事把监听地址改成 0.0.0.0。
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -30,11 +33,18 @@ INSTANCE_MANAGER_DIR = REPO_ROOT / "services" / "instance-manager"
 sys.path.insert(0, str(INSTANCE_MANAGER_DIR))
 
 from runtime import InstanceRuntime, RuntimeFailure  # noqa: E402
+from task_store import TaskStore, TaskStoreError  # noqa: E402
 
 
 INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 INSTANCE_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})(?:/(start|stop|heartbeat))?$"
+)
+TASK_COLLECTION_ROUTE_RE = re.compile(
+    r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/tasks$"
+)
+TASK_ROUTE_RE = re.compile(
+    r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/tasks/(task-[0-9a-f]{16})(/events)?$"
 )
 
 
@@ -160,9 +170,10 @@ class ControlPlane:
     不同实例仍可由 ThreadingHTTPServer 并行处理。
     """
 
-    def __init__(self, store: InstanceStore, runtime: InstanceRuntime) -> None:
+    def __init__(self, store: InstanceStore, runtime: InstanceRuntime, tasks: TaskStore) -> None:
         self.store = store
         self.runtime = runtime
+        self.tasks = tasks
         self._locks_guard = threading.Lock()
         self._locks: dict[str, threading.Lock] = {}
 
@@ -250,6 +261,7 @@ class ControlPlane:
             except (RuntimeFailure, subprocess.SubprocessError) as error:
                 self.store.update(instance_id, "failed", str(error)[-4000:])
                 raise ApiError(500, "instance_stop_failed", str(error)) from error
+            self.tasks.fail_running(instance_id, "instance stopped before task completed")
             return {**self.store.update(instance_id, "stopped"), "runtime": runtime_status}
 
     def heartbeat(self, instance_id: str) -> dict[str, Any]:
@@ -274,8 +286,46 @@ class ControlPlane:
             except (RuntimeFailure, subprocess.SubprocessError) as error:
                 self.store.update(instance_id, "failed", str(error)[-4000:])
                 raise ApiError(500, "instance_destroy_failed", str(error)) from error
+            self.tasks.delete_instance(instance_id)
             self.store.delete(instance_id)
             return {"id": record["id"], "status": "destroyed"}
+
+    def create_task(self, instance_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """为正在运行的实例排队一个用户任务，并刷新实例活动时间。"""
+
+        instance_id = self.validate_requested_id(instance_id)
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ApiError(400, "invalid_prompt", "prompt must be a non-empty string")
+        prompt = prompt.strip()
+        if len(prompt.encode("utf-8")) > 32768:
+            raise ApiError(413, "prompt_too_large", "prompt exceeds 32 KiB")
+        record = self.get(instance_id)
+        if record["status"] != "running":
+            raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
+        try:
+            self.runtime.heartbeat(instance_id)
+            return self.tasks.create(instance_id, prompt)
+        except (RuntimeFailure, TaskStoreError, OSError, sqlite3.Error) as error:
+            raise ApiError(500, "task_create_failed", str(error)) from error
+
+    def get_task(self, instance_id: str, task_id: str) -> dict[str, Any]:
+        """读取任务当前状态和最终输出。"""
+
+        self.store.get(self.validate_requested_id(instance_id))
+        try:
+            return self.tasks.get(instance_id, task_id)
+        except TaskStoreError as error:
+            raise ApiError(404, "task_not_found", str(error)) from error
+
+    def task_events(self, instance_id: str, task_id: str) -> list[dict[str, Any]]:
+        """返回按序号排列的任务事件，供 MVP 前端轮询。"""
+
+        self.store.get(self.validate_requested_id(instance_id))
+        try:
+            return self.tasks.events(instance_id, task_id)
+        except TaskStoreError as error:
+            raise ApiError(404, "task_not_found", str(error)) from error
 
 
 class ControlPlaneHandler(BaseHTTPRequestHandler):
@@ -338,6 +388,14 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             if self.path == "/api/instances":
                 self.send_payload(200, {"instances": self.control.list()})
                 return
+            task_match = TASK_ROUTE_RE.fullmatch(self.path)
+            if task_match:
+                instance_id, task_id, events_suffix = task_match.groups()
+                if events_suffix:
+                    self.send_payload(200, {"events": self.control.task_events(instance_id, task_id)})
+                else:
+                    self.send_payload(200, self.control.get_task(instance_id, task_id))
+                return
             match = INSTANCE_ROUTE_RE.fullmatch(self.path)
             if match and match.group(2) is None:
                 self.send_payload(200, self.control.get(match.group(1)))
@@ -351,6 +409,10 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         try:
             if self.path == "/api/instances":
                 self.send_payload(201, self.control.create(self.read_json()))
+                return
+            task_match = TASK_COLLECTION_ROUTE_RE.fullmatch(self.path)
+            if task_match:
+                self.send_payload(202, self.control.create_task(task_match.group(1), self.read_json()))
                 return
             match = INSTANCE_ROUTE_RE.fullmatch(self.path)
             if not match or match.group(2) is None:
@@ -385,6 +447,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--listen-port", default=18090, type=int)
     parser.add_argument("--database", type=Path, default=Path("/var/lib/fc/control-plane.db"))
     parser.add_argument("--state-root", type=Path, default=Path("/var/lib/fc"))
+    parser.add_argument("--task-database", type=Path, default=Path("/var/lib/fc/tasks/tasks.db"))
+    parser.add_argument("--deepseek-credential", type=Path)
     parser.add_argument("--idle-timeout", type=int, default=300)
     return parser
 
@@ -395,16 +459,19 @@ def main() -> None:
     if os.geteuid() != 0:
         raise SystemExit("control plane must run as root")
     if args.listen_host not in {"127.0.0.1", "::1", "localhost"}:
-        raise SystemExit("M10 control plane only supports loopback listeners")
+        raise SystemExit("unauthenticated control plane only supports loopback listeners")
     if args.idle_timeout < 1:
         raise SystemExit("idle timeout must be at least one second")
 
     store = InstanceStore(args.database)
+    tasks = TaskStore(args.task_database)
     runtime = InstanceRuntime(
         state_root=args.state_root,
         idle_timeout_seconds=args.idle_timeout,
+        deepseek_credential=args.deepseek_credential,
+        task_database=args.task_database,
     )
-    control = ControlPlane(store, runtime)
+    control = ControlPlane(store, runtime, tasks)
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), ControlPlaneHandler)
     server.control = control  # type: ignore[attr-defined]
     print(

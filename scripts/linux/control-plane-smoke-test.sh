@@ -18,6 +18,7 @@ listen_port="18090"
 base_url="http://${listen_host}:${listen_port}"
 state_root="/var/lib/fc/control-plane-smoke"
 database_path="${state_root}/control-plane.db"
+task_database_path="${state_root}/tasks.db"
 log_path="${state_root}/server.log"
 pid_path="${state_root}/server.pid"
 metadata_path="${state_root}/instances/${instance_id}.json"
@@ -94,6 +95,7 @@ python3 "${repo_dir}/services/control-plane/server.py" \
   --listen-host "${listen_host}" \
   --listen-port "${listen_port}" \
   --database "${database_path}" \
+  --task-database "${task_database_path}" \
   --state-root "${state_root}" \
   --idle-timeout "${INSTANCE_IDLE_TIMEOUT_SECONDS}" \
   > "${log_path}" 2>&1 &

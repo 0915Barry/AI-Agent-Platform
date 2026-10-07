@@ -39,6 +39,7 @@ Commands:
   deepseek-e2e-test      Run Pi Agent against DeepSeek through Tool Gateway
   control-plane-smoke-test
                          Control a real microVM through the M10 HTTP API
+  agent-task-smoke-test  Run a real M11 Pi task through the control plane
   control-plane-start    Start the loopback-only M10 API in the Linux VM
   control-plane-stop     Stop the M10 API; running instances remain managed
   control-plane-status   Show whether the M10 API service is running
@@ -276,6 +277,18 @@ smoke_test_control_plane() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/control-plane-smoke-test.sh'"
 }
 
+smoke_test_agent_task() {
+  sync_repo
+  echo "Building and testing the M11 managed Pi Agent task path in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/agent-task-smoke-test.sh'"
+}
+
 control_plane_service() {
   action="$1"
   sync_repo
@@ -344,6 +357,9 @@ case "${command}" in
     ;;
   control-plane-smoke-test)
     smoke_test_control_plane
+    ;;
+  agent-task-smoke-test)
+    smoke_test_agent_task
     ;;
   control-plane-start)
     control_plane_service start

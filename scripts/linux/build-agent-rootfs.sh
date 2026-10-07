@@ -41,6 +41,7 @@ node_cache_path="${cache_dir}/${node_archive}"
 pi_archive="pi-coding-agent-${PI_VERSION}.tgz"
 pi_cache_path="${cache_dir}/${pi_archive}"
 guest_init="${repo_dir}/scripts/guest/agent-init.sh"
+guest_task_worker="${repo_dir}/scripts/guest/agent-task-worker.sh"
 
 build_id="$(
   {
@@ -48,6 +49,7 @@ build_id="$(
     sha256sum "${repo_dir}/config/versions.env" | awk '{print $1}'
     sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}'
     sha256sum "${guest_init}" | awk '{print $1}'
+    sha256sum "${guest_task_worker}" | awk '{print $1}'
   } | sha256sum | awk '{print $1}'
 )"
 
@@ -204,6 +206,9 @@ install -d -o root -g root -m 0755 \
 install -o root -g root -m 0755 \
   "${guest_init}" \
   "${mount_dir}/usr/local/sbin/agent-init"
+install -o root -g root -m 0755 \
+  "${guest_task_worker}" \
+  "${mount_dir}/usr/local/sbin/agent-task-worker"
 
 # Archive metadata must never make the unprivileged Agent user the owner of
 # platform runtime files. Only workspace and Pi state are writable by pi.

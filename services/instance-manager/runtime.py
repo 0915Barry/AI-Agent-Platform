@@ -10,9 +10,13 @@ rootfs 始终只读；用户工作区位于独立 ext4 数据盘。停止实例�
 """
 
 import json
+import hashlib
+import ipaddress
 import os
 import pwd
+import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -30,6 +34,10 @@ JAILER_ROOT = Path("/srv/jailer")
 FIRECRACKER_JAIL_ROOT = JAILER_ROOT / "firecracker"
 FIRECRACKER_USER = "firecracker"
 FIRECRACKER_GROUP = "firecracker"
+GATEWAY_USER = "agent-gateway"
+GATEWAY_GROUP = "agent-gateway"
+GATEWAY_PORT = 18082
+BRIDGE_PORT = 18083
 
 
 class RuntimeFailure(RuntimeError):
@@ -71,11 +79,17 @@ class InstanceRuntime:
         state_root: Path = DEFAULT_STATE_ROOT,
         volume_root: Path = DEFAULT_VOLUME_ROOT,
         idle_timeout_seconds: int = 300,
+        deepseek_credential: Path | None = None,
+        task_database: Path | None = None,
     ) -> None:
         self.state_root = state_root.resolve()
         self.volume_root = volume_root.resolve()
         self.idle_timeout_seconds = idle_timeout_seconds
+        self.deepseek_credential = deepseek_credential.resolve() if deepseek_credential else None
+        self.task_database = task_database.resolve() if task_database else None
         self.manager = Path(__file__).resolve().with_name("lifecycle.py")
+        self.gateway = Path(__file__).resolve().parents[1] / "tool-gateway" / "gateway.py"
+        self.bridge = Path(__file__).resolve().parents[1] / "agent-bridge" / "bridge.py"
         kernel_version = load_version("SMOKE_KERNEL_VERSION")
         self.agent_uid = int(load_version("AGENT_UID"))
         self.agent_gid = int(load_version("AGENT_GID"))
@@ -87,7 +101,7 @@ class InstanceRuntime:
         if os.geteuid() != 0:
             raise RuntimeFailure("instance runtime must run as root")
 
-    def ensure_host(self) -> tuple[int, int]:
+    def ensure_host(self) -> tuple[int, int, int, int]:
         """验证构建产物和二进制，并确保专用低权限 VMM 用户存在。"""
         self.require_root()
         if not self.kernel_source.is_file():
@@ -120,6 +134,27 @@ class InstanceRuntime:
             )
 
         account = pwd.getpwnam(FIRECRACKER_USER)
+        gateway_group = run(["getent", "group", GATEWAY_GROUP], check=False)
+        if gateway_group.returncode != 0:
+            run(["groupadd", "--system", GATEWAY_GROUP])
+        try:
+            pwd.getpwnam(GATEWAY_USER)
+        except KeyError:
+            run(
+                [
+                    "useradd",
+                    "--system",
+                    "--gid",
+                    GATEWAY_GROUP,
+                    "--no-create-home",
+                    "--home-dir",
+                    "/nonexistent",
+                    "--shell",
+                    "/usr/sbin/nologin",
+                    GATEWAY_USER,
+                ]
+            )
+        gateway_account = pwd.getpwnam(GATEWAY_USER)
         for directory in (
             FIRECRACKER_JAIL_ROOT,
             self.volume_root,
@@ -128,7 +163,12 @@ class InstanceRuntime:
             self.state_root / "control-plane",
         ):
             directory.mkdir(parents=True, exist_ok=True, mode=0o755)
-        return account.pw_uid, account.pw_gid
+        if self.deepseek_credential is not None:
+            if not self.deepseek_credential.is_file():
+                raise RuntimeFailure(f"DeepSeek credential is missing: {self.deepseek_credential}")
+            if self.task_database is None:
+                raise RuntimeFailure("task database is required when managed Agent networking is enabled")
+        return account.pw_uid, account.pw_gid, gateway_account.pw_uid, gateway_account.pw_gid
 
     def paths(self, instance_id: str) -> dict[str, Path]:
         """集中生成实例所有路径，确保它们只能落在固定根目录。"""
@@ -148,6 +188,13 @@ class InstanceRuntime:
             "state": state_dir,
             "console": state_dir / "console.log",
             "reaper": state_dir / "reaper.log",
+            "sidecars": state_dir / "sidecars",
+            "gateway_log": state_dir / "sidecars" / "gateway.log",
+            "gateway_audit": state_dir / "sidecars" / "gateway.audit.jsonl",
+            "bridge_log": state_dir / "sidecars" / "bridge.log",
+            "bridge_audit": state_dir / "sidecars" / "bridge.audit.jsonl",
+            "credential": state_dir / "sidecars" / "deepseek-api-key",
+            "bridge_token": state_dir / "sidecars" / "bridge-token",
         }
 
     def create_volume(self, volume_path: Path, uid: int, gid: int) -> None:
@@ -187,7 +234,237 @@ class InstanceRuntime:
             shutil.rmtree(mount_path, ignore_errors=True)
             building_path.unlink(missing_ok=True)
 
-    def prepare_jail(self, instance_id: str, paths: dict[str, Path]) -> None:
+    def network_identity(self, instance_id: str) -> dict[str, str]:
+        """从实例 ID 稳定派生 /30 子网、TAP、MAC 和 nftables 表名。"""
+
+        digest = hashlib.sha256(instance_id.encode("utf-8")).digest()
+        slot = int.from_bytes(digest[:2], "big") % 16384
+        network = ipaddress.ip_network(f"172.29.0.0/16")[slot * 4]
+        subnet = ipaddress.ip_network(f"{network}/30")
+        host_ip = str(subnet.network_address + 1)
+        guest_ip = str(subnet.network_address + 2)
+        suffix = digest.hex()[:10]
+        return {
+            "tap": f"fc{suffix}",
+            "nft_table": f"aap_{digest.hex()[:12]}",
+            "subnet": str(subnet),
+            "host_ip": host_ip,
+            "host_cidr": f"{host_ip}/30",
+            "guest_ip": guest_ip,
+            "guest_cidr": f"{guest_ip}/30",
+            "guest_mac": f"06:00:{digest[2]:02x}:{digest[3]:02x}:{digest[4]:02x}:{digest[5]:02x}",
+        }
+
+    def configure_agent_volume(self, volume_path: Path, host_ip: str) -> None:
+        """离线挂载数据盘并写入只含占位凭据的 Pi provider 配置。"""
+
+        mount_path = Path(tempfile.mkdtemp(prefix="agent-volume-config.", dir="/var/tmp"))
+        mounted = False
+        try:
+            run(["mount", "-o", "loop", str(volume_path), str(mount_path)])
+            mounted = True
+            config_dir = mount_path / "pi-state" / "agent"
+            config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            models = {
+                "providers": {
+                    "deepseek-gateway": {
+                        "baseUrl": f"http://{host_ip}:{GATEWAY_PORT}/v1",
+                        "api": "openai-completions",
+                        "apiKey": "gateway-placeholder",
+                        "models": [
+                            {
+                                "id": "deepseek-flash",
+                                "name": "DeepSeek Flash via Tool Gateway",
+                                "reasoning": False,
+                                "input": ["text"],
+                                "contextWindow": 128000,
+                                "maxTokens": 8192,
+                            }
+                        ],
+                    }
+                }
+            }
+            config_path = config_dir / "models.json"
+            config_path.write_text(json.dumps(models, separators=(",", ":")) + "\n", encoding="utf-8")
+            os.chown(config_dir, self.agent_uid, self.agent_gid)
+            os.chown(config_path, self.agent_uid, self.agent_gid)
+            os.chmod(config_path, 0o600)
+            run(["sync"])
+        finally:
+            if mounted:
+                run(["umount", str(mount_path)], check=False)
+            shutil.rmtree(mount_path, ignore_errors=True)
+
+    def setup_network(self, network: dict[str, str], firecracker_uid: int) -> None:
+        """创建实例专用 TAP，并仅放行 guest 到 Gateway/bridge 的两个端口。"""
+
+        if run(["ip", "-4", "route", "show", "exact", network["subnet"]], check=False).stdout.strip():
+            raise RuntimeFailure(f"instance subnet conflicts with an existing route: {network['subnet']}")
+        run(["ip", "tuntap", "add", "dev", network["tap"], "mode", "tap", "user", str(firecracker_uid)])
+        try:
+            run(["ip", "address", "add", network["host_cidr"], "dev", network["tap"]])
+            run(["ip", "link", "set", "dev", network["tap"], "up"])
+            rules = f"""table inet {network['nft_table']} {{
+  chain input {{
+    type filter hook input priority -10; policy accept;
+    iifname \"{network['tap']}\" ip saddr {network['guest_ip']} ip daddr {network['host_ip']} tcp dport {{ {GATEWAY_PORT}, {BRIDGE_PORT} }} counter accept
+    iifname \"{network['tap']}\" ip saddr {network['guest_ip']} counter drop
+  }}
+  chain forward {{
+    type filter hook forward priority -10; policy accept;
+    iifname \"{network['tap']}\" counter drop
+    oifname \"{network['tap']}\" counter drop
+  }}
+}}
+"""
+            with tempfile.NamedTemporaryFile("w", prefix="agent-network.", suffix=".nft", delete=False) as handle:
+                handle.write(rules)
+                rules_path = Path(handle.name)
+            try:
+                run(["nft", "-f", str(rules_path)])
+            finally:
+                rules_path.unlink(missing_ok=True)
+        except Exception:
+            run(["nft", "delete", "table", "inet", network["nft_table"]], check=False)
+            run(["ip", "link", "delete", network["tap"]], check=False)
+            raise
+
+    @staticmethod
+    def terminate_process(process: subprocess.Popen[bytes] | subprocess.Popen[str]) -> None:
+        """尽力终止尚未交给生命周期管理器的启动阶段进程。"""
+
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+
+    def start_sidecars(
+        self,
+        instance_id: str,
+        paths: dict[str, Path],
+        network: dict[str, str],
+        gateway_uid: int,
+        gateway_gid: int,
+    ) -> list[subprocess.Popen[bytes]]:
+        """以专用低权限用户启动凭据 Gateway 与 guest 任务桥。"""
+
+        if self.deepseek_credential is None or self.task_database is None:
+            raise RuntimeFailure("managed Agent sidecars are not configured")
+        paths["sidecars"].mkdir(parents=True, exist_ok=True, mode=0o750)
+        os.chown(paths["sidecars"], gateway_uid, gateway_gid)
+        for log_path in (paths["gateway_log"], paths["gateway_audit"], paths["bridge_log"], paths["bridge_audit"]):
+            log_path.write_text("", encoding="utf-8")
+            os.chown(log_path, gateway_uid, gateway_gid)
+            os.chmod(log_path, 0o600)
+        shutil.copyfile(self.deepseek_credential, paths["credential"])
+        os.chown(paths["credential"], gateway_uid, gateway_gid)
+        os.chmod(paths["credential"], 0o400)
+        paths["bridge_token"].write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
+        os.chown(paths["bridge_token"], gateway_uid, gateway_gid)
+        os.chmod(paths["bridge_token"], 0o400)
+
+        task_parent = self.task_database.parent
+        task_parent.mkdir(parents=True, exist_ok=True, mode=0o2770)
+        os.chown(task_parent, 0, gateway_gid)
+        os.chmod(task_parent, 0o2770)
+        for database_file in task_parent.glob(f"{self.task_database.name}*"):
+            os.chown(database_file, 0, gateway_gid)
+            os.chmod(database_file, 0o660)
+
+        base = [
+            "setpriv",
+            "--reuid",
+            str(gateway_uid),
+            "--regid",
+            str(gateway_gid),
+            "--clear-groups",
+        ]
+        gateway_handle = paths["gateway_log"].open("ab", buffering=0)
+        bridge_handle = paths["bridge_log"].open("ab", buffering=0)
+        gateway_process = subprocess.Popen(
+            [
+                *base,
+                sys.executable,
+                str(self.gateway),
+                "--listen-host",
+                network["host_ip"],
+                "--listen-port",
+                str(GATEWAY_PORT),
+                "--upstream",
+                "https://api.deepseek.com",
+                "--credential-file",
+                str(paths["credential"]),
+                "--audit-file",
+                str(paths["gateway_audit"]),
+                "--tenant",
+                instance_id,
+                "--activity-file",
+                str(paths["activity"]),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=gateway_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        bridge_process = subprocess.Popen(
+            [
+                *base,
+                sys.executable,
+                str(self.bridge),
+                "--listen-host",
+                network["host_ip"],
+                "--listen-port",
+                str(BRIDGE_PORT),
+                "--database",
+                str(self.task_database),
+                "--instance-id",
+                instance_id,
+                "--token-file",
+                str(paths["bridge_token"]),
+                "--activity-file",
+                str(paths["activity"]),
+                "--audit-file",
+                str(paths["bridge_audit"]),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=bridge_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        gateway_handle.close()
+        bridge_handle.close()
+        processes = [gateway_process, bridge_process]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if any(process.poll() is not None for process in processes):
+                break
+            ready = True
+            for port in (GATEWAY_PORT, BRIDGE_PORT):
+                try:
+                    with socket.create_connection((network["host_ip"], port), timeout=0.2):
+                        pass
+                except OSError:
+                    ready = False
+            if ready:
+                return processes
+            time.sleep(0.2)
+        for process in processes:
+            self.terminate_process(process)
+        gateway_tail = paths["gateway_log"].read_text(encoding="utf-8", errors="replace")[-2000:]
+        bridge_tail = paths["bridge_log"].read_text(encoding="utf-8", errors="replace")[-2000:]
+        raise RuntimeFailure(f"managed sidecars did not become ready\ngateway={gateway_tail}\nbridge={bridge_tail}")
+
+    def prepare_jail(
+        self,
+        instance_id: str,
+        paths: dict[str, Path],
+        network: dict[str, str] | None = None,
+        bridge_token: str | None = None,
+    ) -> None:
         """建立 jail hard link，并生成只读 rootfs + 可写数据盘配置。"""
         shutil.rmtree(paths["jail"], ignore_errors=True)
         paths["chroot"].mkdir(parents=True, mode=0o755)
@@ -201,13 +478,37 @@ class InstanceRuntime:
                 "kernel, rootfs, volumes, and jailer paths must support hard links on the same Linux filesystem"
             ) from error
 
+        boot_args = (
+            "root=/dev/vda ro rootfstype=ext4 console=ttyS0 reboot=k "
+            "panic=1 pci=off init=/usr/local/sbin/agent-init agent_data_disk=1"
+        )
+        network_interfaces: list[dict[str, str]] = []
+        if network is not None:
+            if bridge_token is None:
+                raise RuntimeFailure("bridge token is required for managed networking")
+            boot_args += (
+                " agent_managed_runtime=1"
+                f" agent_ip={network['guest_cidr']}"
+                f" agent_gateway={network['host_ip']}"
+                f" agent_dns={network['host_ip']}"
+                f" agent_gateway_host={network['host_ip']}"
+                f" agent_gateway_port={GATEWAY_PORT}"
+                f" agent_bridge_host={network['host_ip']}"
+                f" agent_bridge_port={BRIDGE_PORT}"
+                f" agent_bridge_token={bridge_token}"
+            )
+            network_interfaces = [
+                {
+                    "iface_id": "eth0",
+                    "guest_mac": network["guest_mac"],
+                    "host_dev_name": network["tap"],
+                }
+            ]
+
         config = {
             "boot-source": {
                 "kernel_image_path": "/vmlinux",
-                "boot_args": (
-                    "root=/dev/vda ro rootfstype=ext4 console=ttyS0 reboot=k "
-                    "panic=1 pci=off init=/usr/local/sbin/agent-init agent_data_disk=1"
-                ),
+                "boot_args": boot_args,
             },
             "machine-config": {
                 "vcpu_count": 2,
@@ -230,7 +531,7 @@ class InstanceRuntime:
                     "is_read_only": False,
                 },
             ],
-            "network-interfaces": [],
+            "network-interfaces": network_interfaces,
             "cpu-config": None,
             "balloon": None,
             "vsock": None,
@@ -269,18 +570,48 @@ class InstanceRuntime:
         watcher 仍会在 5 分钟无活动后回收计算资源。
         """
         instance_id = validate_instance_id(instance_id)
-        uid, gid = self.ensure_host()
+        uid, gid, gateway_uid, gateway_gid = self.ensure_host()
         paths = self.paths(instance_id)
         existing = self.status(instance_id)
         if existing is not None and existing.get("status") == "running" and existing.get("processAlive"):
             raise RuntimeFailure(f"instance is already running: {instance_id}")
 
         paths["state"].mkdir(parents=True, exist_ok=True, mode=0o750)
+        if self.deepseek_credential is not None:
+            os.chown(paths["state"], 0, gateway_gid)
+            os.chmod(paths["state"], 0o750)
         self.create_volume(paths["volume"], uid, gid)
         filesystem_check = run(["e2fsck", "-f", "-y", str(paths["volume"])], check=False)
         if filesystem_check.returncode > 1:
             raise RuntimeFailure(f"persistent volume check failed: {filesystem_check.stderr.strip()}")
-        self.prepare_jail(instance_id, paths)
+        network: dict[str, str] | None = None
+        sidecars: list[subprocess.Popen[bytes]] = []
+        if self.deepseek_credential is not None:
+            network = self.network_identity(instance_id)
+            self.configure_agent_volume(paths["volume"], network["host_ip"])
+            paths["activity"].parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            paths["activity"].touch()
+            os.chown(paths["activity"], gateway_uid, gateway_gid)
+            os.chmod(paths["activity"], 0o600)
+            self.setup_network(network, uid)
+            try:
+                sidecars = self.start_sidecars(
+                    instance_id,
+                    paths,
+                    network,
+                    gateway_uid,
+                    gateway_gid,
+                )
+                bridge_token = paths["bridge_token"].read_text(encoding="utf-8").strip()
+                self.prepare_jail(instance_id, paths, network, bridge_token)
+            except Exception:
+                for sidecar in sidecars:
+                    self.terminate_process(sidecar)
+                run(["nft", "delete", "table", "inet", network["nft_table"]], check=False)
+                run(["ip", "link", "delete", network["tap"]], check=False)
+                raise
+        else:
+            self.prepare_jail(instance_id, paths)
         paths["console"].write_text("", encoding="utf-8")
         os.chmod(paths["console"], 0o640)
 
@@ -324,7 +655,9 @@ class InstanceRuntime:
             # 以 guest 明确输出的 READY 标志作为启动成功条件，而不是只看 PID 存活。
             while time.monotonic() < deadline:
                 console = paths["console"].read_text(encoding="utf-8", errors="replace")
-                if "\nAGENT_RUNTIME_READY " in f"\n{console}":
+                runtime_ready = "\nAGENT_RUNTIME_READY " in f"\n{console}"
+                worker_ready = network is None or "\nAGENT_TASK_WORKER_READY " in f"\n{console}"
+                if runtime_ready and worker_ready:
                     ready = True
                     break
                 if process.poll() is not None:
@@ -340,7 +673,7 @@ class InstanceRuntime:
                 tail = paths["console"].read_text(encoding="utf-8", errors="replace")[-8000:]
                 raise RuntimeFailure(f"guest did not become ready\n{tail}")
 
-            self.lifecycle(
+            register_arguments = [
                 "register",
                 instance_id,
                 "--pid",
@@ -353,7 +686,23 @@ class InstanceRuntime:
                 str(paths["socket"]),
                 "--volume-path",
                 str(paths["volume"]),
-            )
+            ]
+            if network is not None:
+                register_arguments.extend(
+                    [
+                        "--tap-name",
+                        network["tap"],
+                        "--nft-family",
+                        "inet",
+                        "--nft-table",
+                        network["nft_table"],
+                        "--activity-uid",
+                        str(gateway_uid),
+                    ]
+                )
+                for sidecar in sidecars:
+                    register_arguments.extend(["--sidecar-pid", str(sidecar.pid)])
+            self.lifecycle(*register_arguments)
             # watcher 是独立进程，因此控制面服务退出后空闲回收仍然有效。
             reaper_handle = paths["reaper"].open("ab", buffering=0)
             subprocess.Popen(
@@ -375,6 +724,8 @@ class InstanceRuntime:
             reaper_handle.close()
             # 回收由本进程创建的 VMM 子进程，防止停止后留下 zombie。
             threading.Thread(target=process.wait, daemon=True).start()
+            for sidecar in sidecars:
+                threading.Thread(target=sidecar.wait, daemon=True).start()
             status = self.status(instance_id)
             if status is None:
                 raise RuntimeFailure("lifecycle registration did not create instance metadata")
@@ -386,6 +737,11 @@ class InstanceRuntime:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 pass
+            for sidecar in sidecars:
+                self.terminate_process(sidecar)
+            if network is not None:
+                run(["nft", "delete", "table", "inet", network["nft_table"]], check=False)
+                run(["ip", "link", "delete", network["tap"]], check=False)
             shutil.rmtree(paths["jail"], ignore_errors=True)
             raise
 

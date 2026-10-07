@@ -17,6 +17,7 @@ listen_port="18090"
 pid_path="/run/ai-agent-control-plane.pid"
 log_path="/var/log/ai-agent-control-plane.log"
 database_path="/var/lib/fc/control-plane.db"
+task_database_path="/var/lib/fc/tasks/tasks.db"
 server_path="${repo_dir}/services/control-plane/server.py"
 
 read_pid() {
@@ -47,6 +48,19 @@ start_service() {
   fi
 
   rm -f "${pid_path}"
+  local operator="${SUDO_USER:-}"
+  if [[ -z "${operator}" || "${operator}" == "root" ]]; then
+    echo "Start the service as a configured normal user through sudo" >&2
+    exit 1
+  fi
+  local operator_home
+  operator_home="$(getent passwd "${operator}" | cut -d: -f6)"
+  local credential_path="${operator_home}/.config/ai-agent-platform/deepseek-api-key"
+  if [[ ! -f "${credential_path}" ]]; then
+    echo "DeepSeek API key is not configured for ${operator}." >&2
+    echo "Run ./run-linux.sh configure-deepseek first." >&2
+    exit 1
+  fi
   install -d -o root -g root -m 0755 /var/lib/fc
   touch "${log_path}"
   chmod 0640 "${log_path}"
@@ -55,6 +69,8 @@ start_service() {
     --listen-host "${listen_host}" \
     --listen-port "${listen_port}" \
     --database "${database_path}" \
+    --task-database "${task_database_path}" \
+    --deepseek-credential "${credential_path}" \
     --state-root /var/lib/fc \
     --idle-timeout "${INSTANCE_IDLE_TIMEOUT_SECONDS}" \
     >> "${log_path}" 2>&1 &

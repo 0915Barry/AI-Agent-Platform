@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M10 控制面的纯本地单元测试。
+"""M10/M11 控制面与任务队列的纯本地单元测试。
 
 测试使用 :class:`FakeRuntime` 替代真正的 Firecracker 运行时，因此不要求
 ``/dev/kvm``、root 权限或 Linux 虚拟机。这里主要验证控制面的业务规则：
@@ -81,9 +81,11 @@ class ControlPlaneTests(unittest.TestCase):
 
         self.temporary = tempfile.TemporaryDirectory()
         database = Path(self.temporary.name) / "control-plane.db"
+        task_database = Path(self.temporary.name) / "tasks.db"
         self.store = SERVER.InstanceStore(database)
+        self.tasks = SERVER.TaskStore(task_database)
         self.runtime = FakeRuntime()
-        self.control = SERVER.ControlPlane(self.store, self.runtime)
+        self.control = SERVER.ControlPlane(self.store, self.runtime, self.tasks)
 
     def tearDown(self) -> None:
         """清理本用例的临时数据库目录。"""
@@ -147,6 +149,44 @@ class ControlPlaneTests(unittest.TestCase):
         with self.assertRaises(SERVER.ApiError) as stop_error:
             self.control.stop("agent-created")
         self.assertEqual(stop_error.exception.status, 409)
+
+    def test_task_lifecycle_and_events(self) -> None:
+        """运行实例可以创建任务，guest 领取后能回传最终结果和事件。"""
+
+        self.control.create({"id": "agent-task"})
+        self.control.start("agent-task")
+        queued = self.control.create_task("agent-task", {"prompt": "read the marker"})
+        self.assertEqual(queued["status"], "queued")
+
+        claimed = self.tasks.claim_next("agent-task")
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        self.assertEqual(claimed["status"], "running")
+        self.tasks.append_event(
+            "agent-task",
+            claimed["id"],
+            "completed",
+            {"output": "M11_OK"},
+        )
+
+        completed = self.control.get_task("agent-task", claimed["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["output"], "M11_OK")
+        event_types = [event["type"] for event in self.control.task_events("agent-task", claimed["id"])]
+        self.assertEqual(event_types, ["queued", "started", "completed"])
+
+    def test_task_requires_running_instance_and_valid_prompt(self) -> None:
+        """任务只能发送给 running 实例，且提示词不能为空。"""
+
+        self.control.create({"id": "agent-idle"})
+        with self.assertRaises(SERVER.ApiError) as not_running:
+            self.control.create_task("agent-idle", {"prompt": "hello"})
+        self.assertEqual(not_running.exception.status, 409)
+
+        self.control.start("agent-idle")
+        with self.assertRaises(SERVER.ApiError) as empty_prompt:
+            self.control.create_task("agent-idle", {"prompt": "   "})
+        self.assertEqual(empty_prompt.exception.status, 400)
 
 
 if __name__ == "__main__":

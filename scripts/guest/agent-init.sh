@@ -57,7 +57,9 @@ chown -R pi:pi /workspace /home/pi/.pi
 network_test="$(cmdline_value agent_network_test || true)"
 gateway_test="$(cmdline_value agent_gateway_test || true)"
 deepseek_e2e_test="$(cmdline_value agent_deepseek_e2e_test || true)"
-if [[ "${network_test}" == "1" || "${gateway_test}" == "1" || "${deepseek_e2e_test}" == "1" ]]; then
+managed_runtime="$(cmdline_value agent_managed_runtime || true)"
+if [[ "${network_test}" == "1" || "${gateway_test}" == "1" \
+  || "${deepseek_e2e_test}" == "1" || "${managed_runtime}" == "1" ]]; then
   guest_ip_cidr="$(cmdline_value agent_ip)"
   guest_gateway="$(cmdline_value agent_gateway)"
   guest_dns="$(cmdline_value agent_dns)"
@@ -235,10 +237,21 @@ if [[ "${network_test}" == "1" ]]; then
 
   echo "AGENT_NETWORK_READY ip=${guest_ip_cidr} gateway=${guest_gateway} dns=resolved https=allowed private=denied"
   echo "Networking is enabled for this governed smoke test; model credentials are still absent."
-elif [[ "${gateway_test}" == "1" || "${deepseek_e2e_test}" == "1" ]]; then
+elif [[ "${gateway_test}" == "1" || "${deepseek_e2e_test}" == "1" || "${managed_runtime}" == "1" ]]; then
   echo "Networking is restricted to the host Tool Gateway; model credentials remain outside the microVM."
 else
   echo "The runtime image contains no model credentials and networking is not configured yet."
+fi
+
+if [[ "${managed_runtime}" == "1" ]]; then
+  bridge_host="$(cmdline_value agent_bridge_host)"
+  bridge_port="$(cmdline_value agent_bridge_port)"
+  bridge_token="$(cmdline_value agent_bridge_token)"
+  echo "AGENT_TASK_WORKER_READY bridge=${bridge_host}:${bridge_port} credential=instance-token"
+  exec env \
+    AGENT_BRIDGE_URL="http://${bridge_host}:${bridge_port}" \
+    AGENT_BRIDGE_TOKEN="${bridge_token}" \
+    /usr/local/sbin/agent-task-worker
 fi
 
 trap 'poweroff -f' TERM INT

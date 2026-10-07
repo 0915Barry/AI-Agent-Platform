@@ -27,6 +27,7 @@
 | M8 | 实例生命周期与空闲回收 | ✅ 已通过，正式阈值 5 分钟 |
 | M9 | Pi Agent → Tool Gateway → DeepSeek 真实联调 | ✅ 已通过 |
 | M10 | HTTP 控制面管理真实 microVM 生命周期 | ✅ 已通过 |
+| M11 | 控制面向 Pi Agent 下发任务并经 DeepSeek 返回结果 | ⏳ 已实现，待当前 ARM64 环境实机验收 |
 
 ## 当前支持范围
 
@@ -291,6 +292,7 @@ Linux/KVM checks passed
 | 保存 DeepSeek Key | `./run.sh configure-deepseek` | `./run-linux.sh configure-deepseek` |
 | DeepSeek 端到端 | `./run.sh deepseek-e2e-test` | `./run-linux.sh deepseek-e2e-test` |
 | HTTP 控制面 | `./run.sh control-plane-smoke-test` | `./run-linux.sh control-plane-smoke-test` |
+| Agent 任务通道 | `./run.sh agent-task-smoke-test` | `./run-linux.sh agent-task-smoke-test` |
 
 第一次 `runtime-smoke-test` 会从固定 Ubuntu 快照构建完整 rootfs，下载较多基础包并安装 Node.js 和 Pi Agent，耗时明显较长。构建指纹不变时后续测试会复用 `/srv/fc/artifacts/agent-rootfs.ext4`。
 
@@ -314,6 +316,7 @@ Linux/KVM checks passed
 | `configure-deepseek` | 隐藏输入并将 API Key 保存到 Linux 用户私有目录 |
 | `deepseek-e2e-test` | 让 Pi Agent 经 Tool Gateway 调用 DeepSeek 并执行 `read` 工具 |
 | `control-plane-smoke-test` | 通过 HTTP API 创建、启动、查询、心跳、停止并销毁真实 microVM |
+| `agent-task-smoke-test` | 通过控制面向 microVM 内 Pi 下发真实任务，并验证 DeepSeek、工具写入和事件结果 |
 | `control-plane-start` | 构建所需镜像并在 Ubuntu loopback 启动长期运行的控制面 |
 | `control-plane-stop` | 停止控制面进程；已启动实例仍由独立空闲回收器管理 |
 | `control-plane-status` | 查询控制面服务是否运行 |
@@ -664,7 +667,7 @@ PASS: control plane created, started, queried, heartbeated, stopped, and destroy
 CONTROL_PLANE_READY bind=127.0.0.1:18090 storage=sqlite runtime=firecracker idle_timeout=300s auth=loopback-only
 ```
 
-这证明 HTTP 控制面能够驱动真实 Firecracker 实例完成创建、启动、状态查询、心跳、停止和显式销毁；普通停止保留独立数据盘，显式销毁删除实例数据，未认证接口不会监听通配地址。当前阶段还没有消息接口、用户认证、多租户或前端页面。
+这证明 HTTP 控制面能够驱动真实 Firecracker 实例完成创建、启动、状态查询、心跳、停止和显式销毁；普通停止保留独立数据盘，显式销毁删除实例数据，未认证接口不会监听通配地址。用户认证、多租户和前端页面仍未实现。
 
 验收通过后，可以启动长期运行的本地开发服务：
 
@@ -698,6 +701,51 @@ curl -X DELETE http://127.0.0.1:18090/api/instances/demo-agent
 ```
 
 完成开发后运行 `./run.sh control-plane-stop`；Windows 的 Ubuntu VM 使用 `./run-linux.sh control-plane-stop`。停止控制面不会直接删除数据盘，只有实例的 `DELETE` 接口会执行显式销毁。
+
+## M11 Agent 任务通道
+
+M11 把此前分别验证的控制面、受控 TAP 网络、Tool Gateway、DeepSeek 和 Pi Agent
+整合为正式实例路径。启用 DeepSeek 凭据的控制面启动实例时会自动完成：
+
+- 为每个实例稳定派生独立 `/30` 子网、TAP 名和 nftables 表；
+- 只允许 guest 访问宿主 TAP 地址上的 Tool Gateway 与任务桥；
+- 以低权限 `agent-gateway` 用户运行两个 sidecar，并由生命周期管理器统一回收；
+- 将真实 DeepSeek Key 保留在宿主受限文件，数据盘只保存占位凭据；
+- 在 guest 中运行单任务串行 Worker，领取任务、调用 Pi，并回传有序事件；
+- 任务活动会刷新 5 分钟空闲计时，停止实例仍保留工作区数据。
+
+新增接口：
+
+```http
+POST /api/instances/{id}/tasks
+GET  /api/instances/{id}/tasks/{task_id}
+GET  /api/instances/{id}/tasks/{task_id}/events
+```
+
+当前事件接口采用短轮询 JSON；这是 MVP 的可验证边界，后续前端里程碑再升级为
+SSE/WebSocket 流式显示。Gateway 当前也仍会缓冲完整上游响应，因此本阶段验证的
+是安全、执行和结果链路，而不是逐 token 展示体验。
+
+在已经完成 `configure-deepseek` 的环境执行：
+
+```bash
+# macOS
+./run.sh agent-task-smoke-test
+
+# Windows 的 Ubuntu VM
+./run-linux.sh agent-task-smoke-test
+```
+
+测试会让 Pi 使用 `write` 和 `read` 工具写入并验证随机标记，检查任务事件顺序、
+Gateway 审计、数据盘持久化以及显式销毁。首次执行会因为 guest Worker 文件变更而
+重建 rootfs。预期成功标志：
+
+```text
+PASS: control plane completed a real Pi Agent task through DeepSeek
+AGENT_TASK_READY transport=http-poll events=ordered gateway=isolated persistence=preserved idle_timeout=300s
+```
+
+在实际出现这两行之前，M11 保持“待实机验收”，不能视为完成。
 
 ## 跨平台常见错误
 
