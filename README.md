@@ -26,6 +26,7 @@
 | M7 | Tool Gateway 与凭据外置 | ✅ 已通过 |
 | M8 | 实例生命周期与空闲回收 | ✅ 已通过，正式阈值 5 分钟 |
 | M9 | Pi Agent → Tool Gateway → DeepSeek 真实联调 | ✅ 已通过 |
+| M10 | HTTP 控制面管理真实 microVM 生命周期 | ✅ 已通过 |
 
 ## 当前支持范围
 
@@ -289,6 +290,7 @@ Linux/KVM checks passed
 | 生命周期 | `./run.sh lifecycle-smoke-test` | `./run-linux.sh lifecycle-smoke-test` |
 | 保存 DeepSeek Key | `./run.sh configure-deepseek` | `./run-linux.sh configure-deepseek` |
 | DeepSeek 端到端 | `./run.sh deepseek-e2e-test` | `./run-linux.sh deepseek-e2e-test` |
+| HTTP 控制面 | `./run.sh control-plane-smoke-test` | `./run-linux.sh control-plane-smoke-test` |
 
 第一次 `runtime-smoke-test` 会从固定 Ubuntu 快照构建完整 rootfs，下载较多基础包并安装 Node.js 和 Pi Agent，耗时明显较长。构建指纹不变时后续测试会复用 `/srv/fc/artifacts/agent-rootfs.ext4`。
 
@@ -311,10 +313,14 @@ Linux/KVM checks passed
 | `lifecycle-smoke-test` | 以 6 秒测试阈值验证心跳、空闲回收、重启和销毁 |
 | `configure-deepseek` | 隐藏输入并将 API Key 保存到 Linux 用户私有目录 |
 | `deepseek-e2e-test` | 让 Pi Agent 经 Tool Gateway 调用 DeepSeek 并执行 `read` 工具 |
+| `control-plane-smoke-test` | 通过 HTTP API 创建、启动、查询、心跳、停止并销毁真实 microVM |
+| `control-plane-start` | 构建所需镜像并在 Ubuntu loopback 启动长期运行的控制面 |
+| `control-plane-stop` | 停止控制面进程；已启动实例仍由独立空闲回收器管理 |
+| `control-plane-status` | 查询控制面服务是否运行 |
 
 运行 `./run.sh help` 或 `./run-linux.sh help` 可以查看对应入口支持的完整命令。
 
-## Agent 运行镜像
+## M3 Agent 运行镜像
 
 最小 microVM 验收通过后运行：
 
@@ -606,6 +612,92 @@ DEEPSEEK_E2E_READY model=deepseek-flash gateway=172.31.252.1:18082 credential=ho
 这证明 Pi Agent 能通过自定义 OpenAI-compatible provider 配置调用 DeepSeek，并能完成真实工具调用；供应商密钥只存在于 Ubuntu 宿主侧，microVM 仅持有占位凭据且无法绕过 Gateway 直连供应商。实际随机标记不作为固定测试数据写入文档。
 
 配置格式与接口以 [Pi 自定义模型文档](https://pi.dev/docs/latest/models) 和 [DeepSeek API 文档](https://api-docs.deepseek.com/guides/codex) 为准；仓库仍固定 Pi Agent 版本，升级时必须重新执行全部验收。
+
+## M10 HTTP 控制面
+
+M0–M9 使用终端脚本验证了底层能力；M10 在其上增加一个仅监听 Ubuntu loopback 的 HTTP 控制接口，让后续前端可以通过后端操作实例，而不需要直接执行 smoke-test 脚本。
+
+第一版使用 Python 标准库和 SQLite，不引入额外 Web 框架依赖。控制面负责保存产品级实例状态，`InstanceRuntime` 负责创建数据盘、准备 jail、启动 Firecracker，并复用 M8 的生命周期管理器完成心跳、5 分钟空闲回收、停止和销毁。
+
+当前接口：
+
+```http
+POST   /api/instances
+GET    /api/instances
+GET    /api/instances/{id}
+POST   /api/instances/{id}/start
+POST   /api/instances/{id}/heartbeat
+POST   /api/instances/{id}/stop
+DELETE /api/instances/{id}
+GET    /healthz
+```
+
+出于安全考虑，M10 尚未实现用户认证，因此服务拒绝监听 `0.0.0.0`，只能绑定 `127.0.0.1`/`::1`。在认证和授权完成前，不得将这个 root 权限控制接口暴露到局域网或互联网。
+
+运行真实验收：
+
+```bash
+# macOS
+./run.sh control-plane-smoke-test
+
+# Windows 的 Ubuntu VM
+./run-linux.sh control-plane-smoke-test
+```
+
+测试会通过 API 完成 `created → running → stopped → destroyed`，验证运行状态、心跳、停止时数据盘保留、销毁时数据盘删除，以及未认证接口只监听 loopback。成功标志：
+
+```text
+PASS: control plane created, started, queried, heartbeated, stopped, and destroyed a real microVM
+CONTROL_PLANE_READY bind=127.0.0.1:18090 storage=sqlite runtime=firecracker idle_timeout=300s auth=loopback-only
+```
+
+### M10 验收结果
+
+已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境中通过真实控制面 API 完成验收：
+
+```text
+CONTROL_PLANE_INSTANCE_CREATED id=m10-smoke status=created
+CONTROL_PLANE_INSTANCE_STARTED id=m10-smoke status=running
+CONTROL_PLANE_HEARTBEAT id=m10-smoke status=running
+CONTROL_PLANE_INSTANCE_STOPPED id=m10-smoke status=stopped volume=preserved
+PASS: control plane created, started, queried, heartbeated, stopped, and destroyed a real microVM
+CONTROL_PLANE_READY bind=127.0.0.1:18090 storage=sqlite runtime=firecracker idle_timeout=300s auth=loopback-only
+```
+
+这证明 HTTP 控制面能够驱动真实 Firecracker 实例完成创建、启动、状态查询、心跳、停止和显式销毁；普通停止保留独立数据盘，显式销毁删除实例数据，未认证接口不会监听通配地址。当前阶段还没有消息接口、用户认证、多租户或前端页面。
+
+验收通过后，可以启动长期运行的本地开发服务：
+
+```bash
+# macOS
+./run.sh control-plane-start
+./run.sh control-plane-status
+
+# Windows 的 Ubuntu VM
+./run-linux.sh control-plane-start
+./run-linux.sh control-plane-status
+```
+
+Windows 同事可以直接在 Ubuntu VM 中请求 `http://127.0.0.1:18090`。macOS 上需要另开一个终端建立 SSH 隧道：
+
+```bash
+ssh -N -L 18090:127.0.0.1:18090 agentdev@<UTM-Linux-IP>
+```
+
+然后在 macOS 访问：
+
+```bash
+curl http://127.0.0.1:18090/healthz
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"id":"demo-agent"}' \
+  http://127.0.0.1:18090/api/instances
+curl -X POST http://127.0.0.1:18090/api/instances/demo-agent/start
+curl http://127.0.0.1:18090/api/instances/demo-agent
+curl -X POST http://127.0.0.1:18090/api/instances/demo-agent/stop
+curl -X DELETE http://127.0.0.1:18090/api/instances/demo-agent
+```
+
+完成开发后运行 `./run.sh control-plane-stop`；Windows 的 Ubuntu VM 使用 `./run-linux.sh control-plane-stop`。停止控制面不会直接删除数据盘，只有实例的 `DELETE` 接口会执行显式销毁。
 
 ## 跨平台常见错误
 

@@ -37,6 +37,11 @@ Commands:
   lifecycle-smoke-test   Verify heartbeat, idle reaping, restart, and destroy
   configure-deepseek     Securely save a DeepSeek API key in the Linux VM
   deepseek-e2e-test      Run Pi Agent against DeepSeek through Tool Gateway
+  control-plane-smoke-test
+                         Control a real microVM through the M10 HTTP API
+  control-plane-start    Start the loopback-only M10 API in the Linux VM
+  control-plane-stop     Stop the M10 API; running instances remain managed
+  control-plane-status   Show whether the M10 API service is running
   setup <vm-ip> [vm-user]
                          Configure, check, sync, and install Firecracker
 EOF
@@ -259,6 +264,34 @@ test_deepseek_e2e() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/deepseek-e2e-test.sh'"
 }
 
+smoke_test_control_plane() {
+  sync_repo
+  echo "Building and testing the M10 control plane in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/control-plane-smoke-test.sh'"
+}
+
+control_plane_service() {
+  action="$1"
+  sync_repo
+  if [[ "${action}" == "start" ]]; then
+    remote_command="sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/control-plane-service.sh' start"
+  else
+    remote_command="sudo '${REMOTE_DIR}/scripts/linux/control-plane-service.sh' '${action}'"
+  fi
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" "${remote_command}"
+}
+
 command="${1:-}"
 case "${command}" in
   doctor)
@@ -308,6 +341,18 @@ case "${command}" in
     ;;
   deepseek-e2e-test)
     test_deepseek_e2e
+    ;;
+  control-plane-smoke-test)
+    smoke_test_control_plane
+    ;;
+  control-plane-start)
+    control_plane_service start
+    ;;
+  control-plane-stop)
+    control_plane_service stop
+    ;;
+  control-plane-status)
+    control_plane_service status
     ;;
   setup)
     if [[ -n "${2:-}" ]]; then

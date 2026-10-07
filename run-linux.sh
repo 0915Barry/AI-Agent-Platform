@@ -24,6 +24,11 @@ Commands:
   lifecycle-smoke-test  Verify idle reaping and restart persistence
   configure-deepseek    Securely save a DeepSeek API key outside the repo
   deepseek-e2e-test     Run Pi Agent against DeepSeek through Tool Gateway
+  control-plane-smoke-test
+                        Control a real microVM through the M10 HTTP API
+  control-plane-start   Start the loopback-only M10 HTTP API
+  control-plane-stop    Stop the API; running instances remain managed
+  control-plane-status  Show whether the API service is running
   setup                 Run doctor and install Firecracker
 EOF
 }
@@ -85,6 +90,20 @@ case "${command}" in
   deepseek-e2e-test)
     build_rootfs
     sudo "${repo_dir}/scripts/linux/deepseek-e2e-test.sh"
+    ;;
+  control-plane-smoke-test)
+    build_rootfs
+    sudo "${repo_dir}/scripts/linux/control-plane-smoke-test.sh"
+    ;;
+  control-plane-start)
+    build_rootfs
+    sudo "${repo_dir}/scripts/linux/control-plane-service.sh" start
+    ;;
+  control-plane-stop)
+    sudo "${repo_dir}/scripts/linux/control-plane-service.sh" stop
+    ;;
+  control-plane-status)
+    sudo "${repo_dir}/scripts/linux/control-plane-service.sh" status
     ;;
   setup)
     "${repo_dir}/scripts/linux/doctor.sh"
