@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""Firecracker 实例生命周期登记、心跳、空闲回收与销毁工具。
+
+本模块不负责创建 microVM；它接管一个已经启动的 Firecracker 进程，并把
+PID、PID 启动时钟、jail、数据盘和网络资源写入受控元数据。控制面和回归测试
+都复用这里的停止/清理规则，从而避免每个入口各自实现一套危险的进程删除逻辑。
+
+安全边界：
+- 实例 ID、TAP 名和 nftables 表名必须经过白名单校验；
+- 仅依据 PID 不足以识别进程，因此同时校验 /proc 中的启动时钟；
+- jail 和数据盘必须位于固定目录，拒绝对任意路径执行清理；
+- 普通停止和空闲回收保留数据盘，只有 destroy 才删除持久化数据。
+"""
+
 import argparse
 import json
 import os
@@ -18,12 +31,14 @@ RESOURCE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def validate_instance_id(instance_id: str) -> str:
+    """校验实例 ID，防止路径穿越和命令资源名注入。"""
     if not INSTANCE_RE.fullmatch(instance_id):
         raise SystemExit(f"invalid instance id: {instance_id}")
     return instance_id
 
 
 def paths(state_root: Path, instance_id: str) -> tuple[Path, Path, Path]:
+    """返回实例元数据、busy 标记和最后活动时间文件的固定路径。"""
     return (
         state_root / "instances" / f"{instance_id}.json",
         state_root / "instances" / f"{instance_id}.busy",
@@ -32,6 +47,7 @@ def paths(state_root: Path, instance_id: str) -> tuple[Path, Path, Path]:
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
+    """先写临时文件再原子替换，避免进程中断留下半截 JSON。"""
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
         json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
@@ -41,6 +57,7 @@ def atomic_write_json(path: Path, payload: dict) -> None:
 
 
 def load_metadata(state_root: Path, instance_id: str) -> tuple[Path, dict]:
+    """读取已登记实例；不存在时以 CLI 错误终止当前操作。"""
     metadata_path, _, _ = paths(state_root, instance_id)
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -50,6 +67,7 @@ def load_metadata(state_root: Path, instance_id: str) -> tuple[Path, dict]:
 
 
 def process_start_ticks(pid: int) -> int | None:
+    """读取 Linux 进程启动时钟，用于抵御 PID 被系统复用的问题。"""
     try:
         fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
         return int(fields[21])
@@ -58,6 +76,7 @@ def process_start_ticks(pid: int) -> int | None:
 
 
 def process_matches(metadata: dict) -> bool:
+    """确认 PID 仍存活且确实是登记时的那个进程，而不是复用同 PID 的新进程。"""
     pid = int(metadata["pid"])
     try:
         fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
@@ -69,6 +88,7 @@ def process_matches(metadata: dict) -> bool:
 
 
 def run_cleanup_command(arguments: list[str]) -> None:
+    """执行幂等清理命令；资源已经消失时不阻断后续清理。"""
     try:
         subprocess.run(
             arguments,
@@ -81,6 +101,7 @@ def run_cleanup_command(arguments: list[str]) -> None:
 
 
 def request_guest_shutdown(api_socket: Path) -> bool:
+    """通过 Firecracker Unix API 请求 guest Ctrl-Alt-Del 优雅关机。"""
     if not api_socket.is_socket():
         return False
     payload = b'{"action_type":"SendCtrlAltDel"}'
@@ -104,6 +125,7 @@ def request_guest_shutdown(api_socket: Path) -> bool:
 
 
 def wait_for_exit(metadata: dict, seconds: float) -> bool:
+    """在限定时间内轮询目标进程是否退出。"""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if not process_matches(metadata):
@@ -113,6 +135,7 @@ def wait_for_exit(metadata: dict, seconds: float) -> bool:
 
 
 def stop_process(metadata: dict) -> str:
+    """按 guest shutdown → SIGTERM → SIGKILL 的顺序停止 VMM。"""
     if not process_matches(metadata):
         return "already-exited"
 
@@ -140,6 +163,7 @@ def stop_process(metadata: dict) -> str:
 
 
 def cleanup_ephemeral(metadata: dict) -> None:
+    """清理 TAP、nftables 与 jail；持久化数据盘不在此函数删除。"""
     tap_name = metadata.get("tapName", "")
     if tap_name:
         if not RESOURCE_RE.fullmatch(tap_name) or len(tap_name) > 15:
@@ -164,6 +188,7 @@ def cleanup_ephemeral(metadata: dict) -> None:
 
 
 def stop_instance(state_root: Path, instance_id: str, reason: str) -> dict:
+    """停止实例、清理临时资源，并保留可供重启的数据盘和元数据。"""
     metadata_path, metadata = load_metadata(state_root, instance_id)
     stop_method = stop_process(metadata)
     cleanup_ephemeral(metadata)
@@ -180,6 +205,7 @@ def stop_instance(state_root: Path, instance_id: str, reason: str) -> dict:
 
 
 def command_register(args: argparse.Namespace) -> None:
+    """登记刚启动的 Firecracker 进程，并初始化活动时间。"""
     if os.geteuid() != 0:
         raise SystemExit("register must run as root")
     instance_id = validate_instance_id(args.instance_id)
@@ -233,6 +259,7 @@ def command_register(args: argparse.Namespace) -> None:
 
 
 def command_heartbeat(args: argparse.Namespace) -> None:
+    """刷新活动文件 mtime；空闲回收器以此计算 idleSeconds。"""
     instance_id = validate_instance_id(args.instance_id)
     _, metadata = load_metadata(args.state_root, instance_id)
     _, _, activity_path = paths(args.state_root, instance_id)
@@ -241,6 +268,7 @@ def command_heartbeat(args: argparse.Namespace) -> None:
 
 
 def command_busy(args: argparse.Namespace) -> None:
+    """设置长任务保护标记；busy 期间回收器不会因空闲时间停止实例。"""
     instance_id = validate_instance_id(args.instance_id)
     load_metadata(args.state_root, instance_id)
     _, busy_path, _ = paths(args.state_root, instance_id)
@@ -253,6 +281,7 @@ def command_busy(args: argparse.Namespace) -> None:
 
 
 def command_status(args: argparse.Namespace) -> None:
+    """输出机器可读的实例状态，并实时补充进程存活和空闲秒数。"""
     instance_id = validate_instance_id(args.instance_id)
     _, metadata = load_metadata(args.state_root, instance_id)
     _, busy_path, activity_path = paths(args.state_root, instance_id)
@@ -267,6 +296,7 @@ def command_status(args: argparse.Namespace) -> None:
 
 
 def command_watch(args: argparse.Namespace) -> None:
+    """持续观察单个实例，在进程退出或达到空闲阈值时完成回收。"""
     if os.geteuid() != 0:
         raise SystemExit("watch must run as root")
     instance_id = validate_instance_id(args.instance_id)
@@ -304,6 +334,7 @@ def command_watch(args: argparse.Namespace) -> None:
 
 
 def command_stop(args: argparse.Namespace) -> None:
+    """处理显式停止请求；数据盘保持不变。"""
     if os.geteuid() != 0:
         raise SystemExit("stop must run as root")
     instance_id = validate_instance_id(args.instance_id)
@@ -315,6 +346,7 @@ def command_stop(args: argparse.Namespace) -> None:
 
 
 def command_destroy(args: argparse.Namespace) -> None:
+    """必要时先停止实例，再删除数据盘、状态文件和活动标记。"""
     if os.geteuid() != 0:
         raise SystemExit("destroy must run as root")
     instance_id = validate_instance_id(args.instance_id)
@@ -334,6 +366,7 @@ def command_destroy(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """构造供 Shell 脚本和控制面共同调用的命令行接口。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -381,6 +414,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """解析子命令并把操作分派给对应生命周期处理函数。"""
+
     parser = build_parser()
     args = parser.parse_args()
     args.handler(args)

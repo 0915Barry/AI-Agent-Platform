@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""宿主侧模型 Tool Gateway。
+
+microVM 只知道 TAP 地址和占位 API Key；真实 DeepSeek Key 保存在 Ubuntu 宿主的
+受限文件中，由本进程读取并在转发请求时注入。Gateway 只开放经过白名单允许的
+Chat Completions 路由，审计记录元数据而不记录 Authorization 或完整请求正文。
+
+当前实现为了 MVP 简单可靠，会先完整读取上游响应再返回，能够兼容普通 JSON 和
+SSE 内容类型，但不提供逐 token 的实时转发；真正的聊天流式体验将在后续里程碑
+升级为背压可控的流式代理。
+"""
+
 import argparse
 import json
 import time
@@ -9,12 +20,14 @@ from pathlib import Path
 
 
 def append_audit(path: Path, event: dict) -> None:
+    """追加一行紧凑 JSON 审计事件；调用方不得传入凭据或完整正文。"""
     event = {"timestamp": int(time.time()), **event}
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, separators=(",", ":")) + "\n")
 
 
 def main() -> None:
+    """读取宿主凭据并启动绑定到指定 TAP 地址的并发 Gateway。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--listen-host", required=True)
     parser.add_argument("--listen-port", required=True, type=int)
@@ -30,12 +43,16 @@ def main() -> None:
         raise SystemExit("credential file is empty")
 
     class GatewayHandler(BaseHTTPRequestHandler):
+        """执行路由限制、请求校验、凭据替换、上游转发和脱敏审计。"""
+
         server_version = "AgentToolGateway/0.1"
 
         def log_message(self, _format: str, *args: object) -> None:
+            # 禁用 BaseHTTPRequestHandler 的原始访问日志，避免未来误记敏感头。
             return
 
         def send_json(self, status: int, payload: dict) -> None:
+            """返回 Gateway 自身产生的 JSON 错误。"""
             body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -44,6 +61,7 @@ def main() -> None:
             self.wfile.write(body)
 
         def do_POST(self) -> None:
+            """只代理 `/v1/chat/completions`，其他路径默认拒绝。"""
             if self.path != "/v1/chat/completions":
                 append_audit(
                     args.audit_file,
@@ -82,6 +100,7 @@ def main() -> None:
                 self.send_json(400, {"error": "invalid_request"})
                 return
 
+            # 不转发 guest 提供的 Authorization；始终使用宿主文件中的真实凭据。
             upstream_request = urllib.request.Request(
                 f"{args.upstream}{self.path}",
                 data=request_body,
@@ -111,6 +130,7 @@ def main() -> None:
             except (urllib.error.URLError, TimeoutError):
                 pass
 
+            # 限制响应体，防止异常上游无限占用高权限 Gateway 内存。
             if len(response_body) > 8 * 1024 * 1024:
                 status = 502
                 response_content_type = "application/json"
@@ -128,6 +148,7 @@ def main() -> None:
                 },
             )
             if args.activity_file is not None:
+                # 成功经过 Gateway 的模型活动可以延长实例生命周期。
                 try:
                     args.activity_file.touch()
                 except OSError:

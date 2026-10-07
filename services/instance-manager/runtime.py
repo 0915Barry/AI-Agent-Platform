@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""把“实例启动”从回归脚本抽象为可被控制面复用的运行时。
+
+InstanceRuntime 负责准备每个实例独立的数据盘和 jail、生成 Firecracker 配置、
+启动 VMM、等待 guest 就绪，并把进程交给 lifecycle.py 管理。它刻意不处理 HTTP、
+用户身份或模型消息，避免把高权限宿主操作与产品协议混在同一层。
+
+rootfs 始终只读；用户工作区位于独立 ext4 数据盘。停止实例只清理 VMM/jail，
+显式 destroy 才删除数据盘。这一语义与 M6/M8 的安全和持久化验收保持一致。
+"""
+
 import json
 import os
 import pwd
@@ -23,10 +33,13 @@ FIRECRACKER_GROUP = "firecracker"
 
 
 class RuntimeFailure(RuntimeError):
+    """可安全转换成控制面错误响应的运行时失败。"""
+
     pass
 
 
 def run(arguments: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    """统一执行宿主命令并捕获输出，避免错误信息散落到控制台。"""
     return subprocess.run(
         arguments,
         check=check,
@@ -37,6 +50,7 @@ def run(arguments: list[str], *, check: bool = True) -> subprocess.CompletedProc
 
 
 def load_version(name: str) -> str:
+    """读取仓库固定版本配置；运行时不接受浮动版本或环境覆盖。"""
     versions_path = Path(__file__).resolve().parents[2] / "config" / "versions.env"
     for raw_line in versions_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -49,6 +63,8 @@ def load_version(name: str) -> str:
 
 
 class InstanceRuntime:
+    """一台 Ubuntu KVM 宿主上的 Firecracker 实例运行时。"""
+
     def __init__(
         self,
         *,
@@ -67,10 +83,12 @@ class InstanceRuntime:
         self.rootfs_source = ARTIFACT_ROOT / "agent-rootfs.ext4"
 
     def require_root(self) -> None:
+        """宿主设备、挂载、jail 与 cgroup 操作必须由 root 完成。"""
         if os.geteuid() != 0:
             raise RuntimeFailure("instance runtime must run as root")
 
     def ensure_host(self) -> tuple[int, int]:
+        """验证构建产物和二进制，并确保专用低权限 VMM 用户存在。"""
         self.require_root()
         if not self.kernel_source.is_file():
             raise RuntimeFailure(f"guest kernel is missing: {self.kernel_source}")
@@ -113,6 +131,7 @@ class InstanceRuntime:
         return account.pw_uid, account.pw_gid
 
     def paths(self, instance_id: str) -> dict[str, Path]:
+        """集中生成实例所有路径，确保它们只能落在固定根目录。"""
         instance_id = validate_instance_id(instance_id)
         jail_path = FIRECRACKER_JAIL_ROOT / instance_id
         expected_jail = (FIRECRACKER_JAIL_ROOT / instance_id).resolve()
@@ -132,6 +151,11 @@ class InstanceRuntime:
         }
 
     def create_volume(self, volume_path: Path, uid: int, gid: int) -> None:
+        """原子创建 1 GiB ext4 数据盘，并初始化 Pi 可写目录。
+
+        先在 `.building` 文件中完成格式化和目录初始化，全部成功后再替换为正式
+        数据盘，避免中断后把不完整镜像误当成可用实例数据。
+        """
         if volume_path.exists():
             return
         expected_parent = self.volume_root.resolve()
@@ -164,6 +188,7 @@ class InstanceRuntime:
             building_path.unlink(missing_ok=True)
 
     def prepare_jail(self, instance_id: str, paths: dict[str, Path]) -> None:
+        """建立 jail hard link，并生成只读 rootfs + 可写数据盘配置。"""
         shutil.rmtree(paths["jail"], ignore_errors=True)
         paths["chroot"].mkdir(parents=True, mode=0o755)
         try:
@@ -221,6 +246,7 @@ class InstanceRuntime:
         os.chmod(config_path, 0o644)
 
     def lifecycle(self, *arguments: str, capture: bool = True) -> subprocess.CompletedProcess[str]:
+        """调用统一生命周期 CLI，并把子进程错误转换为 RuntimeFailure。"""
         command = [
             sys.executable,
             str(self.manager),
@@ -237,6 +263,11 @@ class InstanceRuntime:
         return subprocess.run(command, check=False, text=True)
 
     def start(self, instance_id: str) -> dict:
+        """启动实例并等待 AGENT_RUNTIME_READY 后再向调用者返回。
+
+        启动成功后登记 PID 并派生独立 idle watcher。即使 HTTP 控制面重启，
+        watcher 仍会在 5 分钟无活动后回收计算资源。
+        """
         instance_id = validate_instance_id(instance_id)
         uid, gid = self.ensure_host()
         paths = self.paths(instance_id)
@@ -253,6 +284,7 @@ class InstanceRuntime:
         paths["console"].write_text("", encoding="utf-8")
         os.chmod(paths["console"], 0o640)
 
+        # 让 VMM 控制台直接落盘，避免把 guest 输出混入控制面 JSON 响应。
         console_handle = paths["console"].open("ab", buffering=0)
         command = [
             "/usr/local/bin/jailer",
@@ -289,6 +321,7 @@ class InstanceRuntime:
         ready = False
         deadline = time.monotonic() + 60
         try:
+            # 以 guest 明确输出的 READY 标志作为启动成功条件，而不是只看 PID 存活。
             while time.monotonic() < deadline:
                 console = paths["console"].read_text(encoding="utf-8", errors="replace")
                 if "\nAGENT_RUNTIME_READY " in f"\n{console}":
@@ -321,6 +354,7 @@ class InstanceRuntime:
                 "--volume-path",
                 str(paths["volume"]),
             )
+            # watcher 是独立进程，因此控制面服务退出后空闲回收仍然有效。
             reaper_handle = paths["reaper"].open("ab", buffering=0)
             subprocess.Popen(
                 [
@@ -339,6 +373,7 @@ class InstanceRuntime:
                 start_new_session=True,
             )
             reaper_handle.close()
+            # 回收由本进程创建的 VMM 子进程，防止停止后留下 zombie。
             threading.Thread(target=process.wait, daemon=True).start()
             status = self.status(instance_id)
             if status is None:
@@ -355,6 +390,7 @@ class InstanceRuntime:
             raise
 
     def status(self, instance_id: str) -> dict | None:
+        """读取生命周期元数据，并实时计算进程存活与空闲时间。"""
         instance_id = validate_instance_id(instance_id)
         paths = self.paths(instance_id)
         if not paths["metadata"].is_file():
@@ -369,6 +405,7 @@ class InstanceRuntime:
         return metadata
 
     def heartbeat(self, instance_id: str) -> dict:
+        """刷新实例活动时间，并返回刷新后的运行状态。"""
         self.lifecycle("heartbeat", validate_instance_id(instance_id))
         status = self.status(instance_id)
         if status is None:
@@ -376,6 +413,7 @@ class InstanceRuntime:
         return status
 
     def stop(self, instance_id: str, reason: str = "api") -> dict:
+        """停止计算资源但保留实例记录和持久化数据盘。"""
         instance_id = validate_instance_id(instance_id)
         self.lifecycle("stop", instance_id, "--reason", reason)
         status = self.status(instance_id)
@@ -384,6 +422,7 @@ class InstanceRuntime:
         return status
 
     def destroy(self, instance_id: str) -> None:
+        """显式销毁实例，包括持久化数据盘和控制面运行日志目录。"""
         instance_id = validate_instance_id(instance_id)
         paths = self.paths(instance_id)
         if paths["metadata"].exists():

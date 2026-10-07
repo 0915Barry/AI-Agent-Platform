@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""M10 单机控制面 HTTP API。
+
+该服务把前端将来需要的“创建、启动、查询、心跳、停止、销毁”操作转换为
+InstanceRuntime 调用。产品状态保存在 SQLite；Firecracker 的实时进程状态仍以
+lifecycle.py 元数据和 /proc 为准，查询时会自动对两者进行校准。
+
+当前没有身份认证，因此 main() 强制只允许 loopback 监听。macOS 开发者应通过
+SSH 隧道访问，绝不能为了省事把监听地址改成 0.0.0.0。
+"""
+
 import argparse
 import json
 import os
@@ -29,6 +39,8 @@ INSTANCE_ROUTE_RE = re.compile(
 
 
 class ApiError(Exception):
+    """带 HTTP 状态码和稳定错误码的可预期 API 异常。"""
+
     def __init__(self, status: int, code: str, message: str) -> None:
         super().__init__(message)
         self.status = status
@@ -37,6 +49,12 @@ class ApiError(Exception):
 
 
 class InstanceStore:
+    """SQLite 产品状态仓库。
+
+    每次操作创建短连接，并显式提交/回滚/关闭，适配 ThreadingHTTPServer 的
+    多线程请求模型；数据库不保存供应商密钥或 guest 文件内容。
+    """
+
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
@@ -44,6 +62,7 @@ class InstanceStore:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
+        """提供具备事务和确定性关闭语义的数据库连接。"""
         connection = sqlite3.connect(self.database_path, timeout=10)
         connection.row_factory = sqlite3.Row
         try:
@@ -57,6 +76,7 @@ class InstanceStore:
             connection.close()
 
     def initialize(self) -> None:
+        """启用 WAL 并幂等创建最小实例表。"""
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
@@ -73,6 +93,7 @@ class InstanceStore:
 
     @staticmethod
     def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        """把 SQLite snake_case 字段映射成 API camelCase 字段。"""
         return {
             "id": row["id"],
             "status": row["status"],
@@ -82,6 +103,7 @@ class InstanceStore:
         }
 
     def create(self, instance_id: str) -> dict[str, Any]:
+        """创建 created 状态记录；重复 ID 返回 409。"""
         now = int(time.time())
         try:
             with self.connect() as connection:
@@ -94,6 +116,7 @@ class InstanceStore:
         return self.get(instance_id)
 
     def get(self, instance_id: str) -> dict[str, Any]:
+        """按 ID 查询记录；不存在时返回统一 404 语义。"""
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT id,status,created_at,updated_at,last_error FROM instances WHERE id=?",
@@ -104,6 +127,7 @@ class InstanceStore:
         return self.row_to_dict(row)
 
     def list(self) -> list[dict[str, Any]]:
+        """按创建时间稳定排序列出实例。"""
         with self.connect() as connection:
             rows = connection.execute(
                 "SELECT id,status,created_at,updated_at,last_error FROM instances ORDER BY created_at,id"
@@ -111,6 +135,7 @@ class InstanceStore:
         return [self.row_to_dict(row) for row in rows]
 
     def update(self, instance_id: str, status: str, last_error: str | None = None) -> dict[str, Any]:
+        """更新状态和最后错误，供状态机每个阶段使用。"""
         with self.connect() as connection:
             cursor = connection.execute(
                 "UPDATE instances SET status=?,updated_at=?,last_error=? WHERE id=?",
@@ -121,6 +146,7 @@ class InstanceStore:
         return self.get(instance_id)
 
     def delete(self, instance_id: str) -> None:
+        """删除产品记录；实际磁盘必须先由 Runtime 销毁。"""
         with self.connect() as connection:
             cursor = connection.execute("DELETE FROM instances WHERE id=?", (instance_id,))
         if cursor.rowcount != 1:
@@ -128,6 +154,12 @@ class InstanceStore:
 
 
 class ControlPlane:
+    """协调产品状态机与高权限 InstanceRuntime。
+
+    同一实例的变更使用进程内锁串行化，防止两个并发 start/stop 请求互相覆盖。
+    不同实例仍可由 ThreadingHTTPServer 并行处理。
+    """
+
     def __init__(self, store: InstanceStore, runtime: InstanceRuntime) -> None:
         self.store = store
         self.runtime = runtime
@@ -135,11 +167,13 @@ class ControlPlane:
         self._locks: dict[str, threading.Lock] = {}
 
     def lock_for(self, instance_id: str) -> threading.Lock:
+        """惰性创建每实例锁，锁表本身由 guard 保护。"""
         with self._locks_guard:
             return self._locks.setdefault(instance_id, threading.Lock())
 
     @staticmethod
     def validate_requested_id(instance_id: str) -> str:
+        """在进入文件系统和 Runtime 前拒绝非法实例 ID。"""
         if not INSTANCE_RE.fullmatch(instance_id):
             raise ApiError(
                 400,
@@ -149,6 +183,7 @@ class ControlPlane:
         return instance_id
 
     def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """建立逻辑实例；此时尚未分配磁盘或启动 microVM。"""
         requested = payload.get("id")
         if requested is None:
             instance_id = f"agent-{uuid.uuid4().hex[:12]}"
@@ -159,6 +194,11 @@ class ControlPlane:
         return self.store.create(instance_id)
 
     def reconcile(self, record: dict[str, Any]) -> dict[str, Any]:
+        """用真实 VMM 状态修正可能过期的 SQLite 状态。
+
+        例如独立 idle watcher 已停止实例，但控制面进程当时并未收到事件；下一次
+        GET/LIST 会在这里把 running 自动修正为 stopped。
+        """
         if record["status"] not in {"running", "starting", "stopping"}:
             return record
         runtime_status = self.runtime.status(record["id"])
@@ -171,12 +211,15 @@ class ControlPlane:
         return {**record, "runtime": runtime_status}
 
     def get(self, instance_id: str) -> dict[str, Any]:
+        """返回单个实例及其经校准的运行时状态。"""
         return self.reconcile(self.store.get(self.validate_requested_id(instance_id)))
 
     def list(self) -> list[dict[str, Any]]:
+        """列出全部实例，并逐个校准可能过期的状态。"""
         return [self.reconcile(record) for record in self.store.list()]
 
     def start(self, instance_id: str) -> dict[str, Any]:
+        """执行 created/stopped/failed → starting → running 状态流转。"""
         instance_id = self.validate_requested_id(instance_id)
         with self.lock_for(instance_id):
             record = self.get(instance_id)
@@ -193,6 +236,7 @@ class ControlPlane:
             return {**self.store.update(instance_id, "running"), "runtime": runtime_status}
 
     def stop(self, instance_id: str) -> dict[str, Any]:
+        """执行 running → stopping → stopped；停止不会删除数据盘。"""
         instance_id = self.validate_requested_id(instance_id)
         with self.lock_for(instance_id):
             record = self.get(instance_id)
@@ -209,6 +253,7 @@ class ControlPlane:
             return {**self.store.update(instance_id, "stopped"), "runtime": runtime_status}
 
     def heartbeat(self, instance_id: str) -> dict[str, Any]:
+        """仅允许 running 实例刷新活动时间。"""
         instance_id = self.validate_requested_id(instance_id)
         record = self.get(instance_id)
         if record["status"] != "running":
@@ -220,6 +265,7 @@ class ControlPlane:
         return {**record, "runtime": runtime_status}
 
     def destroy(self, instance_id: str) -> dict[str, Any]:
+        """先销毁宿主资源，再删除 SQLite 记录，避免产生孤儿磁盘。"""
         instance_id = self.validate_requested_id(instance_id)
         with self.lock_for(instance_id):
             record = self.store.get(instance_id)
@@ -233,6 +279,8 @@ class ControlPlane:
 
 
 class ControlPlaneHandler(BaseHTTPRequestHandler):
+    """只接受固定路由和 JSON 对象的小型 HTTP 适配层。"""
+
     server_version = "AgentControlPlane/0.1"
 
     @property
@@ -246,6 +294,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         )
 
     def send_payload(self, status: int, payload: dict[str, Any] | list[dict[str, Any]]) -> None:
+        """发送紧凑 JSON，并禁止缓存动态实例状态。"""
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -255,12 +304,14 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_error_payload(self, error: ApiError) -> None:
+        """保持所有可预期错误具有相同 JSON 结构。"""
         self.send_payload(
             error.status,
             {"error": {"code": error.code, "message": error.message}},
         )
 
     def read_json(self) -> dict[str, Any]:
+        """读取最多 64 KiB 的 JSON 对象，避免无限请求体占用 root 服务内存。"""
         raw_length = self.headers.get("Content-Length", "0")
         try:
             length = int(raw_length)
@@ -279,6 +330,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         return payload
 
     def do_GET(self) -> None:
+        """处理健康检查、实例列表和单实例查询。"""
         try:
             if self.path == "/healthz":
                 self.send_payload(200, {"status": "ok"})
@@ -295,6 +347,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self.send_error_payload(error)
 
     def do_POST(self) -> None:
+        """处理实例创建以及 start/stop/heartbeat 动作。"""
         try:
             if self.path == "/api/instances":
                 self.send_payload(201, self.control.create(self.read_json()))
@@ -315,6 +368,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self.send_error_payload(error)
 
     def do_DELETE(self) -> None:
+        """处理显式实例销毁；这是删除持久化数据的唯一 HTTP 操作。"""
         try:
             match = INSTANCE_ROUTE_RE.fullmatch(self.path)
             if not match or match.group(2) is not None:
@@ -325,6 +379,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """定义监听地址、数据库、生命周期状态目录和空闲阈值。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", default=18090, type=int)
@@ -335,6 +390,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """验证安全启动条件并运行多线程 loopback HTTP 服务。"""
     args = build_parser().parse_args()
     if os.geteuid() != 0:
         raise SystemExit("control plane must run as root")
