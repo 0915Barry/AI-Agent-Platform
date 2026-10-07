@@ -12,6 +12,65 @@
 - [架构与实现方案汇报](./docs/架构与实现方案汇报.md)
 - [服务器单机 MVP 架构设计图](./docs/服务器单机MVP架构设计图.md)
 
+## 新同事快速开始
+
+新同事**不需要**从 M0 到 M11 逐项运行。里程碑命令是底层研发、故障定位和
+回归测试入口；正常接入只使用 `bootstrap → configure-deepseek → verify → start`。
+
+开始前仍需人工创建一台支持嵌套虚拟化的 Ubuntu 24.04 VM：Mac 使用 UTM +
+Apple Virtualization + ARM64 Ubuntu，Windows x86_64 使用 VMware Workstation +
+AMD64 Ubuntu。VM 必须存在可读写的 `/dev/kvm`，并将仓库/镜像放在 Ubuntu 原生
+ext4 磁盘中。这部分涉及宿主 BIOS、公司安全策略和虚拟机安装，仓库不能自动代办。
+
+### macOS 同事
+
+在 Mac 克隆仓库后执行：
+
+```bash
+git clone https://github.com/0915Barry/AI-Agent-Platform.git
+cd AI-Agent-Platform
+
+# 首次安装：检查 Mac/UTM/KVM，同步代码，安装 Firecracker 并准备 rootfs
+./run.sh bootstrap <UTM-Linux-IP> agentdev
+
+# 隐藏输入并把 Key 保存到 Ubuntu VM，不写入仓库或 microVM
+./run.sh configure-deepseek
+
+# 新机器建议只执行一次完整端到端验收
+./run.sh verify
+
+# 日常开发只启动长期运行的控制面
+./run.sh start
+./run.sh status
+```
+
+结束开发时运行 `./run.sh stop`。停止控制面不会删除实例数据盘。
+
+### Windows 同事
+
+Windows 同事在 VMware 的 Ubuntu VM 内克隆仓库并执行：
+
+```bash
+git clone https://github.com/0915Barry/AI-Agent-Platform.git
+cd AI-Agent-Platform
+chmod +x run-linux.sh scripts/linux/*.sh scripts/guest/*.sh
+
+./run-linux.sh bootstrap
+./run-linux.sh configure-deepseek
+./run-linux.sh verify
+./run-linux.sh start
+./run-linux.sh status
+```
+
+结束开发时运行 `./run-linux.sh stop`。不要在 PowerShell、Git Bash 或 WSL2 中直接
+运行这些 Linux 命令。
+
+`bootstrap` 是一个幂等总入口，内部仍按检查、安装、下载和构建分阶段执行。当前
+仓库尚未发布预构建的 ARM64/AMD64 rootfs，因此每台全新机器第一次仍需完成一次
+本地构建，耗时不会因为合成一个命令而消失；之后构建指纹不变时会直接复用
+`/srv/fc/artifacts/agent-rootfs.ext4`。未来发布经过校验的双架构 runtime bundle 后，
+`bootstrap` 可以改为优先下载，失败时再回退到本地构建。
+
 ## 当前进度
 
 | 里程碑 | 内容 | 状态 |
@@ -274,7 +333,7 @@ Linux/KVM checks passed
 
 最小 microVM 成功标志中的架构应为 `x86_64`。脚本会自动选择 AMD64 Ubuntu、Node.js x64 和经过校验的 x86_64 Firecracker 构建物，不会下载 ARM64 文件。
 
-## 两个平台的完整验收顺序
+## 开发者分层验收（新同事无需逐项执行）
 
 最小 microVM 成功后按顺序执行。上一项失败时不要继续下一项：
 
@@ -300,6 +359,9 @@ Linux/KVM checks passed
 
 | 命令 | 作用 |
 |---|---|
+| `bootstrap` | 新机器的一键入口：检查环境、安装 Firecracker、准备内核并构建或复用 rootfs |
+| `verify` | 运行当前最高层 M11 端到端验收；新机器建议执行一次 |
+| `start` / `stop` / `status` | 日常启动、停止和查询长期运行的控制面 |
 | `doctor` | 检查当前控制端或 Linux/KVM 环境 |
 | `configure`（仅 `run.sh`） | 保存 Mac 到 UTM Linux 的连接设置 |
 | `sync`（仅 `run.sh`） | 通过 rsync 将源码同步到 UTM Linux |
@@ -316,7 +378,7 @@ Linux/KVM checks passed
 | `configure-deepseek` | 隐藏输入并将 API Key 保存到 Linux 用户私有目录 |
 | `deepseek-e2e-test` | 让 Pi Agent 经 Tool Gateway 调用 DeepSeek 并执行 `read` 工具 |
 | `control-plane-smoke-test` | 通过 HTTP API 创建、启动、查询、心跳、停止并销毁真实 microVM |
-| `agent-task-smoke-test` | 通过控制面向 microVM 内 Pi 下发真实任务，并验证 DeepSeek、工具写入和事件结果 |
+| `agent-task-smoke-test` | 通过控制面向 microVM 内 Pi 下发真实任务，并验证 DeepSeek、工具读取和事件结果 |
 | `control-plane-start` | 构建所需镜像并在 Ubuntu loopback 启动长期运行的控制面 |
 | `control-plane-stop` | 停止控制面进程；已启动实例仍由独立空闲回收器管理 |
 | `control-plane-status` | 查询控制面服务是否运行 |

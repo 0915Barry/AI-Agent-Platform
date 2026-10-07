@@ -10,6 +10,11 @@ Usage: ./run-linux.sh <command>
 Run this entry point inside the Ubuntu KVM host VM.
 
 Commands:
+  bootstrap             One-command install/build after the Ubuntu VM exists
+  verify                Run the end-to-end M11 acceptance test
+  start                 Start the long-running loopback control plane
+  stop                  Stop the control plane; preserve instance data
+  status                Show whether the control plane is running
   doctor                Check Linux, architecture, and /dev/kvm
   install-firecracker   Install the pinned Firecracker version
   prepare-microvm       Download verified artifacts for this CPU architecture
@@ -45,6 +50,26 @@ build_rootfs() {
 
 command="${1:-}"
 case "${command}" in
+  bootstrap)
+    "${repo_dir}/scripts/linux/doctor.sh"
+    sudo "${repo_dir}/scripts/linux/install-firecracker.sh"
+    build_rootfs
+    echo "BOOTSTRAP_READY runtime=pinned next=configure-deepseek"
+    ;;
+  verify)
+    build_rootfs
+    sudo "${repo_dir}/scripts/linux/agent-task-smoke-test.sh"
+    ;;
+  start)
+    build_rootfs
+    sudo "${repo_dir}/scripts/linux/control-plane-service.sh" start
+    ;;
+  stop)
+    sudo "${repo_dir}/scripts/linux/control-plane-service.sh" stop
+    ;;
+  status)
+    sudo "${repo_dir}/scripts/linux/control-plane-service.sh" status
+    ;;
   doctor)
     "${repo_dir}/scripts/linux/doctor.sh"
     ;;

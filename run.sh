@@ -19,6 +19,12 @@ usage() {
 Usage: ./run.sh <command>
 
 Commands:
+  bootstrap [vm-ip] [vm-user]
+                         One-command install/build after the Ubuntu VM exists
+  verify                 Run the end-to-end M11 acceptance test
+  start                  Start the long-running loopback control plane
+  stop                   Stop the control plane; preserve instance data
+  status                 Show whether the control plane is running
   doctor                Check the macOS host
   configure <vm-ip> [vm-user]
                          Save the Linux VM connection settings
@@ -46,6 +52,27 @@ Commands:
   setup <vm-ip> [vm-user]
                          Configure, check, sync, and install Firecracker
 EOF
+}
+
+bootstrap_environment() {
+  if [[ -n "${1:-}" ]]; then
+    configure_vm "${1}" "${2:-}"
+  elif [[ -z "${VM_HOST}" ]]; then
+    configure_vm
+  fi
+
+  "${repo_dir}/scripts/macos/doctor.sh"
+  check_vm
+  sync_repo
+  echo "Bootstrapping Firecracker and the pinned Agent runtime in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/install-firecracker.sh' && sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh'"
+  echo "BOOTSTRAP_READY host=${VM_HOST} runtime=pinned next=configure-deepseek"
 }
 
 configure_vm() {
@@ -307,6 +334,21 @@ control_plane_service() {
 
 command="${1:-}"
 case "${command}" in
+  bootstrap)
+    bootstrap_environment "${2:-}" "${3:-}"
+    ;;
+  verify)
+    smoke_test_agent_task
+    ;;
+  start)
+    control_plane_service start
+    ;;
+  stop)
+    control_plane_service stop
+    ;;
+  status)
+    control_plane_service status
+    ;;
   doctor)
     "${repo_dir}/scripts/macos/doctor.sh"
     ;;
