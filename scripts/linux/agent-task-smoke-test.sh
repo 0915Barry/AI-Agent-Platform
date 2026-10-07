@@ -172,6 +172,17 @@ curl --fail --silent --show-error --max-time 30 \
   --request POST "${base_url}/api/instances/${instance_id}/stop" \
   | jq -e '.status == "stopped"' >/dev/null
 
+# Firecracker 停止后 ext4 日志可能仍标记为需要恢复。只读挂载无法回放日志，
+# 因此先像 M6/M8 一样离线完成文件系统检查，再执行只读持久化验收。
+set +e
+e2fsck -f -y "${volume_path}" >/dev/null
+filesystem_check_status=$?
+set -e
+if [[ "${filesystem_check_status}" -gt 1 ]]; then
+  echo "FAIL: persistent Agent volume check failed with status ${filesystem_check_status}" >&2
+  exit "${filesystem_check_status}"
+fi
+
 verify_mount="$(mktemp -d /var/tmp/agent-m11-verify.XXXXXX)"
 mount -o loop,ro "${volume_path}" "${verify_mount}"
 stored_token="$(head -n 1 "${verify_mount}/workspace/m11-marker.txt")"
