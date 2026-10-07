@@ -736,9 +736,10 @@ SSE/WebSocket 流式显示。Gateway 当前也仍会缓冲完整上游响应，�
 ./run-linux.sh agent-task-smoke-test
 ```
 
-测试会让 Pi 使用 `write` 和 `read` 工具写入并验证随机标记，检查任务事件顺序、
-Gateway 审计、数据盘持久化以及显式销毁。首次执行会因为 guest Worker 文件变更而
-重建 rootfs。预期成功标志：
+测试会先由宿主向工作区写入模型未知的随机标记，重启同一实例，再让 Pi 必须使用
+`read` 工具取得内容；随后检查任务事件顺序、Gateway 审计、数据盘持久化以及显式
+销毁。因为 token 不出现在 prompt 中，模型无法靠复述指令绕过工具调用。首次执行
+可能因 guest Worker 文件变更而重建 rootfs。预期成功标志：
 
 ```text
 PASS: control plane completed a real Pi Agent task through DeepSeek

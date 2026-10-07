@@ -66,6 +66,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+check_volume() {
+  # Firecracker 停止后 ext4 日志可能仍标记为需要恢复。只读挂载无法回放日志，
+  # 因此像 M6/M8 一样先离线完成文件系统检查。
+  set +e
+  e2fsck -f -y "${volume_path}" >/dev/null
+  filesystem_check_status=$?
+  set -e
+  if [[ "${filesystem_check_status}" -gt 1 ]]; then
+    echo "FAIL: persistent Agent volume check failed with status ${filesystem_check_status}" >&2
+    exit "${filesystem_check_status}"
+  fi
+}
+
 export DEBIAN_FRONTEND=noninteractive
 missing_packages=false
 for required_command in curl e2fsck ip jq mkfs.ext4 mount nft python3 setpriv ss truncate; do
@@ -129,7 +142,29 @@ curl --fail --silent --show-error --max-time 120 \
   | jq -e '.status == "running" and .runtime.processAlive == true' >/dev/null
 
 token="$(tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-16)"
-prompt="Use the write tool to write exactly ${token} followed by a newline to /workspace/m11-marker.txt. Then use the read tool to verify it. Reply with exactly M11_AGENT_TASK_OK:${token} and no other text."
+
+# 先停止实例并由宿主写入一个模型未知的随机值，再重启同一实例。这样最终回复
+# 只有在 Pi 真实调用 read 工具后才能得到，无法从 prompt 中直接复制答案。
+curl --fail --silent --show-error --max-time 30 \
+  --request POST "${base_url}/api/instances/${instance_id}/stop" \
+  | jq -e '.status == "stopped"' >/dev/null
+check_volume
+
+verify_mount="$(mktemp -d /var/tmp/agent-m11-seed.XXXXXX)"
+mount -o loop "${volume_path}" "${verify_mount}"
+printf '%s\n' "${token}" > "${verify_mount}/workspace/m11-marker.txt"
+chmod 0644 "${verify_mount}/workspace/m11-marker.txt"
+sync
+umount "${verify_mount}"
+rmdir "${verify_mount}"
+verify_mount=""
+
+echo "Restarting the managed instance with a host-seeded persistent marker..."
+curl --fail --silent --show-error --max-time 120 \
+  --request POST "${base_url}/api/instances/${instance_id}/start" \
+  | jq -e '.status == "running" and .runtime.processAlive == true' >/dev/null
+
+prompt="Use the read tool to read /workspace/m11-marker.txt. Reply with exactly M11_AGENT_TASK_OK followed by a colon and the complete file contents. Do not add any other text."
 task_payload="$(jq -n --arg prompt "${prompt}" '{prompt:$prompt}')"
 task_response="$(
   curl --fail --silent --show-error --max-time 10 \
@@ -172,29 +207,17 @@ curl --fail --silent --show-error --max-time 30 \
   --request POST "${base_url}/api/instances/${instance_id}/stop" \
   | jq -e '.status == "stopped"' >/dev/null
 
-# Firecracker 停止后 ext4 日志可能仍标记为需要恢复。只读挂载无法回放日志，
-# 因此先像 M6/M8 一样离线完成文件系统检查，再执行只读持久化验收。
-set +e
-e2fsck -f -y "${volume_path}" >/dev/null
-filesystem_check_status=$?
-set -e
-if [[ "${filesystem_check_status}" -gt 1 ]]; then
-  echo "FAIL: persistent Agent volume check failed with status ${filesystem_check_status}" >&2
-  exit "${filesystem_check_status}"
-fi
+check_volume
 
 verify_mount="$(mktemp -d /var/tmp/agent-m11-verify.XXXXXX)"
 mount -o loop,ro "${volume_path}" "${verify_mount}"
 marker_path="${verify_mount}/workspace/m11-marker.txt"
-marker_valid=false
-if [[ -s "${marker_path}" ]] && grep -Fq -- "${token}" "${marker_path}"; then
-  marker_valid=true
-fi
+stored_token="$(head -n 1 "${marker_path}")"
 umount "${verify_mount}"
 rmdir "${verify_mount}"
 verify_mount=""
-if [[ "${marker_valid}" != true ]]; then
-  echo "FAIL: Agent tool output file did not contain the expected persistence token" >&2
+if [[ "${stored_token}" != "${token}" ]]; then
+  echo "FAIL: host-seeded marker was not preserved across the managed instance restart" >&2
   exit 1
 fi
 
