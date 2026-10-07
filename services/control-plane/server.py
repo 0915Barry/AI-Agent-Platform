@@ -9,9 +9,10 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -41,10 +42,19 @@ class InstanceStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
         self.initialize()
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.database_path, timeout=10)
         connection.row_factory = sqlite3.Row
-        return connection
+        try:
+            yield connection
+        except Exception:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+        finally:
+            connection.close()
 
     def initialize(self) -> None:
         with self.connect() as connection:
