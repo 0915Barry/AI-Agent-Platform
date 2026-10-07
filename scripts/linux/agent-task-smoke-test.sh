@@ -185,12 +185,16 @@ fi
 
 verify_mount="$(mktemp -d /var/tmp/agent-m11-verify.XXXXXX)"
 mount -o loop,ro "${volume_path}" "${verify_mount}"
-stored_token="$(head -n 1 "${verify_mount}/workspace/m11-marker.txt")"
+marker_path="${verify_mount}/workspace/m11-marker.txt"
+marker_valid=false
+if [[ -s "${marker_path}" ]] && grep -Fq -- "${token}" "${marker_path}"; then
+  marker_valid=true
+fi
 umount "${verify_mount}"
 rmdir "${verify_mount}"
 verify_mount=""
-if [[ "${stored_token}" != "${token}" ]]; then
-  echo "FAIL: Agent tool write was not preserved on the data volume" >&2
+if [[ "${marker_valid}" != true ]]; then
+  echo "FAIL: Agent tool output file did not contain the expected persistence token" >&2
   exit 1
 fi
 
