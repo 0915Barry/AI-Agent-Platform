@@ -57,6 +57,36 @@ cd AI-Agent-Platform
 浏览器打开 `http://127.0.0.1:5173`。结束开发时分别按 `Ctrl-C` 停止页面和隧道，
 再运行 `./run.sh stop`；停止控制面不会删除实例数据盘。
 
+#### macOS 日常开启
+
+`bootstrap`、`configure-deepseek` 和 `verify` 只需要在首次部署或排查底层问题时运行。
+日常使用先启动 UTM 中的 Ubuntu VM，然后在仓库根目录打开三个终端：
+
+```bash
+# 终端 1：启动 Ubuntu VM 内的长期控制面；命令完成后可以关闭此终端
+./run.sh start
+
+# 终端 2：控制面 SSH 隧道；必须保持运行
+./run.sh tunnel
+
+# 终端 3：前端开发页面；必须保持运行
+./run.sh web-dev
+```
+
+浏览器打开 `http://127.0.0.1:5173`，在页面中选择实例并点击“启动实例”。不需要再
+单独运行 microVM 脚本；页面的“启动实例”会通过控制面启动 Firecracker。
+
+#### macOS 正常关闭
+
+1. 在页面中点击正在运行实例的“停止”。这会保留会话、工作区文件和数据盘。
+2. 在运行 `web-dev` 的终端按 `Ctrl-C`。
+3. 在运行 `tunnel` 的终端按 `Ctrl-C`。
+4. 在仓库根目录运行 `./run.sh stop`，停止 Ubuntu VM 内的控制面。
+5. 不再使用 Ubuntu 时，可以正常关闭 Ubuntu，再退出 UTM。
+
+不要用页面的“销毁”代替“停止”；“销毁”会删除该实例的数据盘、工作区文件、会话
+和任务记录。
+
 ### Windows + VMware 首次部署
 
 在 VMware 的 Ubuntu VM 内克隆仓库并执行：
@@ -88,6 +118,38 @@ ssh -N -L 5173:127.0.0.1:5173 agentdev@<Ubuntu-VM-IP>
 Windows 浏览器打开 `http://127.0.0.1:5173`。结束开发时按 `Ctrl-C` 停止页面隧道，
 在 Ubuntu 运行 `./run-linux.sh stop`。不要在 PowerShell、Git Bash 或 WSL2 中直接
 执行 `run-linux.sh`。
+
+#### Windows + VMware 日常开启
+
+首次部署完成后，不需要每天重复 `bootstrap`、`configure-deepseek` 或 `verify`。
+先启动 VMware 中的 Ubuntu VM，再按下面方式运行：
+
+```bash
+# Ubuntu 终端 1：启动长期控制面；命令完成后可以关闭此终端
+./run-linux.sh start
+
+# Ubuntu 终端 2：启动前端页面；必须保持运行
+./run-linux.sh web-dev
+```
+
+然后在 Windows PowerShell 中运行并保持该窗口开启：
+
+```powershell
+ssh -N -L 5173:127.0.0.1:5173 agentdev@<Ubuntu-VM-IP>
+```
+
+Windows 浏览器打开 `http://127.0.0.1:5173`，在页面中选择实例并点击“启动实例”。
+Firecracker 仍运行在 Ubuntu VM 内，Windows 不需要直接执行任何 `.sh` 文件。
+
+#### Windows + VMware 正常关闭
+
+1. 在页面中点击正在运行实例的“停止”，保留会话和工作区数据。
+2. 在 Ubuntu 中运行 `web-dev` 的终端按 `Ctrl-C`。
+3. 在 Windows PowerShell 的 SSH 隧道窗口按 `Ctrl-C`。
+4. 在 Ubuntu 仓库目录运行 `./run-linux.sh stop`，停止控制面。
+5. 不再使用时，正常关闭 Ubuntu VM，再退出 VMware。
+
+同样不要误点“销毁”；只有确定不再需要实例的全部持久化数据时才使用该操作。
 
 `bootstrap` 是一个幂等总入口，内部仍按检查、安装、下载和构建分阶段执行。当前
 仓库尚未发布预构建的 ARM64/AMD64 rootfs，因此每台全新机器第一次仍需完成一次
