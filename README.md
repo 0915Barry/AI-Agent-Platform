@@ -14,7 +14,7 @@
 
 ## 快速开始
 
-首次部署**不需要**从 M0 到 M11 逐项运行。里程碑命令是底层研发、故障定位和
+首次部署**不需要**从 M0 到 M12 逐项运行。里程碑命令是底层研发、故障定位和
 回归测试入口；首次运行只使用 `bootstrap → configure-deepseek → verify → start`。
 
 开始前仍需人工创建一台支持嵌套虚拟化的 Ubuntu 24.04 VM：Mac 使用 UTM +
@@ -44,7 +44,18 @@ cd AI-Agent-Platform
 ./run.sh status
 ```
 
-结束开发时运行 `./run.sh stop`。停止控制面不会删除实例数据盘。
+需要使用 M12 页面时，再开两个 macOS 终端分别运行：
+
+```bash
+# 终端 2：把只监听 Ubuntu loopback 的控制面安全转发到 Mac
+./run.sh tunnel
+
+# 终端 3：安装依赖（首次）并启动本地页面
+./run.sh web-dev
+```
+
+浏览器打开 `http://127.0.0.1:5173`。结束开发时分别按 `Ctrl-C` 停止页面和隧道，
+再运行 `./run.sh stop`；停止控制面不会删除实例数据盘。
 
 ### Windows + VMware 首次部署
 
@@ -53,7 +64,7 @@ cd AI-Agent-Platform
 ```bash
 git clone https://github.com/0915Barry/AI-Agent-Platform.git
 cd AI-Agent-Platform
-chmod +x run-linux.sh scripts/linux/*.sh scripts/guest/*.sh
+chmod +x run-linux.sh scripts/common/*.sh scripts/linux/*.sh scripts/guest/*.sh
 
 ./run-linux.sh bootstrap
 ./run-linux.sh configure-deepseek
@@ -62,8 +73,21 @@ chmod +x run-linux.sh scripts/linux/*.sh scripts/guest/*.sh
 ./run-linux.sh status
 ```
 
-结束开发时运行 `./run-linux.sh stop`。不要在 PowerShell、Git Bash 或 WSL2 中直接
-运行这些 Linux 命令。
+需要使用 M12 页面时，在 Ubuntu VM 再开一个终端运行：
+
+```bash
+./run-linux.sh web-dev
+```
+
+然后在 Windows PowerShell 建立仅本机可见的页面隧道：
+
+```powershell
+ssh -N -L 5173:127.0.0.1:5173 agentdev@<Ubuntu-VM-IP>
+```
+
+Windows 浏览器打开 `http://127.0.0.1:5173`。结束开发时按 `Ctrl-C` 停止页面隧道，
+在 Ubuntu 运行 `./run-linux.sh stop`。不要在 PowerShell、Git Bash 或 WSL2 中直接
+执行 `run-linux.sh`。
 
 `bootstrap` 是一个幂等总入口，内部仍按检查、安装、下载和构建分阶段执行。当前
 仓库尚未发布预构建的 ARM64/AMD64 rootfs，因此每台全新机器第一次仍需完成一次
@@ -87,6 +111,7 @@ chmod +x run-linux.sh scripts/linux/*.sh scripts/guest/*.sh
 | M9 | Pi Agent → Tool Gateway → DeepSeek 真实联调 | ✅ 已通过 |
 | M10 | HTTP 控制面管理真实 microVM 生命周期 | ✅ 已通过 |
 | M11 | 控制面向 Pi Agent 下发任务并经 DeepSeek 返回结果 | ✅ 已通过 |
+| M12 | React 管理页面操作实例并提交 Agent 任务 | ✅ 已通过 |
 
 ## 当前支持范围
 
@@ -362,6 +387,10 @@ Linux/KVM checks passed
 | `bootstrap` | 新机器的一键入口：检查环境、安装 Firecracker、准备内核并构建或复用 rootfs |
 | `verify` | 运行当前最高层 M11 端到端验收；新机器建议执行一次 |
 | `start` / `stop` / `status` | 日常启动、停止和查询长期运行的控制面 |
+| `tunnel`（仅 `run.sh`） | 将 Mac 的 `127.0.0.1:18090` 安全转发到 Ubuntu loopback 控制面 |
+| `web-install` | 安装 lockfile 固定的前端依赖；Linux 自动使用项目固定的 Node.js |
+| `web-build` | 执行 TypeScript 检查并生成生产构建 |
+| `web-dev` | 在 `127.0.0.1:5173` 启动 M12 开发页面和控制面反向代理 |
 | `doctor` | 检查当前控制端或 Linux/KVM 环境 |
 | `configure`（仅 `run.sh`） | 保存 Mac 到 UTM Linux 的连接设置 |
 | `sync`（仅 `run.sh`） | 通过 rsync 将源码同步到 UTM Linux |
@@ -823,6 +852,82 @@ AGENT_TASK_READY transport=http-poll events=ordered gateway=isolated persistence
 Gateway 使用 DeepSeek，并能读取 prompt 中未知的工作区随机标记。停止并重启计算
 实例后，同一数据盘内容仍然保留，任务事件按 `queued → started → completed` 顺序
 记录，正式空闲回收阈值保持为 5 分钟。
+
+## M12 Web 管理页面
+
+M12 在 M10/M11 API 上增加一个 React + TypeScript 页面，代码位于 `apps/web/`。
+它没有绕过现有安全边界：浏览器只连接本机 Vite 代理，代理再访问 loopback 控制面；
+DeepSeek Key 仍只保存在 Ubuntu 宿主的受限文件中，不会进入浏览器、仓库或 microVM。
+
+当前页面支持：
+
+- 查看、创建、启动、停止和显式销毁 Agent 实例；
+- 查看 microVM 进程状态、最后更新时间和 5 分钟空闲回收倒计时；
+- 向运行中的 Pi Agent 提交任务，并每秒轮询任务状态和最终结果；
+- 清晰显示控制面离线、实例错误和任务失败信息；
+- 窄屏自适应布局，便于演示和后续继续开发。
+
+### macOS 真实链路验收
+
+以下三个命令分别使用三个终端。`start` 返回后不需要保持终端占用：
+
+```bash
+# 终端 1
+./run.sh start
+
+# 终端 2：保持运行
+./run.sh tunnel
+
+# 终端 3：保持运行
+./run.sh web-dev
+```
+
+打开 `http://127.0.0.1:5173`，页面右上角应显示“控制面在线”。随后依次：
+
+1. 创建实例；
+2. 点击“启动实例”，等待状态变为“运行中”；
+3. 输入一个小任务并发送，等待任务显示“已完成”和 DeepSeek 返回内容；
+4. 点击“停止”验证数据保留；仅在确认不再需要数据时点击“销毁”。
+
+前端的独立构建检查可随时运行：
+
+```bash
+./run.sh web-build
+```
+
+### Windows + VMware 真实链路验收
+
+控制面和页面都在 Ubuntu VM 内运行，因此 Vite 代理无需跨虚拟机访问 M10 API：
+
+```bash
+# Ubuntu 终端 1
+./run-linux.sh start
+
+# Ubuntu 终端 2：保持运行
+./run-linux.sh web-dev
+```
+
+在 Windows PowerShell 运行下面的转发，并保持窗口打开：
+
+```powershell
+ssh -N -L 5173:127.0.0.1:5173 agentdev@<Ubuntu-VM-IP>
+```
+
+然后用 Windows 浏览器打开 `http://127.0.0.1:5173`，按与 macOS 相同的四步进行
+验收。Linux 入口会从 rootfs 下载缓存复用固定 Node.js 22.19.0；缓存不存在时会从
+Node.js 官方地址下载并校验 SHA-256，因此不依赖 Ubuntu 自带 Node 版本。
+
+M12 当前仍沿用 M10 的 loopback-only 无认证边界，不得把 5173 或 18090 改为
+`0.0.0.0` 暴露到局域网。用户登录、多租户授权、SSE/WebSocket 流式输出和生产静态
+部署属于后续里程碑，不是本阶段的安全承诺。
+
+### M12 验收结果
+
+已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境中通过页面创建并启动真实
+实例，向 Pi Agent 提交问题，并成功取得 DeepSeek 回答。页面与 API 之间通过 SSH
+loopback 隧道连接，模型凭据仍由宿主 Tool Gateway 隔离。空闲倒计时只把真实任务
+领取、模型请求和事件回传计为活动；guest 对空任务队列的内部轮询不会延长实例寿命。
+已继续等待完整 5 分钟并确认实例自动停止，独立数据盘保持不变，可重新启动恢复工作区。
 
 ## 跨平台常见错误
 

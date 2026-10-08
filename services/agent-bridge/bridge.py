@@ -73,11 +73,14 @@ def main() -> None:
             try:
                 if self.path == "/guest/tasks/next":
                     task = store.claim_next(args.instance_id)
-                    args.activity_file.touch()
                     if task is None:
+                        # guest Worker 每秒短轮询一次。空队列轮询只是内部保活流量，
+                        # 不能算作用户活动，否则 activity mtime 会被永久刷新，实例
+                        # 永远无法达到空闲回收阈值。
                         self.send_response(204)
                         self.end_headers()
                         return
+                    args.activity_file.touch()
                     audit({"instance": args.instance_id, "task": task["id"], "event": "claimed"})
                     self.send_json(200, {"id": task["id"], "prompt": task["prompt"]})
                     return

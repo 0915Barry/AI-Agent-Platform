@@ -25,6 +25,10 @@ Commands:
   start                  Start the long-running loopback control plane
   stop                   Stop the control plane; preserve instance data
   status                 Show whether the control plane is running
+  tunnel                Forward local port 18090 to the VM control plane
+  web-install           Install the pinned M12 web dependencies
+  web-build             Type-check and build the M12 web console
+  web-dev               Start the loopback-only M12 web console
   doctor                Check the macOS host
   configure <vm-ip> [vm-user]
                          Save the Linux VM connection settings
@@ -126,6 +130,11 @@ sync_repo() {
     --exclude '.git/' \
     --exclude '.env' \
     --exclude '.DS_Store' \
+    --exclude '.tools/' \
+    --exclude '__pycache__/' \
+    --exclude '*.pyc' \
+    --exclude 'node_modules/' \
+    --exclude 'dist/' \
     --exclude 'artifacts/' \
     --exclude 'runtime/' \
     "${repo_dir}/" "${target}:${REMOTE_DIR}/"
@@ -332,6 +341,17 @@ control_plane_service() {
     -t "${VM_USER}@${VM_HOST}" "${remote_command}"
 }
 
+control_plane_tunnel() {
+  require_vm_host
+  echo "Forwarding http://127.0.0.1:18090 to ${VM_USER}@${VM_HOST}. Press Ctrl-C to stop."
+  exec ssh \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -N -L 127.0.0.1:18090:127.0.0.1:18090 \
+    "${VM_USER}@${VM_HOST}"
+}
+
 command="${1:-}"
 case "${command}" in
   bootstrap)
@@ -348,6 +368,18 @@ case "${command}" in
     ;;
   status)
     control_plane_service status
+    ;;
+  tunnel)
+    control_plane_tunnel
+    ;;
+  web-install)
+    "${repo_dir}/scripts/common/web.sh" install
+    ;;
+  web-build)
+    "${repo_dir}/scripts/common/web.sh" build
+    ;;
+  web-dev)
+    "${repo_dir}/scripts/common/web.sh" dev
     ;;
   doctor)
     "${repo_dir}/scripts/macos/doctor.sh"

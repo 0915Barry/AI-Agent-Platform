@@ -16,3 +16,7 @@ artifacts/
 runtime/
 volumes/
 snapshots/
+apps/web/node_modules/
+apps/web/dist/
+*.tsbuildinfo
+.tools/
