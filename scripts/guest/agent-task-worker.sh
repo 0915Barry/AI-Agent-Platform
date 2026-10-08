@@ -18,7 +18,43 @@ post_event() {
     "${bridge_url}/guest/tasks/${task_id}/events" >/dev/null
 }
 
+post_workspace_result() {
+  operation_id="$1"
+  payload_file="$2"
+  curl --fail --silent --show-error \
+    --connect-timeout 3 --max-time 20 \
+    --header "Authorization: Bearer ${bridge_token}" \
+    --header 'Content-Type: application/json' \
+    --data-binary "@${payload_file}" \
+    "${bridge_url}/guest/workspace/${operation_id}/result" >/dev/null
+}
+
 while true; do
+  # 文件请求和 Agent 任务使用同一个串行 Worker，避免两者同时改写工作区。
+  workspace_file="$(mktemp /tmp/workspace-operation.XXXXXX.json)"
+  workspace_status="$({
+    curl --silent --show-error \
+      --connect-timeout 3 --max-time 15 \
+      --output "${workspace_file}" --write-out '%{http_code}' \
+      --request POST \
+      --header "Authorization: Bearer ${bridge_token}" \
+      "${bridge_url}/guest/workspace/next"
+  } || true)"
+  if [[ "${workspace_status}" == "200" ]]; then
+    operation_id="$(jq -r '.id // empty' "${workspace_file}")"
+    result_file="$(mktemp /tmp/workspace-result.XXXXXX.json)"
+    if [[ "${operation_id}" =~ ^workspace-[0-9a-f]{16}$ ]]; then
+      # mktemp 默认仅 root 可读；把单次请求交给低权限 pi 用户后再执行。
+      chown pi:pi "${workspace_file}"
+      runuser -u pi -- env HOME=/home/pi PATH="${runtime_path}" \
+        node /usr/local/sbin/workspace-operation.mjs "${workspace_file}" >"${result_file}"
+      post_workspace_result "${operation_id}" "${result_file}" || true
+    fi
+    rm -f "${workspace_file}" "${result_file}"
+    continue
+  fi
+  rm -f "${workspace_file}"
+
   task_file="$(mktemp /tmp/agent-task.XXXXXX.json)"
   http_status="$({
     curl --silent --show-error \

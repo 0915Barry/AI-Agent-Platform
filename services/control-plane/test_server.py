@@ -14,6 +14,8 @@
 import importlib.util
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -254,6 +256,51 @@ class ControlPlaneTests(unittest.TestCase):
         task = migrated.get("agent-old", "task-0000000000000000")
         self.assertEqual(task["output"], "ok")
         self.assertIsNone(task["conversationId"])
+
+    def test_workspace_operation_is_scoped_and_returns_guest_result(self) -> None:
+        """文件请求只能被目标实例领取，控制面应等待并返回 guest 结果。"""
+
+        self.control.create({"id": "agent-files"})
+        self.control.create({"id": "agent-other"})
+        self.control.start("agent-files")
+
+        def guest() -> None:
+            operation = None
+            for _ in range(50):
+                operation = self.tasks.claim_next_workspace_operation("agent-files")
+                if operation:
+                    break
+                time.sleep(0.01)
+            assert operation is not None
+            self.assertEqual(operation["path"], "docs/readme.txt")
+            self.tasks.finish_workspace_operation(
+                "agent-files", operation["id"], "completed", {"path": operation["path"], "size": 5}
+            )
+
+        worker = threading.Thread(target=guest)
+        worker.start()
+        result = self.control.workspace_operation(
+            "agent-files", "write", {"path": "docs/readme.txt", "contentBase64": "aGVsbG8="}
+        )
+        worker.join()
+        self.assertEqual(result, {"path": "docs/readme.txt", "size": 5})
+        self.assertIsNone(self.tasks.claim_next_workspace_operation("agent-other"))
+
+    def test_workspace_rejects_traversal_and_large_files(self) -> None:
+        """控制面在请求进入 guest 前拒绝目录穿越与超过 5 MiB 的内容。"""
+
+        self.control.create({"id": "agent-files"})
+        self.control.start("agent-files")
+        for unsafe in ("../secret", "folder/../secret", "/etc/shadow", "folder\\secret"):
+            with self.assertRaises(SERVER.ApiError) as rejected:
+                self.control.workspace_operation("agent-files", "read", {"path": unsafe})
+            self.assertEqual(rejected.exception.status, 400)
+        oversized = "A" * (((5 * 1024 * 1024 + 1) * 4 + 2) // 3)
+        with self.assertRaises(SERVER.ApiError) as too_large:
+            self.control.workspace_operation(
+                "agent-files", "write", {"path": "large.bin", "contentBase64": oversized}
+            )
+        self.assertIn(too_large.exception.status, {400, 413})
 
 
 if __name__ == "__main__":

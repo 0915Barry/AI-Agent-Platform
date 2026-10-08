@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { api } from "./api";
-import type { AgentConversation, AgentInstance, AgentMessage, AgentTask } from "./api";
+import type { AgentConversation, AgentInstance, AgentMessage, AgentTask, WorkspaceEntry, WorkspaceFile } from "./api";
 
 const statusLabel: Record<string, string> = {
   created: "待启动", starting: "启动中", running: "运行中", stopping: "停止中",
@@ -44,6 +44,10 @@ export default function App() {
   const [action, setAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [clock, setClock] = useState(() => Date.now());
+  const [consoleView, setConsoleView] = useState<"chat" | "files">("chat");
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [workspaceEntries, setWorkspaceEntries] = useState<WorkspaceEntry[]>([]);
+  const [workspacePreview, setWorkspacePreview] = useState<WorkspaceFile | null>(null);
   const idleClocks = useRef<Record<string, { deadline: number; serverIdleSeconds: number }>>({});
   const conversationViewport = useRef<HTMLDivElement | null>(null);
 
@@ -123,6 +127,9 @@ export default function App() {
     setSelectedConversationId(null);
     setMessages([]);
     setTask(null);
+    setWorkspacePath("");
+    setWorkspaceEntries([]);
+    setWorkspacePreview(null);
     if (!selectedId) return;
     void loadConversations(selectedId).catch((caught) =>
       setError(caught instanceof Error ? caught.message : "会话列表加载失败"));
@@ -214,6 +221,68 @@ export default function App() {
     });
   }
 
+  async function loadWorkspace(path = workspacePath) {
+    if (!selected || selected.status !== "running") return;
+    await runAction("files", async () => {
+      const listing = await api.listWorkspace(selected.id, path);
+      setWorkspacePath(listing.path);
+      setWorkspaceEntries(listing.entries);
+      setWorkspacePreview(null);
+    });
+  }
+
+  async function openWorkspaceEntry(entry: WorkspaceEntry) {
+    if (!selected || entry.type === "unsupported") return;
+    if (entry.type === "directory") {
+      await loadWorkspace(entry.path);
+      return;
+    }
+    await runAction("files", async () => {
+      setWorkspacePreview(await api.readWorkspaceFile(selected.id, entry.path));
+    });
+  }
+
+  function uploadWorkspaceFile(file: File) {
+    if (!selected) return;
+    if (file.size > 5 * 1024 * 1024) {
+      setError("单个文件不能超过 5 MiB");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => void runAction("files", async () => {
+      const dataUrl = String(reader.result);
+      const contentBase64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
+      const target = workspacePath ? `${workspacePath}/${file.name}` : file.name;
+      await api.writeWorkspaceFile(selected.id, target, contentBase64);
+      const listing = await api.listWorkspace(selected.id, workspacePath);
+      setWorkspaceEntries(listing.entries);
+    });
+    reader.onerror = () => setError("无法读取本地文件");
+    reader.readAsDataURL(file);
+  }
+
+  function downloadWorkspaceFile(file: WorkspaceFile) {
+    const binary = window.atob(file.contentBase64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    const url = URL.createObjectURL(new Blob([bytes]));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = file.name;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function previewText(file: WorkspaceFile) {
+    try {
+      const binary = window.atob(file.contentBase64);
+      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      return "该文件不是 UTF-8 文本，请下载后查看。";
+    }
+  }
+
   const idleRemaining = useMemo(() => {
     if (!selected?.runtime || selected.status !== "running") return null;
     const deadline = idleClocks.current[selected.id]?.deadline;
@@ -269,8 +338,8 @@ export default function App() {
             {error ? <div className="error-banner">{error}</div> : null}
             {selected.lastError ? <div className="error-banner">{selected.lastError}</div> : null}
             <div className="agent-console">
-              <div className="console-heading"><div><span className="eyebrow">PI AGENT · M13</span><h3>{selectedConversation?.title ?? "多轮会话"}</h3></div><span className={`task-chip ${task?.status ?? "idle"}`}>{task ? statusLabel[task.status] ?? task.status : "历史已同步"}</span></div>
-              <div className="chat-layout">
+              <div className="console-heading"><div><span className="eyebrow">PI AGENT · M14</span><h3>{consoleView === "chat" ? selectedConversation?.title ?? "多轮会话" : "/workspace 文件"}</h3></div><div className="console-tabs"><button className={consoleView === "chat" ? "active" : ""} onClick={() => setConsoleView("chat")}>会话</button><button className={consoleView === "files" ? "active" : ""} onClick={() => { setConsoleView("files"); void loadWorkspace(""); }}>文件</button></div></div>
+              {consoleView === "chat" ? <div className="chat-layout">
                 <aside className="conversation-sidebar">
                   <button className="new-conversation" onClick={createConversation} disabled={action !== null}><Icon name="plus" /> 新建会话</button>
                   <div className="conversation-list">
@@ -290,7 +359,25 @@ export default function App() {
                     <button className="send-button" disabled={selected.status !== "running" || !prompt.trim() || action !== null || taskActive}><Icon name="send" />{action === "task" ? "发送中" : taskActive ? "执行中" : "发送消息"}</button>
                   </form>
                 </div>
-              </div>
+              </div> : <div className="file-browser">
+                <div className="file-toolbar">
+                  <button disabled={!workspacePath || action !== null} onClick={() => void loadWorkspace(workspacePath.split("/").slice(0, -1).join("/"))}>← 返回</button>
+                  <code>/workspace{workspacePath ? `/${workspacePath}` : ""}</code>
+                  <label className={selected.status !== "running" || action !== null ? "disabled" : ""}>上传文件<input type="file" disabled={selected.status !== "running" || action !== null} onChange={(event) => { const file = event.target.files?.[0]; if (file) uploadWorkspaceFile(file); event.currentTarget.value = ""; }} /></label>
+                  <button disabled={selected.status !== "running" || action !== null} onClick={() => { const name = window.prompt("新文件夹名称"); if (!name || !selected) return; const target = workspacePath ? `${workspacePath}/${name}` : name; void runAction("files", async () => { await api.createWorkspaceDirectory(selected.id, target); const listing = await api.listWorkspace(selected.id, workspacePath); setWorkspaceEntries(listing.entries); }); }}>新建文件夹</button>
+                  <button disabled={selected.status !== "running" || action !== null} onClick={() => void loadWorkspace()}>刷新</button>
+                </div>
+                <div className="file-content">
+                  <div className="file-list">
+                    {selected.status !== "running" ? <div className="file-empty">启动实例后即可管理持久化工作区。</div> : null}
+                    {selected.status === "running" && workspaceEntries.length === 0 ? <div className="file-empty">这个目录还是空的，可以上传文件或新建文件夹。</div> : null}
+                    {workspaceEntries.map((entry) => <div className="file-row" key={entry.path}><button className="file-name" disabled={entry.type === "unsupported" || action !== null} onClick={() => void openWorkspaceEntry(entry)}><span>{entry.type === "directory" ? "▰" : entry.type === "file" ? "▤" : "?"}</span><strong>{entry.name}</strong></button><small>{entry.type === "file" ? `${entry.size.toLocaleString()} B` : entry.type === "directory" ? "文件夹" : "不支持"}</small><button className="file-delete" disabled={action !== null || entry.type === "unsupported"} onClick={() => { if (!selected || !window.confirm(`删除 ${entry.name}？文件夹必须为空。`)) return; void runAction("files", async () => { await api.deleteWorkspaceEntry(selected.id, entry.path); const listing = await api.listWorkspace(selected.id, workspacePath); setWorkspaceEntries(listing.entries); setWorkspacePreview(null); }); }}>删除</button></div>)}
+                  </div>
+                  <div className="file-preview">
+                    {workspacePreview ? <><div className="preview-heading"><div><strong>{workspacePreview.name}</strong><small>{workspacePreview.size.toLocaleString()} B</small></div><button onClick={() => downloadWorkspaceFile(workspacePreview)}>下载</button></div><pre>{previewText(workspacePreview)}</pre></> : <div className="file-empty">选择文件可预览 UTF-8 文本并下载。</div>}
+                  </div>
+                </div>
+              </div>}
             </div>
           </> : <div className="no-selection"><div className="no-selection-mark">π</div><h2>选择一个 Agent 实例</h2><p>在左侧创建或选择实例，然后启动隔离工作区。</p>{error ? <div className="error-banner">{error}</div> : null}</div>}
         </section>

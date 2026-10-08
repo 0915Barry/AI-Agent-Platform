@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M10-M13 单机控制面、Agent 任务与持久化会话 HTTP API。
+"""M10-M14 单机控制面、Agent 任务、会话与工作区文件 HTTP API。
 
 该服务把前端将来需要的“创建、启动、查询、心跳、停止、销毁”操作转换为
 InstanceRuntime 调用。产品状态保存在 SQLite；Firecracker 的实时进程状态仍以
@@ -14,6 +14,8 @@ SSH 隧道访问，绝不能为了省事把监听地址改成 0.0.0.0。
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import re
@@ -54,6 +56,10 @@ CONVERSATION_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/conversations/"
     r"(conversation-[0-9a-f]{16})(/messages)?$"
 )
+WORKSPACE_ROUTE_RE = re.compile(
+    r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/workspace/(list|read|write|mkdir|delete)$"
+)
+MAX_WORKSPACE_FILE_BYTES = 5 * 1024 * 1024
 
 
 class ApiError(Exception):
@@ -398,6 +404,68 @@ class ControlPlane:
         except (RuntimeFailure, OSError, sqlite3.Error) as error:
             raise ApiError(500, "conversation_task_create_failed", str(error)) from error
 
+    @staticmethod
+    def validate_workspace_path(value: Any, *, allow_root: bool) -> str:
+        """把 API 路径限制为 /workspace 下的 POSIX 相对路径。"""
+
+        if not isinstance(value, str):
+            raise ApiError(400, "invalid_workspace_path", "workspace path must be a string")
+        if value.startswith("/"):
+            raise ApiError(400, "invalid_workspace_path", "workspace path must be relative")
+        value = value.strip("/")
+        if not value:
+            if allow_root:
+                return ""
+            raise ApiError(400, "invalid_workspace_path", "workspace path must not be empty")
+        if len(value.encode("utf-8")) > 1024 or "\\" in value or "\x00" in value:
+            raise ApiError(400, "invalid_workspace_path", "workspace path is invalid or too long")
+        parts = value.split("/")
+        if any(part in {"", ".", ".."} or len(part.encode("utf-8")) > 255 for part in parts):
+            raise ApiError(400, "invalid_workspace_path", "workspace path contains an invalid segment")
+        return "/".join(parts)
+
+    def workspace_operation(
+        self, instance_id: str, action: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """排队文件操作并等待 guest 回传，避免宿主并发挂载运行中的 ext4。"""
+
+        instance_id = self.validate_requested_id(instance_id)
+        if action not in {"list", "read", "write", "mkdir", "delete"}:
+            raise ApiError(404, "workspace_action_not_found", "workspace action not found")
+        path = self.validate_workspace_path(payload.get("path", ""), allow_root=action == "list")
+        request: dict[str, Any] = {}
+        if action == "write":
+            encoded = payload.get("contentBase64")
+            if not isinstance(encoded, str):
+                raise ApiError(400, "invalid_file_content", "contentBase64 must be a string")
+            try:
+                decoded = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError) as error:
+                raise ApiError(400, "invalid_file_content", "contentBase64 is invalid") from error
+            if len(decoded) > MAX_WORKSPACE_FILE_BYTES:
+                raise ApiError(413, "workspace_file_too_large", "workspace file exceeds 5 MiB")
+            request["contentBase64"] = encoded
+
+        record = self.get(instance_id)
+        if record["status"] != "running":
+            raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
+        try:
+            self.runtime.heartbeat(instance_id)
+            operation = self.tasks.create_workspace_operation(instance_id, action, path, request)
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                operation = self.tasks.get_workspace_operation(instance_id, operation["id"])
+                if operation["status"] == "completed":
+                    return operation["result"]
+                if operation["status"] == "failed":
+                    raise ApiError(409, "workspace_operation_failed", operation["error"] or "operation failed")
+                time.sleep(0.1)
+            raise ApiError(504, "workspace_operation_timeout", "microVM did not finish the file operation")
+        except ApiError:
+            raise
+        except (RuntimeFailure, TaskStoreError, OSError, sqlite3.Error) as error:
+            raise ApiError(500, "workspace_operation_failed", str(error)) from error
+
 
 class ControlPlaneHandler(BaseHTTPRequestHandler):
     """只接受固定路由和 JSON 对象的小型 HTTP 适配层。"""
@@ -431,15 +499,15 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             {"error": {"code": error.code, "message": error.message}},
         )
 
-    def read_json(self) -> dict[str, Any]:
-        """读取最多 64 KiB 的 JSON 对象，避免无限请求体占用 root 服务内存。"""
+    def read_json(self, max_bytes: int = 65536) -> dict[str, Any]:
+        """读取有明确上限的 JSON 对象，避免无限请求体占用 root 服务内存。"""
         raw_length = self.headers.get("Content-Length", "0")
         try:
             length = int(raw_length)
         except ValueError as error:
             raise ApiError(400, "invalid_content_length", "invalid Content-Length") from error
-        if length < 0 or length > 65536:
-            raise ApiError(413, "request_too_large", "request body exceeds 64 KiB")
+        if length < 0 or length > max_bytes:
+            raise ApiError(413, "request_too_large", "request body exceeds the allowed size")
         if length == 0:
             return {}
         try:
@@ -498,6 +566,15 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         try:
             if self.path == "/api/instances":
                 self.send_payload(201, self.control.create(self.read_json()))
+                return
+            workspace_match = WORKSPACE_ROUTE_RE.fullmatch(self.path)
+            if workspace_match:
+                instance_id, action = workspace_match.groups()
+                limit = 8 * 1024 * 1024 if action == "write" else 65536
+                self.send_payload(
+                    200,
+                    self.control.workspace_operation(instance_id, action, self.read_json(limit)),
+                )
                 return
             conversation_collection = CONVERSATION_COLLECTION_ROUTE_RE.fullmatch(self.path)
             if conversation_collection:

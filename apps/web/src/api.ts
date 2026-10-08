@@ -47,6 +47,26 @@ export interface AgentMessage {
   createdAt: number;
 }
 
+export interface WorkspaceEntry {
+  name: string;
+  path: string;
+  type: "file" | "directory" | "unsupported";
+  size: number;
+  modifiedAt: number;
+}
+
+export interface WorkspaceListing {
+  path: string;
+  entries: WorkspaceEntry[];
+}
+
+export interface WorkspaceFile {
+  path: string;
+  name: string;
+  size: number;
+  contentBase64: string;
+}
+
 interface ApiErrorPayload {
   error?: { code?: string; message?: string };
 }
@@ -109,4 +129,24 @@ export const api = {
         body: JSON.stringify({ content }),
       },
     ),
+  listWorkspace: (instanceId: string, path = "") =>
+    request<WorkspaceListing>(`/api/instances/${instanceId}/workspace/list`, {
+      method: "POST", body: JSON.stringify({ path }),
+    }),
+  readWorkspaceFile: (instanceId: string, path: string) =>
+    request<WorkspaceFile>(`/api/instances/${instanceId}/workspace/read`, {
+      method: "POST", body: JSON.stringify({ path }),
+    }),
+  writeWorkspaceFile: (instanceId: string, path: string, contentBase64: string) =>
+    request<{ path: string; size: number }>(`/api/instances/${instanceId}/workspace/write`, {
+      method: "POST", body: JSON.stringify({ path, contentBase64 }),
+    }),
+  createWorkspaceDirectory: (instanceId: string, path: string) =>
+    request<{ path: string }>(`/api/instances/${instanceId}/workspace/mkdir`, {
+      method: "POST", body: JSON.stringify({ path }),
+    }),
+  deleteWorkspaceEntry: (instanceId: string, path: string) =>
+    request<{ path: string }>(`/api/instances/${instanceId}/workspace/delete`, {
+      method: "POST", body: JSON.stringify({ path }),
+    }),
 };

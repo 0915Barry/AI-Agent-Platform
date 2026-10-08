@@ -11,7 +11,7 @@ Run this entry point inside the Ubuntu KVM host VM.
 
 Commands:
   bootstrap             One-command install/build after the Ubuntu VM exists
-  verify                Run the end-to-end M11 acceptance test
+  verify                Run the current M11 and M14 end-to-end tests
   start                 Start the long-running loopback control plane
   stop                  Stop the control plane; preserve instance data
   status                Show whether the control plane is running
@@ -35,6 +35,7 @@ Commands:
   control-plane-smoke-test
                         Control a real microVM through the M10 HTTP API
   agent-task-smoke-test Run a real M11 Pi task through the control plane
+  workspace-smoke-test  Verify M14 file operations and restart persistence
   control-plane-start   Start the loopback-only M10 HTTP API
   control-plane-stop    Stop the API; running instances remain managed
   control-plane-status  Show whether the API service is running
@@ -62,6 +63,7 @@ case "${command}" in
   verify)
     build_rootfs
     sudo "${repo_dir}/scripts/linux/agent-task-smoke-test.sh"
+    sudo "${repo_dir}/scripts/linux/workspace-smoke-test.sh"
     ;;
   start)
     build_rootfs
@@ -136,6 +138,10 @@ case "${command}" in
   agent-task-smoke-test)
     build_rootfs
     sudo "${repo_dir}/scripts/linux/agent-task-smoke-test.sh"
+    ;;
+  workspace-smoke-test)
+    build_rootfs
+    sudo "${repo_dir}/scripts/linux/workspace-smoke-test.sh"
     ;;
   control-plane-start)
     build_rootfs

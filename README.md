@@ -14,7 +14,7 @@
 
 ## 快速开始
 
-首次部署**不需要**从 M0 到 M13 逐项运行。里程碑命令是底层研发、故障定位和
+首次部署**不需要**从 M0 到 M14 逐项运行。里程碑命令是底层研发、故障定位和
 回归测试入口；首次运行只使用 `bootstrap → configure-deepseek → verify → start`。
 
 开始前仍需人工创建一台支持嵌套虚拟化的 Ubuntu 24.04 VM：Mac 使用 UTM +
@@ -44,7 +44,7 @@ cd AI-Agent-Platform
 ./run.sh status
 ```
 
-需要使用 Web 管理页面（包含 M13 多轮会话）时，再开两个 macOS 终端分别运行：
+需要使用 Web 管理页面（包含 M13 多轮会话和 M14 工作区文件）时，再开两个 macOS 终端分别运行：
 
 ```bash
 # 终端 2：把只监听 Ubuntu loopback 的控制面安全转发到 Mac
@@ -73,7 +73,7 @@ chmod +x run-linux.sh scripts/common/*.sh scripts/linux/*.sh scripts/guest/*.sh
 ./run-linux.sh status
 ```
 
-需要使用 Web 管理页面（包含 M13 多轮会话）时，在 Ubuntu VM 再开一个终端运行：
+需要使用 Web 管理页面（包含 M13 多轮会话和 M14 工作区文件）时，在 Ubuntu VM 再开一个终端运行：
 
 ```bash
 ./run-linux.sh web-dev
@@ -113,6 +113,7 @@ Windows 浏览器打开 `http://127.0.0.1:5173`。结束开发时按 `Ctrl-C` �
 | M11 | 控制面向 Pi Agent 下发任务并经 DeepSeek 返回结果 | ✅ 已通过 |
 | M12 | React 管理页面操作实例并提交 Agent 任务 | ✅ 已通过 |
 | M13 | 持久化会话、消息历史与受限多轮上下文 | ✅ 已通过 |
+| M14 | 工作区文件上传、列表、预览、下载、目录与持久化 | ✅ 已通过 |
 
 ## 当前支持范围
 
@@ -378,6 +379,7 @@ Linux/KVM checks passed
 | DeepSeek 端到端 | `./run.sh deepseek-e2e-test` | `./run-linux.sh deepseek-e2e-test` |
 | HTTP 控制面 | `./run.sh control-plane-smoke-test` | `./run-linux.sh control-plane-smoke-test` |
 | Agent 任务通道 | `./run.sh agent-task-smoke-test` | `./run-linux.sh agent-task-smoke-test` |
+| 工作区文件通道 | `./run.sh workspace-smoke-test` | `./run-linux.sh workspace-smoke-test` |
 
 第一次 `runtime-smoke-test` 会从固定 Ubuntu 快照构建完整 rootfs，下载较多基础包并安装 Node.js 和 Pi Agent，耗时明显较长。构建指纹不变时后续测试会复用 `/srv/fc/artifacts/agent-rootfs.ext4`。
 
@@ -386,12 +388,12 @@ Linux/KVM checks passed
 | 命令 | 作用 |
 |---|---|
 | `bootstrap` | 新机器的一键入口：检查环境、安装 Firecracker、准备内核并构建或复用 rootfs |
-| `verify` | 运行当前最高层 M11 端到端验收；新机器建议执行一次 |
+| `verify` | 运行 M11 Agent 任务与 M14 工作区端到端验收；新机器建议执行一次 |
 | `start` / `stop` / `status` | 日常启动、停止和查询长期运行的控制面 |
 | `tunnel`（仅 `run.sh`） | 将 Mac 的 `127.0.0.1:18090` 安全转发到 Ubuntu loopback 控制面 |
 | `web-install` | 安装 lockfile 固定的前端依赖；Linux 自动使用项目固定的 Node.js |
 | `web-build` | 执行 TypeScript 检查并生成生产构建 |
-| `web-dev` | 在 `127.0.0.1:5173` 启动 M12 开发页面和控制面反向代理 |
+| `web-dev` | 在 `127.0.0.1:5173` 启动管理页面和控制面反向代理 |
 | `doctor` | 检查当前控制端或 Linux/KVM 环境 |
 | `configure`（仅 `run.sh`） | 保存 Mac 到 UTM Linux 的连接设置 |
 | `sync`（仅 `run.sh`） | 通过 rsync 将源码同步到 UTM Linux |
@@ -409,6 +411,7 @@ Linux/KVM checks passed
 | `deepseek-e2e-test` | 让 Pi Agent 经 Tool Gateway 调用 DeepSeek 并执行 `read` 工具 |
 | `control-plane-smoke-test` | 通过 HTTP API 创建、启动、查询、心跳、停止并销毁真实 microVM |
 | `agent-task-smoke-test` | 通过控制面向 microVM 内 Pi 下发真实任务，并验证 DeepSeek、工具读取和事件结果 |
+| `workspace-smoke-test` | 在真实 microVM 中验证文件读写、路径隔离与重启持久化 |
 | `control-plane-start` | 构建所需镜像并在 Ubuntu loopback 启动长期运行的控制面 |
 | `control-plane-stop` | 停止控制面进程；已启动实例仍由独立空闲回收器管理 |
 | `control-plane-status` | 查询控制面服务是否运行 |
@@ -988,6 +991,61 @@ M13 修改了控制面 API 和 SQLite 表结构，因此更新代码后需要重
 第二轮问题能够使用首轮内容，刷新浏览器后消息历史仍然存在，停止并重新启动实例后
 会话与消息继续保留。控制面使用宿主 SQLite 管理显式上下文，DeepSeek 凭据仍只由
 Tool Gateway 持有，M13 没有引入向量数据库或改变现有 microVM 隔离边界。
+
+## M14 工作区文件管理
+
+M14 在管理页面增加“文件”视图，可以浏览 `/workspace`、新建文件夹、上传、预览、
+下载和删除文件。上传与读取的单文件上限均为 5 MiB；页面只直接预览 UTF-8 文本，
+其他格式仍可下载。文件保存在实例独立的 ext4 数据盘中，因此停止、空闲回收和重启
+实例后仍会保留；显式“销毁”实例才会删除该数据盘。
+
+控制面不会在 microVM 运行时二次挂载 ext4。它把操作写入宿主 SQLite 队列，由
+microVM 内以非 root `pi` 用户运行的 Worker 主动领取，并在 `/workspace` 内完成。
+控制面和 guest 会同时拒绝绝对路径、`..` 路径穿越和符号链接逃逸；删除目录时只允许
+删除空目录。文件操作与 Pi Agent 任务由同一个 Worker 串行执行，避免同时改写文件。
+
+新增接口均为 `POST`，请求体包含相对 `path`；写入接口额外包含 `contentBase64`：
+
+```http
+POST /api/instances/{id}/workspace/list
+POST /api/instances/{id}/workspace/read
+POST /api/instances/{id}/workspace/write
+POST /api/instances/{id}/workspace/mkdir
+POST /api/instances/{id}/workspace/delete
+```
+
+M14 改动了 guest Worker，因此第一次验收会根据新构建指纹重建一次 rootfs。后续源码
+和构建输入不变时会继续复用已有镜像。macOS 在仓库根目录执行：
+
+```bash
+./run.sh workspace-smoke-test
+```
+
+Windows 的 Ubuntu VM 内执行：
+
+```bash
+./run-linux.sh workspace-smoke-test
+```
+
+成功标志为：
+
+```text
+PASS: workspace files were safely managed inside the microVM and persisted across restart
+WORKSPACE_READY scope=/workspace max_file=5MiB traversal=denied symlinks=denied persistence=preserved
+```
+
+验收脚本会在真实 microVM 内完成目录创建、文件写入、列表、读取、路径穿越拒绝，
+然后停止并重启实例，确认随机文件内容仍然存在，最后清理专用的 `m14-smoke` 实例。
+日常使用时只需按快速开始启动控制面、隧道和页面，不需要重复运行验收命令。
+
+### M14 验收结果
+
+已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境中通过真实验收：文件
+通道的 guest Worker 能在 `/workspace` 内完成目录与文件操作，路径穿越被拒绝，
+文件经强制落盘后在停止并重启 microVM 后仍保持原内容。模型 API Key 没有进入
+microVM，宿主也没有在实例运行时并发挂载数据盘。Web 页面已完成文件夹创建、文件
+上传与预览测试；Pi Agent 能通过 `read` 工具读取页面上传到同一工作区的 RTF 文件，
+并正确提取其中的可见文本。停止并重启实例后，工作区文件仍然存在。
 
 ## 跨平台常见错误
 

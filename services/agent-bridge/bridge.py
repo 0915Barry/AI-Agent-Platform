@@ -22,6 +22,9 @@ from task_store import TaskStore, TaskStoreError  # noqa: E402
 
 
 TASK_EVENT_ROUTE = re.compile(r"^/guest/tasks/(task-[0-9a-f]{16})/events$")
+WORKSPACE_RESULT_ROUTE = re.compile(
+    r"^/guest/workspace/(workspace-[0-9a-f]{16})/result$"
+)
 
 
 def main() -> None:
@@ -83,6 +86,67 @@ def main() -> None:
                     args.activity_file.touch()
                     audit({"instance": args.instance_id, "task": task["id"], "event": "claimed"})
                     self.send_json(200, {"id": task["id"], "prompt": task["prompt"]})
+                    return
+
+                if self.path == "/guest/workspace/next":
+                    operation = store.claim_next_workspace_operation(args.instance_id)
+                    if operation is None:
+                        # 和空任务轮询一样，空文件队列不能延长实例生命周期。
+                        self.send_response(204)
+                        self.end_headers()
+                        return
+                    args.activity_file.touch()
+                    audit(
+                        {
+                            "instance": args.instance_id,
+                            "operation": operation["id"],
+                            "action": operation["action"],
+                            "event": "workspace_claimed",
+                        }
+                    )
+                    self.send_json(
+                        200,
+                        {
+                            "id": operation["id"],
+                            "action": operation["action"],
+                            "path": operation["path"],
+                            **operation["request"],
+                        },
+                    )
+                    return
+
+                workspace_match = WORKSPACE_RESULT_ROUTE.fullmatch(self.path)
+                if workspace_match:
+                    raw_length = self.headers.get("Content-Length", "0")
+                    try:
+                        length = int(raw_length)
+                    except ValueError:
+                        self.send_json(400, {"error": "invalid_content_length"})
+                        return
+                    if length < 1 or length > 8 * 1024 * 1024:
+                        self.send_json(413, {"error": "workspace_result_too_large"})
+                        return
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        self.send_json(400, {"error": "invalid_workspace_result"})
+                        return
+                    operation_id = workspace_match.group(1)
+                    completed = store.finish_workspace_operation(
+                        args.instance_id,
+                        operation_id,
+                        payload.get("status"),
+                        payload.get("result"),
+                        payload.get("error"),
+                    )
+                    args.activity_file.touch()
+                    audit(
+                        {
+                            "instance": args.instance_id,
+                            "operation": operation_id,
+                            "event": f"workspace_{completed['status']}",
+                        }
+                    )
+                    self.send_json(202, {"accepted": True})
                     return
 
                 match = TASK_EVENT_ROUTE.fullmatch(self.path)

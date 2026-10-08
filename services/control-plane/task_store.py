@@ -108,6 +108,22 @@ class TaskStore:
                 """
             )
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workspace_operations (
+                    id TEXT PRIMARY KEY,
+                    instance_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    request_payload TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_payload TEXT,
+                    error TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
                 "CREATE INDEX IF NOT EXISTS tasks_instance_status ON tasks(instance_id,status,created_at)"
             )
             connection.execute(
@@ -124,6 +140,10 @@ class TaskStore:
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS messages_assistant_task "
                 "ON messages(task_id) WHERE role='assistant' AND task_id IS NOT NULL"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS workspace_operations_instance_status "
+                "ON workspace_operations(instance_id,status,created_at)"
             )
 
     @staticmethod
@@ -399,6 +419,99 @@ class TaskStore:
             for row in rows
         ]
 
+    @staticmethod
+    def workspace_operation_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        """把文件操作记录还原成控制面与 guest 共用的字典。"""
+
+        return {
+            "id": row["id"],
+            "instanceId": row["instance_id"],
+            "action": row["action"],
+            "path": row["path"],
+            "request": json.loads(row["request_payload"]),
+            "status": row["status"],
+            "result": json.loads(row["result_payload"]) if row["result_payload"] else None,
+            "error": row["error"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def create_workspace_operation(
+        self, instance_id: str, action: str, path: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        """创建只属于单个实例的工作区操作，内容暂存在宿主 SQLite 队列。"""
+
+        operation_id = f"workspace-{uuid.uuid4().hex[:16]}"
+        now = int(time.time())
+        encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO workspace_operations"
+                "(id,instance_id,action,path,request_payload,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'queued',?,?)",
+                (operation_id, instance_id, action, path, encoded, now, now),
+            )
+        return self.get_workspace_operation(instance_id, operation_id)
+
+    def get_workspace_operation(self, instance_id: str, operation_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM workspace_operations WHERE id=? AND instance_id=?",
+                (operation_id, instance_id),
+            ).fetchone()
+        if row is None:
+            raise TaskStoreError(f"workspace operation not found: {operation_id}")
+        return self.workspace_operation_from_row(row)
+
+    def claim_next_workspace_operation(self, instance_id: str) -> dict[str, Any] | None:
+        """由对应 guest 原子领取文件操作，跨实例令牌不能领取其他实例的请求。"""
+
+        now = int(time.time())
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM workspace_operations "
+                "WHERE instance_id=? AND status='queued' ORDER BY created_at,id LIMIT 1",
+                (instance_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            changed = connection.execute(
+                "UPDATE workspace_operations SET status='running',updated_at=? "
+                "WHERE id=? AND status='queued'",
+                (now, row["id"]),
+            )
+            if changed.rowcount != 1:
+                return None
+        return self.get_workspace_operation(instance_id, row["id"])
+
+    def finish_workspace_operation(
+        self,
+        instance_id: str,
+        operation_id: str,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """保存 guest 文件操作结果；只接受 running → completed/failed。"""
+
+        if status not in {"completed", "failed"}:
+            raise TaskStoreError(f"invalid workspace operation status: {status}")
+        if status == "completed" and not isinstance(result, dict):
+            raise TaskStoreError("completed workspace operation requires a result object")
+        if status == "failed" and (not isinstance(error, str) or not error):
+            raise TaskStoreError("failed workspace operation requires an error")
+        encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")) if result else None
+        with self.connect() as connection:
+            changed = connection.execute(
+                "UPDATE workspace_operations SET status=?,result_payload=?,error=?,updated_at=? "
+                "WHERE id=? AND instance_id=? AND status='running'",
+                (status, encoded, error[:4000] if error else None, int(time.time()), operation_id, instance_id),
+            )
+        if changed.rowcount != 1:
+            raise TaskStoreError(f"workspace operation is not running: {operation_id}")
+        return self.get_workspace_operation(instance_id, operation_id)
+
     def fail_running(self, instance_id: str, reason: str) -> None:
         """实例停止时把尚未结束的任务标记失败，防止永久显示 running。"""
 
@@ -418,6 +531,11 @@ class TaskStore:
                     "UPDATE tasks SET status='failed',error=?,updated_at=? WHERE id=?",
                     (reason, now, row["id"]),
                 )
+            connection.execute(
+                "UPDATE workspace_operations SET status='failed',error=?,updated_at=? "
+                "WHERE instance_id=? AND status IN ('queued','running')",
+                (reason, now, instance_id),
+            )
 
     def delete_instance(self, instance_id: str) -> None:
         """显式销毁实例时删除其会话、消息、任务正文和事件。"""
@@ -442,3 +560,4 @@ class TaskStore:
                 connection.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
             connection.execute("DELETE FROM conversations WHERE instance_id=?", (instance_id,))
             connection.execute("DELETE FROM tasks WHERE instance_id=?", (instance_id,))
+            connection.execute("DELETE FROM workspace_operations WHERE instance_id=?", (instance_id,))
