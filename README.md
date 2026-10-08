@@ -44,7 +44,7 @@ cd AI-Agent-Platform
 ./run.sh status
 ```
 
-需要使用 M12 页面时，再开两个 macOS 终端分别运行：
+需要使用 Web 管理页面（包含 M13 多轮会话）时，再开两个 macOS 终端分别运行：
 
 ```bash
 # 终端 2：把只监听 Ubuntu loopback 的控制面安全转发到 Mac
@@ -73,7 +73,7 @@ chmod +x run-linux.sh scripts/common/*.sh scripts/linux/*.sh scripts/guest/*.sh
 ./run-linux.sh status
 ```
 
-需要使用 M12 页面时，在 Ubuntu VM 再开一个终端运行：
+需要使用 Web 管理页面（包含 M13 多轮会话）时，在 Ubuntu VM 再开一个终端运行：
 
 ```bash
 ./run-linux.sh web-dev
