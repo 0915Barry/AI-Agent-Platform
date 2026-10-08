@@ -82,13 +82,28 @@ h3 { font-size: 18px; }
 .metric-status.failed i { background: var(--danger); }
 .error-banner { margin-top: 16px; padding: 12px 14px; border: 1px solid #613936; background: #251513; color: #ffaaa3; font-size: 12px; }
 
-.agent-console { border: 1px solid var(--line); background: var(--surface); margin-top: 22px; min-height: 460px; display: grid; grid-template-rows: auto 1fr auto; }
+.agent-console { border: 1px solid var(--line); background: var(--surface); margin-top: 22px; min-height: 540px; display: grid; grid-template-rows: auto 1fr; }
 .console-heading { padding: 20px 22px; border-bottom: 1px solid var(--line); }
 .task-chip { padding: 6px 9px; border: 1px solid var(--line); color: var(--muted); font: 10px "DM Mono", monospace; text-transform: uppercase; }
 .task-chip.running, .task-chip.queued { color: #e9c775; border-color: #51472d; }
 .task-chip.completed { color: var(--accent); border-color: #45562d; }
 .task-chip.failed { color: var(--danger); border-color: #613936; }
-.conversation { padding: 26px 22px; min-height: 250px; overflow: auto; }
+.chat-layout { min-height: 0; display: grid; grid-template-columns: 230px minmax(0, 1fr); }
+.conversation-sidebar { min-width: 0; border-right: 1px solid var(--line); background: #10130f; padding: 14px; }
+.new-conversation { width: 100%; min-height: 38px; display: flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid #465632; background: #1b2117; color: var(--accent); cursor: pointer; }
+.new-conversation:disabled { opacity: .45; cursor: not-allowed; }
+.conversation-list { display: grid; gap: 6px; margin-top: 12px; }
+.conversation-list-empty { min-height: 180px; display: grid; place-content: center; justify-items: center; gap: 10px; padding: 20px; color: var(--muted); text-align: center; font-size: 11px; line-height: 1.6; }
+.conversation-list-empty svg { width: 24px; height: 24px; }
+.conversation-row { min-width: 0; display: grid; gap: 5px; padding: 11px; border: 1px solid transparent; background: transparent; color: #dfe4d7; text-align: left; cursor: pointer; }
+.conversation-row:hover { background: #171b15; }
+.conversation-row.selected { border-color: #3e4932; background: #1c2118; }
+.conversation-row strong, .conversation-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-row strong { font-size: 12px; }
+.conversation-row span { color: var(--muted); font-size: 10px; }
+.conversation-row time { color: #687060; font: 9px "DM Mono", monospace; }
+.chat-main { min-width: 0; display: grid; grid-template-rows: minmax(330px, 1fr) auto; }
+.conversation { padding: 26px 22px; min-height: 330px; max-height: 58vh; overflow: auto; }
 .conversation-empty { min-height: 250px; display: grid; place-content: center; justify-items: center; gap: 8px; color: var(--muted); text-align: center; }
 .conversation-empty strong { color: #dce1d3; }
 .conversation-empty p { max-width: 430px; font-size: 12px; line-height: 1.7; }
@@ -100,6 +115,8 @@ h3 { font-size: 18px; }
 .user-message > span { text-align: right; }
 .user-message p { background: #29321d; border: 1px solid #465632; }
 .agent-message pre, .agent-message .typing { margin: 0; background: #171a15; border-left: 2px solid var(--accent); }
+.pending-message { margin-top: 12px; }
+.task-error { margin: 14px 0; padding: 12px 14px; border: 1px solid #613936; color: #ffaaa3; background: #251513; font-size: 12px; }
 .typing { display: flex; gap: 5px; padding: 18px; }
 .typing i { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); animation: pulse 1s infinite ease-in-out; }
 .typing i:nth-child(2) { animation-delay: .15s; }
@@ -123,6 +140,7 @@ h3 { font-size: 18px; }
   .instance-header { align-items: flex-start; gap: 20px; }
   .actions { flex-wrap: wrap; justify-content: flex-end; }
   .metrics { grid-template-columns: repeat(2, 1fr); }
+  .chat-layout { grid-template-columns: 190px minmax(0, 1fr); }
 }
 
 @media (max-width: 580px) {
@@ -134,4 +152,9 @@ h3 { font-size: 18px; }
   .metrics { grid-template-columns: 1fr; }
   .prompt-form { grid-template-columns: 1fr; }
   .message { max-width: 95%; }
+  .chat-layout { grid-template-columns: 1fr; }
+  .conversation-sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
+  .conversation-list { display: flex; overflow-x: auto; }
+  .conversation-row { min-width: 180px; }
+  .conversation-list-empty { min-height: 70px; }
 }

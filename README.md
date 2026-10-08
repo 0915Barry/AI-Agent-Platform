@@ -14,7 +14,7 @@
 
 ## 快速开始
 
-首次部署**不需要**从 M0 到 M12 逐项运行。里程碑命令是底层研发、故障定位和
+首次部署**不需要**从 M0 到 M13 逐项运行。里程碑命令是底层研发、故障定位和
 回归测试入口；首次运行只使用 `bootstrap → configure-deepseek → verify → start`。
 
 开始前仍需人工创建一台支持嵌套虚拟化的 Ubuntu 24.04 VM：Mac 使用 UTM +
@@ -112,6 +112,7 @@ Windows 浏览器打开 `http://127.0.0.1:5173`。结束开发时按 `Ctrl-C` �
 | M10 | HTTP 控制面管理真实 microVM 生命周期 | ✅ 已通过 |
 | M11 | 控制面向 Pi Agent 下发任务并经 DeepSeek 返回结果 | ✅ 已通过 |
 | M12 | React 管理页面操作实例并提交 Agent 任务 | ✅ 已通过 |
+| M13 | 持久化会话、消息历史与受限多轮上下文 | ✅ 已通过 |
 
 ## 当前支持范围
 
@@ -928,6 +929,65 @@ M12 当前仍沿用 M10 的 loopback-only 无认证边界，不得把 5173 或 1
 loopback 隧道连接，模型凭据仍由宿主 Tool Gateway 隔离。空闲倒计时只把真实任务
 领取、模型请求和事件回传计为活动；guest 对空任务队列的内部轮询不会延长实例寿命。
 已继续等待完整 5 分钟并确认实例自动停止，独立数据盘保持不变，可重新启动恢复工作区。
+
+## M13 会话历史与多轮上下文
+
+M13 将 M12 的单次任务界面升级为持久化多轮会话。会话和消息保存在 Ubuntu 宿主的
+`/var/lib/fc/tasks/tasks.db`，不写入浏览器本地存储，也不会进入只读 rootfs。停止、
+空闲回收和重新启动 microVM 都会保留历史；显式销毁实例时，会话、消息、任务记录
+和数据盘一起删除。
+
+新增接口：
+
+```http
+POST /api/instances/{id}/conversations
+GET  /api/instances/{id}/conversations
+GET  /api/instances/{id}/conversations/{conversation_id}
+GET  /api/instances/{id}/conversations/{conversation_id}/messages
+POST /api/instances/{id}/conversations/{conversation_id}/messages
+```
+
+每次发送消息时，控制面会按时间顺序读取同一实例、同一会话的最近消息，组装成新的
+Pi 任务。当前最多选择最近 20 条消息，并限制完整上下文为 24 KiB，单条用户消息限制
+为 16 KiB；达到预算时优先保留较新的消息。该限制防止历史无限增长导致请求延迟、
+Token 成本和模型上下文占用失控。
+
+页面现在支持创建和切换会话、恢复历史消息、显示正在执行的任务，并在刷新浏览器后
+从宿主 SQLite 重新加载记录。Pi 仍以 `--no-session --no-context-files` 运行，因此会话
+边界、裁剪规则和数据删除语义都由控制面显式管理，不依赖 Pi 内部隐藏状态。
+
+### M13 真实链路验收
+
+M13 修改了控制面 API 和 SQLite 表结构，因此更新代码后需要重启控制面；启动时会
+自动执行幂等数据库迁移，已有 M11/M12 任务记录不会被删除：
+
+```bash
+# macOS 仓库根目录；start 会自动同步最新源码到 Ubuntu VM
+./run.sh stop
+./run.sh start
+
+# Windows 的 Ubuntu VM 仓库目录
+./run-linux.sh stop
+./run-linux.sh start
+```
+
+保持原有 SSH 隧道和 `web-dev` 运行，刷新 `http://127.0.0.1:5173`。在同一个会话
+依次发送：
+
+```text
+请记住我的代号是 Alpha。
+我的代号是什么？
+```
+
+第二次回答应包含 `Alpha`。随后刷新浏览器、停止并重新启动实例，会话列表和消息历史
+仍应存在。新建另一个实例后，不应看到原实例的任何会话。
+
+### M13 验收结果
+
+已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境中完成真实验收：同一会话的
+第二轮问题能够使用首轮内容，刷新浏览器后消息历史仍然存在，停止并重新启动实例后
+会话与消息继续保留。控制面使用宿主 SQLite 管理显式上下文，DeepSeek 凭据仍只由
+Tool Gateway 持有，M13 没有引入向量数据库或改变现有 microVM 隔离边界。
 
 ## 跨平台常见错误
 

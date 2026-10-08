@@ -26,6 +26,25 @@ export interface AgentTask {
   error: string | null;
   createdAt: number;
   updatedAt: number;
+  conversationId: string | null;
+}
+
+export interface AgentConversation {
+  id: string;
+  instanceId: string;
+  title: string;
+  preview: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface AgentMessage {
+  id: string;
+  conversationId: string;
+  role: "user" | "assistant";
+  content: string;
+  taskId: string | null;
+  createdAt: number;
 }
 
 interface ApiErrorPayload {
@@ -65,4 +84,29 @@ export const api = {
     }),
   getTask: (instanceId: string, taskId: string) =>
     request<AgentTask>(`/api/instances/${instanceId}/tasks/${taskId}`),
+  listConversations: async (instanceId: string) =>
+    (
+      await request<{ conversations: AgentConversation[] }>(
+        `/api/instances/${instanceId}/conversations`,
+      )
+    ).conversations,
+  createConversation: (instanceId: string) =>
+    request<AgentConversation>(`/api/instances/${instanceId}/conversations`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  listMessages: async (instanceId: string, conversationId: string) =>
+    (
+      await request<{ messages: AgentMessage[] }>(
+        `/api/instances/${instanceId}/conversations/${conversationId}/messages`,
+      )
+    ).messages,
+  createConversationMessage: (instanceId: string, conversationId: string, content: string) =>
+    request<AgentTask>(
+      `/api/instances/${instanceId}/conversations/${conversationId}/messages`,
+      {
+        method: "POST",
+        body: JSON.stringify({ content }),
+      },
+    ),
 };

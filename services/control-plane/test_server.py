@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M10/M11 控制面与任务队列的纯本地单元测试。
+"""M10-M13 控制面、任务队列与多轮会话的纯本地单元测试。
 
 测试使用 :class:`FakeRuntime` 替代真正的 Firecracker 运行时，因此不要求
 ``/dev/kvm``、root 权限或 Linux 虚拟机。这里主要验证控制面的业务规则：
@@ -12,6 +12,7 @@
 """
 
 import importlib.util
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -187,6 +188,72 @@ class ControlPlaneTests(unittest.TestCase):
         with self.assertRaises(SERVER.ApiError) as empty_prompt:
             self.control.create_task("agent-idle", {"prompt": "   "})
         self.assertEqual(empty_prompt.exception.status, 400)
+
+    def test_conversation_persists_messages_and_builds_context(self) -> None:
+        """第二轮任务应包含首轮问答，完成结果应写回消息历史。"""
+
+        self.control.create({"id": "agent-chat"})
+        self.control.start("agent-chat")
+        conversation = self.control.create_conversation("agent-chat", {})
+
+        first = self.control.create_conversation_message(
+            "agent-chat", conversation["id"], {"content": "请记住我的代号是 Alpha"}
+        )
+        claimed_first = self.tasks.claim_next("agent-chat")
+        assert claimed_first is not None
+        self.tasks.append_event(
+            "agent-chat", claimed_first["id"], "completed", {"output": "好的，我会记住。"}
+        )
+
+        second = self.control.create_conversation_message(
+            "agent-chat", conversation["id"], {"content": "我的代号是什么？"}
+        )
+        self.assertEqual(second["conversationId"], conversation["id"])
+        self.assertIn("Alpha", second["prompt"])
+        self.assertIn("我的代号是什么", second["prompt"])
+        self.assertNotEqual(first["id"], second["id"])
+
+        messages = self.control.conversation_messages("agent-chat", conversation["id"])
+        self.assertEqual([message["role"] for message in messages], ["user", "assistant", "user"])
+        self.assertEqual(messages[1]["content"], "好的，我会记住。")
+        listed = self.control.list_conversations("agent-chat")
+        self.assertEqual(listed[0]["title"], "请记住我的代号是 Alpha")
+
+    def test_conversation_is_isolated_and_deleted_with_instance(self) -> None:
+        """会话不能跨实例读取，显式销毁实例必须清除消息。"""
+
+        self.control.create({"id": "agent-one"})
+        self.control.create({"id": "agent-two"})
+        conversation = self.control.create_conversation("agent-one", {})
+        with self.assertRaises(SERVER.ApiError) as cross_instance:
+            self.control.conversation_messages("agent-two", conversation["id"])
+        self.assertEqual(cross_instance.exception.status, 404)
+
+        self.control.destroy("agent-one")
+        self.assertEqual(self.tasks.list_conversations("agent-one"), [])
+
+    def test_existing_m11_task_database_is_migrated(self) -> None:
+        """旧任务表升级 M13 时应保留数据并增加 conversation_id。"""
+
+        legacy_path = Path(self.temporary.name) / "legacy-tasks.db"
+        with sqlite3.connect(legacy_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, prompt TEXT NOT NULL,
+                    status TEXT NOT NULL, output TEXT, error TEXT,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?)",
+                ("task-0000000000000000", "agent-old", "hello", "completed", "ok", None, 1, 2),
+            )
+        migrated = SERVER.TaskStore(legacy_path)
+        task = migrated.get("agent-old", "task-0000000000000000")
+        self.assertEqual(task["output"], "ok")
+        self.assertIsNone(task["conversationId"])
 
 
 if __name__ == "__main__":

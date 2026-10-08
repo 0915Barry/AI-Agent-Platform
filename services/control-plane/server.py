@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""M10/M11 单机控制面与 Agent 任务 HTTP API。
+"""M10-M13 单机控制面、Agent 任务与持久化会话 HTTP API。
 
 该服务把前端将来需要的“创建、启动、查询、心跳、停止、销毁”操作转换为
 InstanceRuntime 调用。产品状态保存在 SQLite；Firecracker 的实时进程状态仍以
 lifecycle.py 元数据和 /proc 为准，查询时会自动对两者进行校准。
 
-M11 在同一控制面增加任务队列；guest 通过独立 TAP bridge 领取任务并回传事件。
+M11 在同一控制面增加任务队列；M13 继续增加会话、消息和受限多轮上下文。guest
+通过独立 TAP bridge 领取任务并回传事件。
 当前没有身份认证，因此 main() 强制只允许 loopback 监听。macOS 开发者应通过
 SSH 隧道访问，绝不能为了省事把监听地址改成 0.0.0.0。
 """
@@ -45,6 +46,13 @@ TASK_COLLECTION_ROUTE_RE = re.compile(
 )
 TASK_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/tasks/(task-[0-9a-f]{16})(/events)?$"
+)
+CONVERSATION_COLLECTION_ROUTE_RE = re.compile(
+    r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/conversations$"
+)
+CONVERSATION_ROUTE_RE = re.compile(
+    r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/conversations/"
+    r"(conversation-[0-9a-f]{16})(/messages)?$"
 )
 
 
@@ -327,6 +335,69 @@ class ControlPlane:
         except TaskStoreError as error:
             raise ApiError(404, "task_not_found", str(error)) from error
 
+    def create_conversation(self, instance_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """创建一个属于实例的持久化会话。"""
+
+        instance_id = self.validate_requested_id(instance_id)
+        self.store.get(instance_id)
+        title = payload.get("title", "新会话")
+        if not isinstance(title, str) or not title.strip():
+            raise ApiError(400, "invalid_conversation_title", "conversation title must be a string")
+        title = title.strip()
+        if len(title.encode("utf-8")) > 160:
+            raise ApiError(413, "conversation_title_too_large", "conversation title exceeds 160 bytes")
+        try:
+            return self.tasks.create_conversation(instance_id, title)
+        except (TaskStoreError, OSError, sqlite3.Error) as error:
+            raise ApiError(500, "conversation_create_failed", str(error)) from error
+
+    def list_conversations(self, instance_id: str) -> list[dict[str, Any]]:
+        instance_id = self.validate_requested_id(instance_id)
+        self.store.get(instance_id)
+        return self.tasks.list_conversations(instance_id)
+
+    def get_conversation(self, instance_id: str, conversation_id: str) -> dict[str, Any]:
+        instance_id = self.validate_requested_id(instance_id)
+        self.store.get(instance_id)
+        try:
+            return self.tasks.get_conversation(instance_id, conversation_id)
+        except TaskStoreError as error:
+            raise ApiError(404, "conversation_not_found", str(error)) from error
+
+    def conversation_messages(self, instance_id: str, conversation_id: str) -> list[dict[str, Any]]:
+        instance_id = self.validate_requested_id(instance_id)
+        self.store.get(instance_id)
+        try:
+            return self.tasks.list_messages(instance_id, conversation_id)
+        except TaskStoreError as error:
+            raise ApiError(404, "conversation_not_found", str(error)) from error
+
+    def create_conversation_message(
+        self, instance_id: str, conversation_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """保存用户消息，以受限历史构造任务，并刷新实例活动时间。"""
+
+        instance_id = self.validate_requested_id(instance_id)
+        content = payload.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ApiError(400, "invalid_message", "message content must be a non-empty string")
+        content = content.strip()
+        if len(content.encode("utf-8")) > 16384:
+            raise ApiError(413, "message_too_large", "message content exceeds 16 KiB")
+        record = self.get(instance_id)
+        if record["status"] != "running":
+            raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
+        try:
+            self.tasks.get_conversation(instance_id, conversation_id)
+            self.runtime.heartbeat(instance_id)
+            return self.tasks.create_conversation_task(instance_id, conversation_id, content)
+        except TaskStoreError as error:
+            if "conversation not found" in str(error):
+                raise ApiError(404, "conversation_not_found", str(error)) from error
+            raise ApiError(400, "conversation_context_invalid", str(error)) from error
+        except (RuntimeFailure, OSError, sqlite3.Error) as error:
+            raise ApiError(500, "conversation_task_create_failed", str(error)) from error
+
 
 class ControlPlaneHandler(BaseHTTPRequestHandler):
     """只接受固定路由和 JSON 对象的小型 HTTP 适配层。"""
@@ -388,6 +459,24 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             if self.path == "/api/instances":
                 self.send_payload(200, {"instances": self.control.list()})
                 return
+            conversation_collection = CONVERSATION_COLLECTION_ROUTE_RE.fullmatch(self.path)
+            if conversation_collection:
+                self.send_payload(
+                    200,
+                    {"conversations": self.control.list_conversations(conversation_collection.group(1))},
+                )
+                return
+            conversation_match = CONVERSATION_ROUTE_RE.fullmatch(self.path)
+            if conversation_match:
+                instance_id, conversation_id, messages_suffix = conversation_match.groups()
+                if messages_suffix:
+                    self.send_payload(
+                        200,
+                        {"messages": self.control.conversation_messages(instance_id, conversation_id)},
+                    )
+                else:
+                    self.send_payload(200, self.control.get_conversation(instance_id, conversation_id))
+                return
             task_match = TASK_ROUTE_RE.fullmatch(self.path)
             if task_match:
                 instance_id, task_id, events_suffix = task_match.groups()
@@ -409,6 +498,25 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         try:
             if self.path == "/api/instances":
                 self.send_payload(201, self.control.create(self.read_json()))
+                return
+            conversation_collection = CONVERSATION_COLLECTION_ROUTE_RE.fullmatch(self.path)
+            if conversation_collection:
+                self.send_payload(
+                    201,
+                    self.control.create_conversation(
+                        conversation_collection.group(1), self.read_json()
+                    ),
+                )
+                return
+            conversation_match = CONVERSATION_ROUTE_RE.fullmatch(self.path)
+            if conversation_match and conversation_match.group(3):
+                instance_id, conversation_id, _ = conversation_match.groups()
+                self.send_payload(
+                    202,
+                    self.control.create_conversation_message(
+                        instance_id, conversation_id, self.read_json()
+                    ),
+                )
                 return
             task_match = TASK_COLLECTION_ROUTE_RE.fullmatch(self.path)
             if task_match:
