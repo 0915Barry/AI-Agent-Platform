@@ -25,12 +25,25 @@ if (typeof task.systemPrompt !== "string" || !task.systemPrompt ||
     !["read_only", "read_write"].includes(task.toolMode)) {
   throw new Error("invalid Agent configuration");
 }
+if (!Array.isArray(task.skills) || task.skills.length > 5 || task.skills.some((skill) =>
+  !skill || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(skill.id) ||
+  typeof skill.content !== "string" || Buffer.byteLength(skill.content, "utf8") > 32768)) {
+  throw new Error("invalid Skill snapshot");
+}
 
 const enabledTools = task.toolMode === "read_only" ? "read" : "read,write";
 // Pi 的 --system-prompt 同时接受文本或路径。写入一个固定权限的临时文件可以保证
 // 用户输入即使恰好像现有路径，也始终按提示词正文处理，而不会被解释成任意文件。
 const systemPromptPath = `/tmp/pi-system-prompt-${process.pid}.txt`;
 await fs.writeFile(systemPromptPath, task.systemPrompt, { encoding: "utf8", mode: 0o600 });
+const skillsRoot = `/tmp/pi-skills-${process.pid}`;
+const skillArguments = [];
+for (const skill of task.skills) {
+  const skillDirectory = `${skillsRoot}/${skill.id}`;
+  await fs.mkdir(skillDirectory, { recursive: true, mode: 0o700 });
+  await fs.writeFile(`${skillDirectory}/SKILL.md`, skill.content, { encoding: "utf8", mode: 0o600 });
+  skillArguments.push("--skill", skillDirectory);
+}
 
 async function postEvent(type, data = {}) {
   const response = await fetch(`${bridgeUrl}/guest/tasks/${task.id}/events`, {
@@ -74,6 +87,7 @@ const pi = spawn(
     "--no-approve",
     "--no-extensions",
     "--no-skills",
+    ...skillArguments,
     "--no-prompt-templates",
     "--no-context-files",
     "--tools",
@@ -186,6 +200,7 @@ const exitCode = await new Promise((resolve) => {
 await stderrDone;
 await flushText(true);
 await fs.unlink(systemPromptPath).catch(() => undefined);
+await fs.rm(skillsRoot, { recursive: true, force: true }).catch(() => undefined);
 
 if (exitCode !== 0 || terminalError || !settled) {
   await postEvent("failed", {

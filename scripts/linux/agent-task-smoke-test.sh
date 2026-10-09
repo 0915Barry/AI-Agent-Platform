@@ -141,11 +141,11 @@ instance_created=true
 config_payload="$(jq -n \
   --arg name 'M17 read-only verifier' \
   --arg system 'Follow the user request exactly. You are a read-only verification agent.' \
-  '{agentName:$name,systemPrompt:$system,toolMode:"read_only"}')"
+  '{agentName:$name,systemPrompt:$system,toolMode:"read_only",skillIds:["m18-verifier"]}')"
 curl --fail --silent --show-error --max-time 10 \
   --request POST --header 'Content-Type: application/json' \
   --data "${config_payload}" "${base_url}/api/instances/${instance_id}/config" \
-  | jq -e '.agentName == "M17 read-only verifier" and .toolMode == "read_only"' >/dev/null
+  | jq -e '.agentName == "M17 read-only verifier" and .toolMode == "read_only" and .skillIds == ["m18-verifier"]' >/dev/null
 
 echo "Starting managed Pi Agent microVM with isolated Gateway and task bridge..."
 curl --fail --silent --show-error --max-time 120 \
@@ -175,7 +175,7 @@ curl --fail --silent --show-error --max-time 120 \
   --request POST "${base_url}/api/instances/${instance_id}/start" \
   | jq -e '.status == "running" and .runtime.processAlive == true' >/dev/null
 
-prompt="Use the read tool to read /workspace/m11-marker.txt. Reply with exactly M11_AGENT_TASK_OK followed by a colon and the complete file contents. Do not add any other text."
+prompt="/skill:m18-verifier"
 task_payload="$(jq -n --arg prompt "${prompt}" '{prompt:$prompt}')"
 task_response="$(
   curl --fail --silent --show-error --max-time 10 \
@@ -205,7 +205,7 @@ for _ in $(seq 1 240); do
   sleep 1
 done
 if [[ "${task_status}" != "completed" \
-  || ! "${task_output}" =~ ^M11_AGENT_TASK_OK:[[:space:]]*${token}[[:space:]]*$ ]]; then
+  || ! "${task_output}" =~ ^M18_SKILL_OK:[[:space:]]*${token}[[:space:]]*$ ]]; then
   echo "FAIL: unexpected task result status=${task_status} output=${task_output}" >&2
   exit 1
 fi
@@ -272,3 +272,4 @@ echo "PASS: control plane completed a real Pi Agent task through DeepSeek"
 echo "AGENT_TASK_READY transport=sse events=incremental gateway=streaming persistence=preserved idle_timeout=${INSTANCE_IDLE_TIMEOUT_SECONDS}s"
 echo "M15_STREAMING_READY pi=jsonl control_plane=sse reconnect=last-event-id tools=visible thinking=hidden"
 echo "M17_AGENT_CONFIG_READY system_prompt=custom tools=read_only task_snapshot=verified"
+echo "M18_SKILLS_READY source=reviewed-catalog selection=dynamic snapshot=verified pi=explicit-skill"

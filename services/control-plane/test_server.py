@@ -262,6 +262,7 @@ class ControlPlaneTests(unittest.TestCase):
                 "agentName": "只读审查员",
                 "systemPrompt": "只分析文件内容，不要修改任何文件。",
                 "toolMode": "read_only",
+                "skillIds": ["code-review"],
             },
         )
         self.assertEqual(configured["agentName"], "只读审查员")
@@ -272,6 +273,8 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(claimed["id"], task["id"])
         self.assertEqual(claimed["systemPrompt"], "只分析文件内容，不要修改任何文件。")
         self.assertEqual(claimed["toolMode"], "read_only")
+        self.assertEqual(claimed["skills"][0]["id"], "code-review")
+        self.assertIn("# Code review", claimed["skills"][0]["content"])
 
         with self.assertRaises(SERVER.ApiError) as invalid_tools:
             self.control.update_agent_config(

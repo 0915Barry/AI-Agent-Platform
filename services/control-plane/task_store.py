@@ -75,6 +75,10 @@ class TaskStore:
                 connection.execute(
                     "ALTER TABLE tasks ADD COLUMN tool_mode TEXT NOT NULL DEFAULT 'read_write'"
                 )
+            if "skills_json" not in task_columns:
+                connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]'"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS task_events (
@@ -168,6 +172,7 @@ class TaskStore:
                 "You are a helpful coding agent working inside an isolated workspace."
             ),
             "toolMode": row["tool_mode"] or "read_write",
+            "skills": json.loads(row["skills_json"] or "[]"),
         }
 
     @staticmethod
@@ -273,6 +278,7 @@ class TaskStore:
         content: str,
         system_prompt: str | None = None,
         tool_mode: str = "read_write",
+        skills: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """原子保存用户消息、裁剪上下文并创建对应 queued 任务。"""
 
@@ -293,9 +299,9 @@ class TaskStore:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 "INSERT INTO tasks(id,instance_id,prompt,status,created_at,updated_at,conversation_id,"
-                "system_prompt,tool_mode) VALUES(?,?,?,?,?,?,?,?,?)",
+                "system_prompt,tool_mode,skills_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (task_id, instance_id, prompt, "queued", now, now, conversation_id,
-                 system_prompt, tool_mode),
+                 system_prompt, tool_mode, json.dumps(skills or [], separators=(",", ":"))),
             )
             connection.execute(
                 "INSERT INTO task_events(task_id,event_type,payload,created_at) VALUES(?,?,?,?)",
@@ -318,6 +324,7 @@ class TaskStore:
         prompt: str,
         system_prompt: str | None = None,
         tool_mode: str = "read_write",
+        skills: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """创建一个排队任务，并同时写入 queued 事件。"""
 
@@ -326,8 +333,9 @@ class TaskStore:
         with self.connect() as connection:
             connection.execute(
                 "INSERT INTO tasks(id,instance_id,prompt,status,created_at,updated_at,"
-                "system_prompt,tool_mode) VALUES(?,?,?,?,?,?,?,?)",
-                (task_id, instance_id, prompt, "queued", now, now, system_prompt, tool_mode),
+                "system_prompt,tool_mode,skills_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                (task_id, instance_id, prompt, "queued", now, now, system_prompt, tool_mode,
+                 json.dumps(skills or [], separators=(",", ":"))),
             )
             connection.execute(
                 "INSERT INTO task_events(task_id,event_type,payload,created_at) VALUES(?,?,?,?)",

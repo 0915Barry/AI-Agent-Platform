@@ -74,6 +74,36 @@ SESSION_COOKIE_NAME = "aap_session"
 DEFAULT_AGENT_NAME = "Pi Agent"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful coding agent working inside an isolated workspace."
 AGENT_TOOL_MODES = {"read_only", "read_write"}
+SKILL_CATALOG = {
+    "code-review": {
+        "name": "代码审查",
+        "description": "检查正确性、安全性、可靠性与可维护性",
+    },
+    "document-summary": {
+        "name": "文档总结",
+        "description": "提取文档要点、决策、风险和行动项",
+    },
+    "m18-verifier": {
+        "name": "M18 internal verifier",
+        "description": "internal acceptance only",
+        "internal": True,
+    },
+}
+SKILL_CATALOG_ROOT = REPO_ROOT / "skills" / "catalog"
+
+
+def resolve_skill_snapshot(skill_ids: list[str]) -> list[dict[str, str]]:
+    """只从仓库审核目录读取纯 SKILL.md，任务创建后内容不再随仓库变化。"""
+
+    snapshots = []
+    for skill_id in skill_ids:
+        if skill_id not in SKILL_CATALOG:
+            raise ApiError(400, "invalid_skill", f"未知 Skill：{skill_id}")
+        content = (SKILL_CATALOG_ROOT / skill_id / "SKILL.md").read_text(encoding="utf-8")
+        if len(content.encode("utf-8")) > 32768:
+            raise ApiError(500, "invalid_skill_catalog", f"Skill 过大：{skill_id}")
+        snapshots.append({"id": skill_id, "content": content})
+    return snapshots
 
 
 class ApiError(Exception):
@@ -146,6 +176,10 @@ class InstanceStore:
                 connection.execute(
                     "ALTER TABLE instances ADD COLUMN tool_mode TEXT NOT NULL DEFAULT 'read_write'"
                 )
+            if "skills_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE instances ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]'"
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS instances_owner_created "
                 "ON instances(owner_id,created_at,id)"
@@ -164,6 +198,7 @@ class InstanceStore:
             "agentName": row["agent_name"],
             "systemPrompt": row["system_prompt"],
             "toolMode": row["tool_mode"],
+            "skillIds": json.loads(row["skills_json"] or "[]"),
         }
 
     def create(self, instance_id: str, owner_id: str | None = None) -> dict[str, Any]:
@@ -173,9 +208,9 @@ class InstanceStore:
             with self.connect() as connection:
                 connection.execute(
                     "INSERT INTO instances(id,status,created_at,updated_at,last_error,owner_id,"
-                    "agent_name,system_prompt,tool_mode) VALUES(?,?,?,?,NULL,?,?,?,?)",
+                    "agent_name,system_prompt,tool_mode,skills_json) VALUES(?,?,?,?,NULL,?,?,?,?,?)",
                     (instance_id, "created", now, now, owner_id, DEFAULT_AGENT_NAME,
-                     DEFAULT_SYSTEM_PROMPT, "read_write"),
+                     DEFAULT_SYSTEM_PROMPT, "read_write", "[]"),
                 )
         except sqlite3.IntegrityError as error:
             raise ApiError(409, "instance_exists", f"instance already exists: {instance_id}") from error
@@ -231,12 +266,15 @@ class InstanceStore:
         return int(row["count"])
 
     def update_config(
-        self, instance_id: str, agent_name: str, system_prompt: str, tool_mode: str
+        self, instance_id: str, agent_name: str, system_prompt: str, tool_mode: str,
+        skill_ids: list[str],
     ) -> dict[str, Any]:
         with self.connect() as connection:
             cursor = connection.execute(
-                "UPDATE instances SET agent_name=?,system_prompt=?,tool_mode=?,updated_at=? WHERE id=?",
-                (agent_name, system_prompt, tool_mode, int(time.time()), instance_id),
+                "UPDATE instances SET agent_name=?,system_prompt=?,tool_mode=?,skills_json=?,"
+                "updated_at=? WHERE id=?",
+                (agent_name, system_prompt, tool_mode,
+                 json.dumps(skill_ids, separators=(",", ":")), int(time.time()), instance_id),
             )
         if cursor.rowcount != 1:
             raise ApiError(404, "instance_not_found", f"instance not found: {instance_id}")
@@ -431,7 +469,8 @@ class ControlPlane:
         try:
             self.runtime.heartbeat(instance_id)
             return self.tasks.create(
-                instance_id, prompt, record["systemPrompt"], record["toolMode"]
+                instance_id, prompt, record["systemPrompt"], record["toolMode"],
+                resolve_skill_snapshot(record["skillIds"]),
             )
         except (RuntimeFailure, TaskStoreError, OSError, sqlite3.Error) as error:
             raise ApiError(500, "task_create_failed", str(error)) from error
@@ -517,6 +556,7 @@ class ControlPlane:
                 content,
                 record["systemPrompt"],
                 record["toolMode"],
+                resolve_skill_snapshot(record["skillIds"]),
             )
         except TaskStoreError as error:
             if "conversation not found" in str(error):
@@ -532,6 +572,7 @@ class ControlPlane:
         agent_name = payload.get("agentName", current["agentName"])
         system_prompt = payload.get("systemPrompt", current["systemPrompt"])
         tool_mode = payload.get("toolMode", current["toolMode"])
+        skill_ids = payload.get("skillIds", current["skillIds"])
         if not isinstance(agent_name, str) or not agent_name.strip():
             raise ApiError(400, "invalid_agent_name", "Agent 名称不能为空")
         if len(agent_name.strip().encode("utf-8")) > 80:
@@ -542,8 +583,15 @@ class ControlPlane:
             raise ApiError(413, "system_prompt_too_large", "System Prompt 不能超过 8 KiB")
         if tool_mode not in AGENT_TOOL_MODES:
             raise ApiError(400, "invalid_tool_mode", "工具权限必须是只读或读写")
+        if not isinstance(skill_ids, list) or len(skill_ids) > 5 or any(
+            not isinstance(skill_id, str) or skill_id not in SKILL_CATALOG
+            for skill_id in skill_ids
+        ):
+            raise ApiError(400, "invalid_skills", "Skill 列表包含未知或过多项目")
+        if len(set(skill_ids)) != len(skill_ids):
+            raise ApiError(400, "invalid_skills", "Skill 列表不能重复")
         return self.store.update_config(
-            instance_id, agent_name.strip(), system_prompt.strip(), tool_mode
+            instance_id, agent_name.strip(), system_prompt.strip(), tool_mode, skill_ids
         )
 
     @staticmethod
@@ -756,6 +804,17 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 self.send_payload(200, {"authenticated": user is not None, "user": user})
                 return
             user = self.require_user()
+            if request_path == "/api/skills":
+                self.send_payload(
+                    200,
+                    {"skills": [
+                        {"id": skill_id, "name": details["name"],
+                         "description": details["description"]}
+                        for skill_id, details in SKILL_CATALOG.items()
+                        if not details.get("internal")
+                    ]},
+                )
+                return
             if request_path == "/api/instances":
                 self.send_payload(
                     200,

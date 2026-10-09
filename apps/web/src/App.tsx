@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { api, ApiRequestError } from "./api";
-import type { AgentConversation, AgentInstance, AgentMessage, AgentTask, AgentTaskEvent, AuthUser, WorkspaceEntry, WorkspaceFile } from "./api";
+import type { AgentConversation, AgentInstance, AgentMessage, AgentSkill, AgentTask, AgentTaskEvent, AuthUser, WorkspaceEntry, WorkspaceFile } from "./api";
 
 const statusLabel: Record<string, string> = {
   created: "待启动", starting: "启动中", running: "运行中", stopping: "停止中",
@@ -65,11 +65,17 @@ export default function App() {
   const [agentName, setAgentName] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
   const [toolMode, setToolMode] = useState<"read_only" | "read_write">("read_write");
+  const [skillCatalog, setSkillCatalog] = useState<AgentSkill[]>([]);
+  const [skillIds, setSkillIds] = useState<string[]>([]);
   const [workspacePath, setWorkspacePath] = useState("");
   const [workspaceEntries, setWorkspaceEntries] = useState<WorkspaceEntry[]>([]);
   const [workspacePreview, setWorkspacePreview] = useState<WorkspaceFile | null>(null);
   const idleClocks = useRef<Record<string, { deadline: number; serverIdleSeconds: number }>>({});
   const conversationViewport = useRef<HTMLDivElement | null>(null);
+  const selectedIdRef = useRef<string | null>(null);
+  const selectedConversationIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selectedId;
+  selectedConversationIdRef.current = selectedConversationId;
 
   const selected = useMemo(
     () => instances.find((instance) => instance.id === selectedId) ?? null,
@@ -115,14 +121,31 @@ export default function App() {
   }, []);
 
   const loadConversations = useCallback(async (instanceId: string) => {
-    const next = await api.listConversations(instanceId);
+    let next: AgentConversation[];
+    try {
+      next = await api.listConversations(instanceId);
+    } catch (caught) {
+      // 切换实例时旧请求可能晚于新选择返回；它已经失效，不应显示红色误报警。
+      if (selectedIdRef.current !== instanceId) return;
+      throw caught;
+    }
+    if (selectedIdRef.current !== instanceId) return;
     setConversations(next);
     setSelectedConversationId((current) => current && next.some((item) => item.id === current)
       ? current : next[0]?.id ?? null);
   }, []);
 
   const loadMessages = useCallback(async (instanceId: string, conversationId: string) => {
-    const next = await api.listMessages(instanceId, conversationId);
+    let next: AgentMessage[];
+    try {
+      next = await api.listMessages(instanceId, conversationId);
+    } catch (caught) {
+      if (selectedIdRef.current !== instanceId ||
+          selectedConversationIdRef.current !== conversationId) return;
+      throw caught;
+    }
+    if (selectedIdRef.current !== instanceId ||
+        selectedConversationIdRef.current !== conversationId) return;
     setMessages((current) => {
       const unchanged = current.length === next.length && current.every((message, index) => {
         const candidate = next[index];
@@ -142,6 +165,7 @@ export default function App() {
   useEffect(() => {
     if (!currentUser) return;
     void refresh();
+    void api.listSkills().then(setSkillCatalog).catch(() => setSkillCatalog([]));
     const timer = window.setInterval(() => void refresh(true), 3000);
     return () => window.clearInterval(timer);
   }, [currentUser, refresh]);
@@ -172,6 +196,7 @@ export default function App() {
     setAgentName(selected.agentName);
     setSystemPrompt(selected.systemPrompt);
     setToolMode(selected.toolMode);
+    setSkillIds(selected.skillIds ?? []);
   }, [selected?.id]);
 
   useEffect(() => {
@@ -376,6 +401,7 @@ export default function App() {
     if (!selected || !agentName.trim() || !systemPrompt.trim()) return;
     void runAction("config", () => api.updateAgentConfig(selected.id, {
       agentName: agentName.trim(), systemPrompt: systemPrompt.trim(), toolMode,
+      skillIds,
     }));
   }
 
@@ -557,6 +583,7 @@ export default function App() {
                 <label>Agent 名称<input value={agentName} onChange={(event) => setAgentName(event.target.value)} maxLength={80} /></label>
                 <label>System Prompt<textarea value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} rows={10} maxLength={8192} /></label>
                 <label>工具权限<select value={toolMode} onChange={(event) => setToolMode(event.target.value as "read_only" | "read_write")}><option value="read_only">只读文件（read）</option><option value="read_write">读写文件（read、write）</option></select></label>
+                <fieldset><legend>启用 Skills</legend>{skillCatalog.map((skill) => <label className="skill-option" key={skill.id}><input type="checkbox" checked={skillIds.includes(skill.id)} onChange={(event) => setSkillIds((current) => event.target.checked ? [...current, skill.id] : current.filter((id) => id !== skill.id))} /><span><strong>{skill.name}</strong><small>{skill.description}</small></span></label>)}</fieldset>
                 <p>配置只影响之后创建的任务。microVM 隔离、网络策略和宿主凭据不可在这里修改。</p>
                 <button className="primary-button" disabled={action !== null || !agentName.trim() || !systemPrompt.trim()}>{action === "config" ? "保存中…" : "保存 Agent 配置"}</button>
               </form>}

@@ -14,7 +14,7 @@
 
 ## 快速开始
 
-首次部署**不需要**从 M0 到 M16 逐项运行。里程碑命令是底层研发、故障定位和
+首次部署**不需要**从 M0 到 M18 逐项运行。里程碑命令是底层研发、故障定位和
 回归测试入口；首次运行只使用
 `bootstrap → configure-user → configure-deepseek → verify → start`。
 
@@ -186,6 +186,7 @@ Windows 浏览器打开 `http://127.0.0.1:5173` 并登录，在页面中选择�
 | M15 | Pi JSONL、Gateway 流式转发、控制面 SSE 与页面增量输出 | ✅ 已通过 |
 | M16 | 本地账户登录、HttpOnly 会话、实例归属隔离与每用户配额 | ✅ 已通过 |
 | M17 | 实例级 Agent 名称、System Prompt 与只读/读写工具权限 | ✅ 已通过 |
+| M18 | 仓库审核 Skill 目录、实例动态启停与任务快照注入 | ✅ 已通过 |
 
 ## 当前支持范围
 
@@ -454,6 +455,7 @@ Linux/KVM checks passed
 | HTTP 控制面 | `./run.sh control-plane-smoke-test` | `./run-linux.sh control-plane-smoke-test` |
 | Agent 任务通道 | `./run.sh agent-task-smoke-test` | `./run-linux.sh agent-task-smoke-test` |
 | Agent 自定义配置 | `./run.sh agent-config-smoke-test` | `./run-linux.sh agent-config-smoke-test` |
+| Skill 动态注入 | `./run.sh skills-smoke-test` | `./run-linux.sh skills-smoke-test` |
 | 工作区文件通道 | `./run.sh workspace-smoke-test` | `./run-linux.sh workspace-smoke-test` |
 
 第一次 `runtime-smoke-test` 会从固定 Ubuntu 快照构建完整 rootfs，下载较多基础包并安装 Node.js 和 Pi Agent，耗时明显较长。构建指纹不变时后续测试会复用 `/srv/fc/artifacts/agent-rootfs.ext4`。
@@ -489,6 +491,7 @@ Linux/KVM checks passed
 | `control-plane-smoke-test` | 通过 HTTP API 创建、启动、查询、心跳、停止并销毁真实 microVM |
 | `agent-task-smoke-test` | 通过控制面向 microVM 内 Pi 下发真实任务，并验证 DeepSeek、工具读取和事件结果 |
 | `agent-config-smoke-test` | 验证自定义 System Prompt、只读工具权限和任务配置快照进入真实 Pi |
+| `skills-smoke-test` | 验证审核目录中的 Skill 经任务快照动态注入真实 Pi |
 | `workspace-smoke-test` | 在真实 microVM 中验证文件读写、路径隔离与重启持久化 |
 | `control-plane-start` | 构建所需镜像并在 Ubuntu loopback 启动长期运行的控制面 |
 | `control-plane-stop` | 停止控制面进程；已启动实例仍由独立空闲回收器管理 |
@@ -1288,6 +1291,46 @@ M17_AGENT_CONFIG_READY system_prompt=custom tools=read_only task_snapshot=verifi
 正式系统提示参数和唯一允许的 `read` 工具完成 DeepSeek 任务，并输出
 `M17_AGENT_CONFIG_READY`。页面也已验证配置保存及自定义角色回答正常。19 项控制面
 自动测试与前端生产构建全部通过。
+
+## M18 动态 Skill 管理
+
+M18 第一版提供由仓库审核的指令型 Skill 目录。页面“配置”中可以为每个实例独立启用
+“代码审查”和“文档总结”；选择结果保存在实例记录中，并在创建任务时连同 Skill
+正文写入不可变快照。guest 会为本次任务创建临时 Skill 目录，通过 Pi 1.0.0 的正式
+`--skill` 参数显式加载，任务结束后立即清理。
+
+这一版不接受页面上传任意 Skill，也不允许 Skill 携带脚本、密钥或新的工具权限。
+Skill 只能补充模型工作流程，实际能力仍受 M17 的 `read` 或 `read,write` 白名单、
+microVM、jailer 和网络策略限制。新增 Skill 必须作为仓库文件经过代码审查；实例启停
+已有 Skill 不需要重建 rootfs。
+
+真实链路验收：
+
+```bash
+# macOS
+./run.sh skills-smoke-test
+
+# Windows 的 Ubuntu VM
+./run-linux.sh skills-smoke-test
+```
+
+第一次会因 guest 适配器变化重建 rootfs。测试通过真实 DeepSeek 强制调用内部验收
+Skill，并使用只读工具读取随机文件。成功标志：
+
+```text
+M18_SKILLS_READY source=reviewed-catalog selection=dynamic snapshot=verified pi=explicit-skill
+```
+
+页面验收时，在实例“配置”中勾选“文档总结”并保存，刷新后确认仍勾选，再让 Agent
+总结工作区中的文档。MCP、可执行 Skill 和用户上传 Skill 仍属于后续安全评审范围。
+
+### M18 实测结果
+
+已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境通过真实验收：内部验收 Skill
+经任务快照和 Pi `--skill` 参数进入 microVM，使用唯一允许的 `read` 工具读取随机
+文件并输出 `M18_SKILLS_READY`；页面启用“文档总结”后，刷新仍保留选择，并成功读取
+工作区真实文件生成摘要。测试也确认缺失文件时 Skill 会报告 `ENOENT` 而不会编造内容。
+同时修复了切换实例时旧会话请求晚返回导致的 `conversation not found` 红色误报警。
 
 ## 跨平台常见错误
 

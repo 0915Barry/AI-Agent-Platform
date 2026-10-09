@@ -178,6 +178,13 @@ h3 { font-size: 18px; }
 .agent-config input:focus, .agent-config textarea:focus, .agent-config select:focus { border-color: #718345; }
 .agent-config p { color: var(--muted); font-size: 11px; line-height: 1.7; }
 .agent-config .primary-button { justify-self: start; min-height: 40px; border: 0; cursor: pointer; }
+.agent-config fieldset { display: grid; gap: 8px; margin: 0; padding: 14px; border: 1px solid var(--line); }
+.agent-config legend { padding: 0 6px; color: #b9c0af; font-size: 11px; }
+.agent-config .skill-option { display: flex; grid-template-columns: none; align-items: flex-start; gap: 10px; padding: 9px; background: #10130f; cursor: pointer; }
+.agent-config .skill-option input { width: auto; margin-top: 3px; }
+.agent-config .skill-option span { display: grid; gap: 4px; }
+.agent-config .skill-option strong { color: #e2e7da; font-size: 12px; }
+.agent-config .skill-option small { color: var(--muted); font-size: 10px; }
 .no-selection { min-height: 75vh; display: grid; place-content: center; justify-items: center; text-align: center; color: var(--muted); gap: 10px; }
 .no-selection-mark { width: 58px; height: 58px; border: 1px solid #3d4633; display: grid; place-items: center; color: var(--accent); font: 28px "DM Mono", monospace; margin-bottom: 10px; }
 .no-selection h2 { color: #e1e5d9; font-size: 22px; }

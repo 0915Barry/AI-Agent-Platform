@@ -92,6 +92,7 @@ def main() -> None:
                             "prompt": task["prompt"],
                             "systemPrompt": task["systemPrompt"],
                             "toolMode": task["toolMode"],
+                            "skills": task["skills"],
                         },
                     )
                     return
