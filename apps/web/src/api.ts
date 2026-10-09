@@ -25,6 +25,9 @@ export interface AgentInstance {
   createdAt: number;
   updatedAt: number;
   lastError: string | null;
+  agentName: string;
+  systemPrompt: string;
+  toolMode: "read_only" | "read_write";
   runtime?: RuntimeStatus;
 }
 
@@ -126,6 +129,12 @@ export const api = {
   startInstance: (id: string) => request<AgentInstance>(`/api/instances/${id}/start`, { method: "POST" }),
   stopInstance: (id: string) => request<AgentInstance>(`/api/instances/${id}/stop`, { method: "POST" }),
   destroyInstance: (id: string) => request<{ id: string; status: string }>(`/api/instances/${id}`, { method: "DELETE" }),
+  updateAgentConfig: (
+    id: string,
+    config: { agentName: string; systemPrompt: string; toolMode: "read_only" | "read_write" },
+  ) => request<AgentInstance>(`/api/instances/${id}/config`, {
+    method: "POST", body: JSON.stringify(config),
+  }),
   createTask: (instanceId: string, prompt: string) =>
     request<AgentTask>(`/api/instances/${instanceId}/tasks`, {
       method: "POST",

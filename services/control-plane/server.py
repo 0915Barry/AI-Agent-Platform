@@ -47,6 +47,9 @@ INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 INSTANCE_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})(?:/(start|stop|heartbeat))?$"
 )
+INSTANCE_CONFIG_ROUTE_RE = re.compile(
+    r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/config$"
+)
 TASK_COLLECTION_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/tasks$"
 )
@@ -68,6 +71,9 @@ MAX_WORKSPACE_FILE_BYTES = 5 * 1024 * 1024
 MAX_INSTANCES_PER_USER = 5
 MAX_RUNNING_INSTANCES_PER_USER = 2
 SESSION_COOKIE_NAME = "aap_session"
+DEFAULT_AGENT_NAME = "Pi Agent"
+DEFAULT_SYSTEM_PROMPT = "You are a helpful coding agent working inside an isolated workspace."
+AGENT_TOOL_MODES = {"read_only", "read_write"}
 
 
 class ApiError(Exception):
@@ -127,6 +133,19 @@ class InstanceStore:
             }
             if "owner_id" not in columns:
                 connection.execute("ALTER TABLE instances ADD COLUMN owner_id TEXT")
+            if "agent_name" not in columns:
+                connection.execute(
+                    "ALTER TABLE instances ADD COLUMN agent_name TEXT NOT NULL DEFAULT 'Pi Agent'"
+                )
+            if "system_prompt" not in columns:
+                connection.execute(
+                    "ALTER TABLE instances ADD COLUMN system_prompt TEXT NOT NULL DEFAULT "
+                    "'You are a helpful coding agent working inside an isolated workspace.'"
+                )
+            if "tool_mode" not in columns:
+                connection.execute(
+                    "ALTER TABLE instances ADD COLUMN tool_mode TEXT NOT NULL DEFAULT 'read_write'"
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS instances_owner_created "
                 "ON instances(owner_id,created_at,id)"
@@ -142,6 +161,9 @@ class InstanceStore:
             "updatedAt": row["updated_at"],
             "lastError": row["last_error"],
             "ownerId": row["owner_id"],
+            "agentName": row["agent_name"],
+            "systemPrompt": row["system_prompt"],
+            "toolMode": row["tool_mode"],
         }
 
     def create(self, instance_id: str, owner_id: str | None = None) -> dict[str, Any]:
@@ -150,9 +172,10 @@ class InstanceStore:
         try:
             with self.connect() as connection:
                 connection.execute(
-                    "INSERT INTO instances(id,status,created_at,updated_at,last_error,owner_id) "
-                    "VALUES(?,?,?,?,NULL,?)",
-                    (instance_id, "created", now, now, owner_id),
+                    "INSERT INTO instances(id,status,created_at,updated_at,last_error,owner_id,"
+                    "agent_name,system_prompt,tool_mode) VALUES(?,?,?,?,NULL,?,?,?,?)",
+                    (instance_id, "created", now, now, owner_id, DEFAULT_AGENT_NAME,
+                     DEFAULT_SYSTEM_PROMPT, "read_write"),
                 )
         except sqlite3.IntegrityError as error:
             raise ApiError(409, "instance_exists", f"instance already exists: {instance_id}") from error
@@ -162,7 +185,7 @@ class InstanceStore:
         """按 ID 查询记录；不存在时返回统一 404 语义。"""
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT id,status,created_at,updated_at,last_error,owner_id FROM instances WHERE id=?",
+                "SELECT * FROM instances WHERE id=?",
                 (instance_id,),
             ).fetchone()
         if row is None:
@@ -174,13 +197,11 @@ class InstanceStore:
         with self.connect() as connection:
             if owner_id is None:
                 rows = connection.execute(
-                    "SELECT id,status,created_at,updated_at,last_error,owner_id "
-                    "FROM instances ORDER BY created_at,id"
+                    "SELECT * FROM instances ORDER BY created_at,id"
                 ).fetchall()
             else:
                 rows = connection.execute(
-                    "SELECT id,status,created_at,updated_at,last_error,owner_id "
-                    "FROM instances WHERE owner_id=? ORDER BY created_at,id",
+                    "SELECT * FROM instances WHERE owner_id=? ORDER BY created_at,id",
                     (owner_id,),
                 ).fetchall()
         return [self.row_to_dict(row) for row in rows]
@@ -208,6 +229,18 @@ class InstanceStore:
                     "SELECT COUNT(*) AS count FROM instances WHERE owner_id=?", (owner_id,)
                 ).fetchone()
         return int(row["count"])
+
+    def update_config(
+        self, instance_id: str, agent_name: str, system_prompt: str, tool_mode: str
+    ) -> dict[str, Any]:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE instances SET agent_name=?,system_prompt=?,tool_mode=?,updated_at=? WHERE id=?",
+                (agent_name, system_prompt, tool_mode, int(time.time()), instance_id),
+            )
+        if cursor.rowcount != 1:
+            raise ApiError(404, "instance_not_found", f"instance not found: {instance_id}")
+        return self.get(instance_id)
 
     def update(self, instance_id: str, status: str, last_error: str | None = None) -> dict[str, Any]:
         """更新状态和最后错误，供状态机每个阶段使用。"""
@@ -397,7 +430,9 @@ class ControlPlane:
             raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
         try:
             self.runtime.heartbeat(instance_id)
-            return self.tasks.create(instance_id, prompt)
+            return self.tasks.create(
+                instance_id, prompt, record["systemPrompt"], record["toolMode"]
+            )
         except (RuntimeFailure, TaskStoreError, OSError, sqlite3.Error) as error:
             raise ApiError(500, "task_create_failed", str(error)) from error
 
@@ -476,13 +511,40 @@ class ControlPlane:
         try:
             self.tasks.get_conversation(instance_id, conversation_id)
             self.runtime.heartbeat(instance_id)
-            return self.tasks.create_conversation_task(instance_id, conversation_id, content)
+            return self.tasks.create_conversation_task(
+                instance_id,
+                conversation_id,
+                content,
+                record["systemPrompt"],
+                record["toolMode"],
+            )
         except TaskStoreError as error:
             if "conversation not found" in str(error):
                 raise ApiError(404, "conversation_not_found", str(error)) from error
             raise ApiError(400, "conversation_context_invalid", str(error)) from error
         except (RuntimeFailure, OSError, sqlite3.Error) as error:
             raise ApiError(500, "conversation_task_create_failed", str(error)) from error
+
+    def update_agent_config(self, instance_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """校验并保存实例 Agent 配置；运行中的下一项任务会使用新快照。"""
+
+        current = self.store.get(self.validate_requested_id(instance_id))
+        agent_name = payload.get("agentName", current["agentName"])
+        system_prompt = payload.get("systemPrompt", current["systemPrompt"])
+        tool_mode = payload.get("toolMode", current["toolMode"])
+        if not isinstance(agent_name, str) or not agent_name.strip():
+            raise ApiError(400, "invalid_agent_name", "Agent 名称不能为空")
+        if len(agent_name.strip().encode("utf-8")) > 80:
+            raise ApiError(413, "agent_name_too_large", "Agent 名称不能超过 80 字节")
+        if not isinstance(system_prompt, str) or not system_prompt.strip():
+            raise ApiError(400, "invalid_system_prompt", "System Prompt 不能为空")
+        if len(system_prompt.strip().encode("utf-8")) > 8192:
+            raise ApiError(413, "system_prompt_too_large", "System Prompt 不能超过 8 KiB")
+        if tool_mode not in AGENT_TOOL_MODES:
+            raise ApiError(400, "invalid_tool_mode", "工具权限必须是只读或读写")
+        return self.store.update_config(
+            instance_id, agent_name.strip(), system_prompt.strip(), tool_mode
+        )
 
     @staticmethod
     def validate_workspace_path(value: Any, *, allow_root: bool) -> str:
@@ -795,6 +857,14 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 self.send_payload(
                     201,
                     self.control.create(self.read_json(), user["id"] if user is not None else None),
+                )
+                return
+            config_match = INSTANCE_CONFIG_ROUTE_RE.fullmatch(request_path)
+            if config_match:
+                instance_id = config_match.group(1)
+                self.authorize_instance(instance_id, user)
+                self.send_payload(
+                    200, self.control.update_agent_config(instance_id, self.read_json(12288))
                 )
                 return
             workspace_match = WORKSPACE_ROUTE_RE.fullmatch(request_path)

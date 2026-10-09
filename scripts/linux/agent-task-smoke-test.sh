@@ -136,6 +136,17 @@ curl --fail --silent --show-error --max-time 10 \
   --data '{"id":"m11-smoke"}' "${base_url}/api/instances" >/dev/null
 instance_created=true
 
+# M17：把自定义 System Prompt 与只读工具模式保存到实例。后面的真实任务只有 read
+# 工具可用，因此同时验证配置从控制面进入 guest Pi，而不是仅停留在页面。
+config_payload="$(jq -n \
+  --arg name 'M17 read-only verifier' \
+  --arg system 'Follow the user request exactly. You are a read-only verification agent.' \
+  '{agentName:$name,systemPrompt:$system,toolMode:"read_only"}')"
+curl --fail --silent --show-error --max-time 10 \
+  --request POST --header 'Content-Type: application/json' \
+  --data "${config_payload}" "${base_url}/api/instances/${instance_id}/config" \
+  | jq -e '.agentName == "M17 read-only verifier" and .toolMode == "read_only"' >/dev/null
+
 echo "Starting managed Pi Agent microVM with isolated Gateway and task bridge..."
 curl --fail --silent --show-error --max-time 120 \
   --request POST "${base_url}/api/instances/${instance_id}/start" \
@@ -260,3 +271,4 @@ instance_created=false
 echo "PASS: control plane completed a real Pi Agent task through DeepSeek"
 echo "AGENT_TASK_READY transport=sse events=incremental gateway=streaming persistence=preserved idle_timeout=${INSTANCE_IDLE_TIMEOUT_SECONDS}s"
 echo "M15_STREAMING_READY pi=jsonl control_plane=sse reconnect=last-event-id tools=visible thinking=hidden"
+echo "M17_AGENT_CONFIG_READY system_prompt=custom tools=read_only task_snapshot=verified"

@@ -85,7 +85,15 @@ def main() -> None:
                         return
                     args.activity_file.touch()
                     audit({"instance": args.instance_id, "task": task["id"], "event": "claimed"})
-                    self.send_json(200, {"id": task["id"], "prompt": task["prompt"]})
+                    self.send_json(
+                        200,
+                        {
+                            "id": task["id"],
+                            "prompt": task["prompt"],
+                            "systemPrompt": task["systemPrompt"],
+                            "toolMode": task["toolMode"],
+                        },
+                    )
                     return
 
                 if self.path == "/guest/workspace/next":

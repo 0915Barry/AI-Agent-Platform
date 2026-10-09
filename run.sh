@@ -53,6 +53,8 @@ Commands:
                          Control a real microVM through the M10 HTTP API
   agent-task-smoke-test  Run the managed Pi task path (legacy command alias)
   streaming-smoke-test   Verify M15 Pi JSONL, Gateway streaming, and SSE
+  agent-config-smoke-test
+                         Verify M17 custom prompt and tool permissions
   workspace-smoke-test   Verify M14 file operations and restart persistence
   control-plane-start    Start the loopback-only M10 API in the Linux VM
   control-plane-stop     Stop the M10 API; running instances remain managed
@@ -483,6 +485,9 @@ case "${command}" in
     smoke_test_agent_task
     ;;
   streaming-smoke-test)
+    smoke_test_agent_task
+    ;;
+  agent-config-smoke-test)
     smoke_test_agent_task
     ;;
   workspace-smoke-test)

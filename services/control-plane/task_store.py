@@ -69,6 +69,12 @@ class TaskStore:
             }
             if "conversation_id" not in task_columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN conversation_id TEXT")
+            if "system_prompt" not in task_columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN system_prompt TEXT")
+            if "tool_mode" not in task_columns:
+                connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN tool_mode TEXT NOT NULL DEFAULT 'read_write'"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS task_events (
@@ -158,6 +164,10 @@ class TaskStore:
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
             "conversationId": row["conversation_id"],
+            "systemPrompt": row["system_prompt"] or (
+                "You are a helpful coding agent working inside an isolated workspace."
+            ),
+            "toolMode": row["tool_mode"] or "read_write",
         }
 
     @staticmethod
@@ -257,7 +267,12 @@ class TaskStore:
         return prefix + json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
 
     def create_conversation_task(
-        self, instance_id: str, conversation_id: str, content: str
+        self,
+        instance_id: str,
+        conversation_id: str,
+        content: str,
+        system_prompt: str | None = None,
+        tool_mode: str = "read_write",
     ) -> dict[str, Any]:
         """原子保存用户消息、裁剪上下文并创建对应 queued 任务。"""
 
@@ -277,9 +292,10 @@ class TaskStore:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
-                "INSERT INTO tasks(id,instance_id,prompt,status,created_at,updated_at,conversation_id) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (task_id, instance_id, prompt, "queued", now, now, conversation_id),
+                "INSERT INTO tasks(id,instance_id,prompt,status,created_at,updated_at,conversation_id,"
+                "system_prompt,tool_mode) VALUES(?,?,?,?,?,?,?,?,?)",
+                (task_id, instance_id, prompt, "queued", now, now, conversation_id,
+                 system_prompt, tool_mode),
             )
             connection.execute(
                 "INSERT INTO task_events(task_id,event_type,payload,created_at) VALUES(?,?,?,?)",
@@ -296,15 +312,22 @@ class TaskStore:
             )
         return self.get(instance_id, task_id)
 
-    def create(self, instance_id: str, prompt: str) -> dict[str, Any]:
+    def create(
+        self,
+        instance_id: str,
+        prompt: str,
+        system_prompt: str | None = None,
+        tool_mode: str = "read_write",
+    ) -> dict[str, Any]:
         """创建一个排队任务，并同时写入 queued 事件。"""
 
         task_id = f"task-{uuid.uuid4().hex[:16]}"
         now = int(time.time())
         with self.connect() as connection:
             connection.execute(
-                "INSERT INTO tasks(id,instance_id,prompt,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                (task_id, instance_id, prompt, "queued", now, now),
+                "INSERT INTO tasks(id,instance_id,prompt,status,created_at,updated_at,"
+                "system_prompt,tool_mode) VALUES(?,?,?,?,?,?,?,?)",
+                (task_id, instance_id, prompt, "queued", now, now, system_prompt, tool_mode),
             )
             connection.execute(
                 "INSERT INTO task_events(task_id,event_type,payload,created_at) VALUES(?,?,?,?)",

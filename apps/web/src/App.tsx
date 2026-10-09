@@ -61,7 +61,10 @@ export default function App() {
   const [action, setAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [clock, setClock] = useState(() => Date.now());
-  const [consoleView, setConsoleView] = useState<"chat" | "files">("chat");
+  const [consoleView, setConsoleView] = useState<"chat" | "files" | "config">("chat");
+  const [agentName, setAgentName] = useState("");
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const [toolMode, setToolMode] = useState<"read_only" | "read_write">("read_write");
   const [workspacePath, setWorkspacePath] = useState("");
   const [workspaceEntries, setWorkspaceEntries] = useState<WorkspaceEntry[]>([]);
   const [workspacePreview, setWorkspacePreview] = useState<WorkspaceFile | null>(null);
@@ -163,6 +166,13 @@ export default function App() {
     void loadConversations(selectedId).catch((caught) =>
       setError(caught instanceof Error ? caught.message : "会话列表加载失败"));
   }, [loadConversations, selectedId]);
+
+  useEffect(() => {
+    if (!selected) return;
+    setAgentName(selected.agentName);
+    setSystemPrompt(selected.systemPrompt);
+    setToolMode(selected.toolMode);
+  }, [selected?.id]);
 
   useEffect(() => {
     setMessages([]);
@@ -361,6 +371,14 @@ export default function App() {
     });
   }
 
+  function saveAgentConfig(event: FormEvent) {
+    event.preventDefault();
+    if (!selected || !agentName.trim() || !systemPrompt.trim()) return;
+    void runAction("config", () => api.updateAgentConfig(selected.id, {
+      agentName: agentName.trim(), systemPrompt: systemPrompt.trim(), toolMode,
+    }));
+  }
+
   async function loadWorkspace(path = workspacePath) {
     if (!selected || selected.status !== "running") return;
     await runAction("files", async () => {
@@ -496,7 +514,7 @@ export default function App() {
             {error ? <div className="error-banner">{error}</div> : null}
             {selected.lastError ? <div className="error-banner">{selected.lastError}</div> : null}
             <div className="agent-console">
-              <div className="console-heading"><div><span className="eyebrow">PI AGENT · M15</span><h3>{consoleView === "chat" ? selectedConversation?.title ?? "多轮会话" : "/workspace 文件"}</h3></div><div className="console-tabs"><button className={consoleView === "chat" ? "active" : ""} onClick={() => setConsoleView("chat")}>会话</button><button className={consoleView === "files" ? "active" : ""} onClick={() => { setConsoleView("files"); void loadWorkspace(""); }}>文件</button></div></div>
+              <div className="console-heading"><div><span className="eyebrow">PI AGENT · M17</span><h3>{consoleView === "chat" ? selectedConversation?.title ?? selected.agentName : consoleView === "files" ? "/workspace 文件" : "Agent 配置"}</h3></div><div className="console-tabs"><button className={consoleView === "chat" ? "active" : ""} onClick={() => setConsoleView("chat")}>会话</button><button className={consoleView === "files" ? "active" : ""} onClick={() => { setConsoleView("files"); void loadWorkspace(""); }}>文件</button><button className={consoleView === "config" ? "active" : ""} onClick={() => setConsoleView("config")}>配置</button></div></div>
               {consoleView === "chat" ? <div className="chat-layout">
                 <aside className="conversation-sidebar">
                   <button className="new-conversation" onClick={createConversation} disabled={action !== null}><Icon name="plus" /> 新建会话</button>
@@ -517,7 +535,7 @@ export default function App() {
                     <button className="send-button" disabled={selected.status !== "running" || !prompt.trim() || action !== null || taskActive}><Icon name="send" />{action === "task" ? "发送中" : taskActive ? "执行中" : "发送消息"}</button>
                   </form>
                 </div>
-              </div> : <div className="file-browser">
+              </div> : consoleView === "files" ? <div className="file-browser">
                 <div className="file-toolbar">
                   <button disabled={!workspacePath || action !== null} onClick={() => void loadWorkspace(workspacePath.split("/").slice(0, -1).join("/"))}>← 返回</button>
                   <code>/workspace{workspacePath ? `/${workspacePath}` : ""}</code>
@@ -535,7 +553,13 @@ export default function App() {
                     {workspacePreview ? <><div className="preview-heading"><div><strong>{workspacePreview.name}</strong><small>{workspacePreview.size.toLocaleString()} B</small></div><button onClick={() => downloadWorkspaceFile(workspacePreview)}>下载</button></div><pre>{previewText(workspacePreview)}</pre></> : <div className="file-empty">选择文件可预览 UTF-8 文本并下载。</div>}
                   </div>
                 </div>
-              </div>}
+              </div> : <form className="agent-config" onSubmit={saveAgentConfig}>
+                <label>Agent 名称<input value={agentName} onChange={(event) => setAgentName(event.target.value)} maxLength={80} /></label>
+                <label>System Prompt<textarea value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} rows={10} maxLength={8192} /></label>
+                <label>工具权限<select value={toolMode} onChange={(event) => setToolMode(event.target.value as "read_only" | "read_write")}><option value="read_only">只读文件（read）</option><option value="read_write">读写文件（read、write）</option></select></label>
+                <p>配置只影响之后创建的任务。microVM 隔离、网络策略和宿主凭据不可在这里修改。</p>
+                <button className="primary-button" disabled={action !== null || !agentName.trim() || !systemPrompt.trim()}>{action === "config" ? "保存中…" : "保存 Agent 配置"}</button>
+              </form>}
             </div>
           </> : <div className="no-selection"><div className="no-selection-mark">π</div><h2>选择一个 Agent 实例</h2><p>在左侧创建或选择实例，然后启动隔离工作区。</p>{error ? <div className="error-banner">{error}</div> : null}</div>}
         </section>

@@ -185,6 +185,7 @@ Windows 浏览器打开 `http://127.0.0.1:5173` 并登录，在页面中选择�
 | M14 | 工作区文件上传、列表、预览、下载、目录与持久化 | ✅ 已通过 |
 | M15 | Pi JSONL、Gateway 流式转发、控制面 SSE 与页面增量输出 | ✅ 已通过 |
 | M16 | 本地账户登录、HttpOnly 会话、实例归属隔离与每用户配额 | ✅ 已通过 |
+| M17 | 实例级 Agent 名称、System Prompt 与只读/读写工具权限 | ✅ 已通过 |
 
 ## 当前支持范围
 
@@ -452,6 +453,7 @@ Linux/KVM checks passed
 | DeepSeek 端到端 | `./run.sh deepseek-e2e-test` | `./run-linux.sh deepseek-e2e-test` |
 | HTTP 控制面 | `./run.sh control-plane-smoke-test` | `./run-linux.sh control-plane-smoke-test` |
 | Agent 任务通道 | `./run.sh agent-task-smoke-test` | `./run-linux.sh agent-task-smoke-test` |
+| Agent 自定义配置 | `./run.sh agent-config-smoke-test` | `./run-linux.sh agent-config-smoke-test` |
 | 工作区文件通道 | `./run.sh workspace-smoke-test` | `./run-linux.sh workspace-smoke-test` |
 
 第一次 `runtime-smoke-test` 会从固定 Ubuntu 快照构建完整 rootfs，下载较多基础包并安装 Node.js 和 Pi Agent，耗时明显较长。构建指纹不变时后续测试会复用 `/srv/fc/artifacts/agent-rootfs.ext4`。
@@ -486,6 +488,7 @@ Linux/KVM checks passed
 | `deepseek-e2e-test` | 让 Pi Agent 经 Tool Gateway 调用 DeepSeek 并执行 `read` 工具 |
 | `control-plane-smoke-test` | 通过 HTTP API 创建、启动、查询、心跳、停止并销毁真实 microVM |
 | `agent-task-smoke-test` | 通过控制面向 microVM 内 Pi 下发真实任务，并验证 DeepSeek、工具读取和事件结果 |
+| `agent-config-smoke-test` | 验证自定义 System Prompt、只读工具权限和任务配置快照进入真实 Pi |
 | `workspace-smoke-test` | 在真实 microVM 中验证文件读写、路径隔离与重启持久化 |
 | `control-plane-start` | 构建所需镜像并在 Ubuntu loopback 启动长期运行的控制面 |
 | `control-plane-stop` | 停止控制面进程；已启动实例仍由独立空闲回收器管理 |
@@ -1241,6 +1244,50 @@ M16_AUTH_READY password=pbkdf2-sha256 session=httponly:12h ownership=isolated qu
 原有实例。认证、会话撤销、跨用户 404 隔离和配额的 18 项自动测试及前端生产构建均
 已通过。服务脚本还会在 PID 文件丢失时从 `/proc` 找回旧控制面进程，避免升级过程中
 遗留无法停止的孤儿服务。
+
+## M17 自定义 Agent 配置
+
+M17 第一版把每个实例变成可独立配置的 Agent。登录后选择实例，打开“配置”页即可
+修改 Agent 名称、System Prompt 和工具权限。模型仍固定为已经验收的 DeepSeek，避免
+在同一里程碑同时扩大供应商和密钥管理范围。
+
+工具权限只允许两个由平台定义的安全集合：
+
+- 只读文件：Pi 只获得 `read`；
+- 读写文件：Pi 获得 `read,write`。
+
+页面不能开放 `bash`、关闭 jailer、改变网络策略、读取宿主凭据或挂载任意目录。
+System Prompt 最大 8 KiB，任务创建时连同工具模式写入不可变任务快照；因此任务排队
+后再修改实例配置，不会在执行中途改变旧任务的行为。guest 适配器通过 Pi 1.0.0 的
+正式 `--system-prompt` 参数传入系统指令，并用 `--tools` 设置精确工具白名单。
+
+真实链路验收命令为：
+
+```bash
+# macOS
+./run.sh agent-config-smoke-test
+
+# Windows 的 Ubuntu VM
+./run-linux.sh agent-config-smoke-test
+```
+
+该测试会重建一次包含新版 guest 适配器的 rootfs，创建只读 Agent 配置，并要求真实
+Pi 使用唯一允许的 `read` 工具读取随机文件。成功时除 M15 标志外还会出现：
+
+```text
+M17_AGENT_CONFIG_READY system_prompt=custom tools=read_only task_snapshot=verified
+```
+
+后端和页面代码已经通过自动测试与生产构建。可复用的跨实例模板、Skill 与 MCP 动态
+挂载不属于本里程碑。
+
+### M17 实测结果
+
+已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境完成真实验收：控制面保存了
+自定义名称、System Prompt 和只读工具模式；任务以不可变快照进入 microVM；Pi 通过
+正式系统提示参数和唯一允许的 `read` 工具完成 DeepSeek 任务，并输出
+`M17_AGENT_CONFIG_READY`。页面也已验证配置保存及自定义角色回答正常。19 项控制面
+自动测试与前端生产构建全部通过。
 
 ## 跨平台常见错误
 

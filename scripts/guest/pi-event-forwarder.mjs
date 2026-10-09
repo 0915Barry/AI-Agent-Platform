@@ -21,6 +21,16 @@ const task = JSON.parse(await fs.readFile(taskPath, "utf8"));
 if (!/^task-[0-9a-f]{16}$/.test(task.id) || typeof task.prompt !== "string" || !task.prompt) {
   throw new Error("invalid task payload");
 }
+if (typeof task.systemPrompt !== "string" || !task.systemPrompt ||
+    !["read_only", "read_write"].includes(task.toolMode)) {
+  throw new Error("invalid Agent configuration");
+}
+
+const enabledTools = task.toolMode === "read_only" ? "read" : "read,write";
+// Pi 的 --system-prompt 同时接受文本或路径。写入一个固定权限的临时文件可以保证
+// 用户输入即使恰好像现有路径，也始终按提示词正文处理，而不会被解释成任意文件。
+const systemPromptPath = `/tmp/pi-system-prompt-${process.pid}.txt`;
+await fs.writeFile(systemPromptPath, task.systemPrompt, { encoding: "utf8", mode: 0o600 });
 
 async function postEvent(type, data = {}) {
   const response = await fetch(`${bridgeUrl}/guest/tasks/${task.id}/events`, {
@@ -67,7 +77,9 @@ const pi = spawn(
     "--no-prompt-templates",
     "--no-context-files",
     "--tools",
-    "read,write",
+    enabledTools,
+    "--system-prompt",
+    systemPromptPath,
     "--provider",
     "deepseek-gateway",
     "--model",
@@ -173,6 +185,7 @@ const exitCode = await new Promise((resolve) => {
 });
 await stderrDone;
 await flushText(true);
+await fs.unlink(systemPromptPath).catch(() => undefined);
 
 if (exitCode !== 0 || terminalError || !settled) {
   await postEvent("failed", {

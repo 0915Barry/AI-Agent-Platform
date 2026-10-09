@@ -252,6 +252,34 @@ class ControlPlaneTests(unittest.TestCase):
         event_types = [event["type"] for event in self.control.task_events("agent-task", claimed["id"])]
         self.assertEqual(event_types, ["queued", "started", "completed"])
 
+    def test_agent_config_is_validated_and_snapshotted_into_task(self) -> None:
+        """配置修改后新任务应携带独立快照，且只允许两种安全工具集合。"""
+
+        self.control.create({"id": "agent-config"})
+        configured = self.control.update_agent_config(
+            "agent-config",
+            {
+                "agentName": "只读审查员",
+                "systemPrompt": "只分析文件内容，不要修改任何文件。",
+                "toolMode": "read_only",
+            },
+        )
+        self.assertEqual(configured["agentName"], "只读审查员")
+        self.control.start("agent-config")
+        task = self.control.create_task("agent-config", {"prompt": "检查 README"})
+        claimed = self.tasks.claim_next("agent-config")
+        assert claimed is not None
+        self.assertEqual(claimed["id"], task["id"])
+        self.assertEqual(claimed["systemPrompt"], "只分析文件内容，不要修改任何文件。")
+        self.assertEqual(claimed["toolMode"], "read_only")
+
+        with self.assertRaises(SERVER.ApiError) as invalid_tools:
+            self.control.update_agent_config(
+                "agent-config",
+                {"agentName": "危险配置", "systemPrompt": "test", "toolMode": "bash"},
+            )
+        self.assertEqual(invalid_tools.exception.code, "invalid_tool_mode")
+
     def test_sse_replays_incremental_events_and_closes_at_terminal_state(self) -> None:
         """SSE 应按序重放增量事件，并在 completed 后结束 HTTP 响应。"""
 

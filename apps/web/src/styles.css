@@ -171,6 +171,13 @@ h3 { font-size: 18px; }
 .preview-heading small { color: var(--muted); font: 10px "DM Mono", monospace; }
 .file-preview pre { margin: 0; padding: 18px; white-space: pre-wrap; overflow-wrap: anywhere; color: #cfd5c7; font: 12px/1.7 "DM Mono", monospace; }
 .file-empty { min-height: 220px; display: grid; place-content: center; padding: 24px; color: var(--muted); text-align: center; font-size: 12px; }
+.agent-config { max-width: 760px; display: grid; gap: 18px; padding: 28px; }
+.agent-config label { display: grid; gap: 8px; color: #b9c0af; font-size: 11px; }
+.agent-config input, .agent-config textarea, .agent-config select { width: 100%; border: 1px solid var(--line); background: #0b0d0a; color: #eef1e7; padding: 11px 12px; outline: none; }
+.agent-config textarea { resize: vertical; min-height: 180px; line-height: 1.6; }
+.agent-config input:focus, .agent-config textarea:focus, .agent-config select:focus { border-color: #718345; }
+.agent-config p { color: var(--muted); font-size: 11px; line-height: 1.7; }
+.agent-config .primary-button { justify-self: start; min-height: 40px; border: 0; cursor: pointer; }
 .no-selection { min-height: 75vh; display: grid; place-content: center; justify-items: center; text-align: center; color: var(--muted); gap: 10px; }
 .no-selection-mark { width: 58px; height: 58px; border: 1px solid #3d4633; display: grid; place-items: center; color: var(--accent); font: 28px "DM Mono", monospace; margin-bottom: 10px; }
 .no-selection h2 { color: #e1e5d9; font-size: 22px; }
