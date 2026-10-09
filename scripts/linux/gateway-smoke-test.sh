@@ -243,6 +243,22 @@ if [[ "${forbidden_status}" != "404" ]]; then
   exit 1
 fi
 
+# M15：用模拟上游验证 SSE 字节能穿过 Gateway，而不是等完整回答后一次性返回。
+stream_response="$(
+  curl --fail --silent --show-error --no-buffer --max-time 10 \
+    --request POST \
+    --header 'Authorization: Bearer guest-placeholder' \
+    --header 'Content-Type: application/json' \
+    --data '{"model":"gateway-smoke","stream":true,"messages":[{"role":"user","content":"stream"}]}' \
+    "http://${host_ip}:${gateway_port}/v1/chat/completions"
+)"
+for expected_delta in '"content":"gateway-"' '"content":"stream-"' '"content":"ok"' 'data: [DONE]'; do
+  if [[ "${stream_response}" != *"${expected_delta}"* ]]; then
+    echo "FAIL: Gateway did not forward the complete SSE stream" >&2
+    exit 1
+  fi
+done
+
 rm -f "${volume_path}"
 truncate -s 1G "${volume_path}"
 mkfs.ext4 -q -F -O '^orphan_file' -L agent-data "${volume_path}"
@@ -360,6 +376,8 @@ grep -q '"credential_source":"host_file"' "${gateway_audit}" \
   || { echo "FAIL: gateway audit did not record host-side credential injection" >&2; exit 1; }
 grep -q '"status":200' "${gateway_audit}" \
   || { echo "FAIL: gateway audit did not record a successful request" >&2; exit 1; }
+grep -q '"stream":true' "${gateway_audit}" \
+  || { echo "FAIL: gateway audit did not record streaming mode" >&2; exit 1; }
 grep -q '"auth_valid":true' "${upstream_audit}" \
   || { echo "FAIL: mock upstream did not receive the injected credential" >&2; exit 1; }
 

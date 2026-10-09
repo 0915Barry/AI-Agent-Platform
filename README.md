@@ -176,6 +176,7 @@ Firecracker 仍运行在 Ubuntu VM 内，Windows 不需要直接执行任何 `.s
 | M12 | React 管理页面操作实例并提交 Agent 任务 | ✅ 已通过 |
 | M13 | 持久化会话、消息历史与受限多轮上下文 | ✅ 已通过 |
 | M14 | 工作区文件上传、列表、预览、下载、目录与持久化 | ✅ 已通过 |
+| M15 | Pi JSONL、Gateway 流式转发、控制面 SSE 与页面增量输出 | ✅ 已通过 |
 
 ## 当前支持范围
 
@@ -877,11 +878,12 @@ M11 把此前分别验证的控制面、受控 TAP 网络、Tool Gateway、DeepS
 POST /api/instances/{id}/tasks
 GET  /api/instances/{id}/tasks/{task_id}
 GET  /api/instances/{id}/tasks/{task_id}/events
+GET  /api/instances/{id}/tasks/{task_id}/stream
 ```
 
-当前事件接口采用短轮询 JSON；这是 MVP 的可验证边界，后续前端里程碑再升级为
-SSE/WebSocket 流式显示。Gateway 当前也仍会缓冲完整上游响应，因此本阶段验证的
-是安全、执行和结果链路，而不是逐 token 展示体验。
+`/events` 保留为诊断用 JSON 查询；M15 新增的 `/stream` 使用 SSE，并用 SQLite
+事件序号作为 `id` 支持 `Last-Event-ID` 断线续传。Tool Gateway 也已改为逐块转发
+上游 SSE，不再缓冲完整模型回答。
 
 在已经完成 `configure-deepseek` 的环境执行：
 
@@ -929,7 +931,7 @@ DeepSeek Key 仍只保存在 Ubuntu 宿主的受限文件中，不会进入浏�
 
 - 查看、创建、启动、停止和显式销毁 Agent 实例；
 - 查看 microVM 进程状态、最后更新时间和 5 分钟空闲回收倒计时；
-- 向运行中的 Pi Agent 提交任务，并每秒轮询任务状态和最终结果；
+- 向运行中的 Pi Agent 提交任务，并通过 SSE 查看阶段、工具调用和增量回答；
 - 清晰显示控制面离线、实例错误和任务失败信息；
 - 窄屏自适应布局，便于演示和后续继续开发。
 
@@ -983,9 +985,9 @@ ssh -N -L 5173:127.0.0.1:5173 agentdev@<Ubuntu-VM-IP>
 验收。Linux 入口会从 rootfs 下载缓存复用固定 Node.js 22.19.0；缓存不存在时会从
 Node.js 官方地址下载并校验 SHA-256，因此不依赖 Ubuntu 自带 Node 版本。
 
-M12 当前仍沿用 M10 的 loopback-only 无认证边界，不得把 5173 或 18090 改为
-`0.0.0.0` 暴露到局域网。用户登录、多租户授权、SSE/WebSocket 流式输出和生产静态
-部署属于后续里程碑，不是本阶段的安全承诺。
+页面仍沿用 M10 的 loopback-only 无认证边界，不得把 5173 或 18090 改为
+`0.0.0.0` 暴露到局域网。用户登录、多租户授权和生产静态部署仍属于后续里程碑，
+不是当前阶段的安全承诺。
 
 ### M12 验收结果
 
@@ -1108,6 +1110,67 @@ WORKSPACE_READY scope=/workspace max_file=5MiB traversal=denied symlinks=denied 
 microVM，宿主也没有在实例运行时并发挂载数据盘。Web 页面已完成文件夹创建、文件
 上传与预览测试；Pi Agent 能通过 `read` 工具读取页面上传到同一工作区的 RTF 文件，
 并正确提取其中的可见文本。停止并重启实例后，工作区文件仍然存在。
+
+## M15 流式任务体验
+
+M15 把此前“等待完整答案后一次显示”的任务路径改成端到端增量链路：
+
+```text
+DeepSeek SSE
+  → 宿主 Tool Gateway（chunked 转发、凭据仍只在宿主）
+  → Pi Agent 1.0.0 --mode json（JSONL）
+  → microVM 事件适配器（文本短批次、工具阶段；不外发 thinking）
+  → Agent Bridge / SQLite 有序事件
+  → 控制面 SSE（Last-Event-ID 断线续传）
+  → React 页面
+```
+
+页面在任务运行时会显示排队、领取、模型生成、重试、工具执行等阶段，回答文本随
+事件增长，并显示从任务创建开始的耗时。用户主动向上滚动查看历史时，流式更新不会
+抢走滚动位置。最终回答仍只在 `completed` 后写入 M13 消息表，因此刷新页面后以宿主
+SQLite 中的权威消息为准。
+
+安全边界没有改变：浏览器和控制面仍仅通过 loopback/SSH 隧道访问；真实 DeepSeek
+Key 仍是权限 `0400` 的 Ubuntu 宿主文件；microVM 只持有占位值。`thinking_delta`
+不会进入任务数据库或页面，工具结果只保存最多 2000 字符的预览。
+
+M15 修改了 guest Worker，因此第一次验收会重建一次 rootfs；构建指纹不变后继续
+复用。已经配置 DeepSeek 的环境运行：
+
+```bash
+# macOS 仓库根目录
+./run.sh streaming-smoke-test
+
+# Windows 的 Ubuntu VM 仓库目录
+./run-linux.sh streaming-smoke-test
+```
+
+该命令会真实启动 microVM、要求 Pi 使用 `read` 工具、检查文本与工具增量事件、
+完整 SSE 重放、Gateway 流式审计、持久化数据及显式销毁。预期成功标志：
+
+```text
+PASS: control plane completed a real Pi Agent task through DeepSeek
+AGENT_TASK_READY transport=sse events=incremental gateway=streaming persistence=preserved idle_timeout=300s
+M15_STREAMING_READY pi=jsonl control_plane=sse reconnect=last-event-id tools=visible thinking=hidden
+```
+
+### M15 后端验收结果
+
+已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境中完成真实验收：Pi 1.0.0
+以 JSONL 输出增量文本和工具事件，Tool Gateway 逐块转发 DeepSeek SSE，控制面通过
+SSE 完整重放有序事件，随机工作区标记在停止和重启后仍能被 `read` 工具读取。实测
+成功标志为：
+
+```text
+PASS: control plane completed a real Pi Agent task through DeepSeek
+AGENT_TASK_READY transport=sse events=incremental gateway=streaming persistence=preserved idle_timeout=300s
+M15_STREAMING_READY pi=jsonl control_plane=sse reconnect=last-event-id tools=visible thinking=hidden
+```
+
+本地自动测试、前端构建和真实 KVM 后端链路均已通过。管理页面也已完成实际验收：
+回答会在任务结束前逐步出现，阶段、工具名称和耗时正常显示；对于上游一次送达的较大
+文本块，页面使用自适应缓冲按约 40 帧/秒平滑呈现，并在缓冲内容显示完后再切换到
+SQLite 中的最终消息。日常使用不需要重复运行 smoke test。
 
 ## 跨平台常见错误
 

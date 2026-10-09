@@ -193,7 +193,8 @@ for _ in $(seq 1 240); do
   fi
   sleep 1
 done
-if [[ "${task_status}" != "completed" || "${task_output}" != "M11_AGENT_TASK_OK:${token}" ]]; then
+if [[ "${task_status}" != "completed" \
+  || ! "${task_output}" =~ ^M11_AGENT_TASK_OK:[[:space:]]*${token}[[:space:]]*$ ]]; then
   echo "FAIL: unexpected task result status=${task_status} output=${task_output}" >&2
   exit 1
 fi
@@ -201,7 +202,28 @@ fi
 events_response="$(curl --fail --silent --show-error --max-time 10 \
   "${base_url}/api/instances/${instance_id}/tasks/${task_id}/events")"
 printf '%s' "${events_response}" \
-  | jq -e '[.events[].type] == ["queued","started","completed"]' >/dev/null
+  | jq -e '
+      [.events[].type] as $types
+      | $types[0:2] == ["queued","started"]
+      and $types[-1] == "completed"
+      and ($types | index("progress")) != null
+      and ($types | index("text")) != null
+      and ($types | index("tool_call")) != null
+      and ($types | index("tool_result")) != null
+    ' >/dev/null
+
+# 终态任务也必须能通过 SSE 从序号 0 完整重放后自行关闭；这同时验证浏览器首次连接
+# 和 Last-Event-ID 断线续传所依赖的稳定事件序号。
+sse_response="$(curl --fail --silent --show-error --no-buffer --max-time 10 \
+  "${base_url}/api/instances/${instance_id}/tasks/${task_id}/stream")"
+if [[ "${sse_response}" != *'event: task-event'* ]]; then
+  echo "FAIL: SSE stream did not contain task events" >&2
+  exit 1
+fi
+if [[ "${sse_response}" != *'"type":"completed"'* ]]; then
+  echo "FAIL: SSE stream did not reach the completed event" >&2
+  exit 1
+fi
 
 curl --fail --silent --show-error --max-time 30 \
   --request POST "${base_url}/api/instances/${instance_id}/stop" \
@@ -226,10 +248,15 @@ if ! grep -q '"status":200' "${gateway_audit}"; then
   echo "FAIL: Tool Gateway did not record an authorized DeepSeek response" >&2
   exit 1
 fi
+if ! grep -q '"stream":true' "${gateway_audit}"; then
+  echo "FAIL: Tool Gateway did not stream the DeepSeek response" >&2
+  exit 1
+fi
 
 curl --fail --silent --show-error --max-time 30 \
   --request DELETE "${base_url}/api/instances/${instance_id}" >/dev/null
 instance_created=false
 
 echo "PASS: control plane completed a real Pi Agent task through DeepSeek"
-echo "AGENT_TASK_READY transport=http-poll events=ordered gateway=isolated persistence=preserved idle_timeout=${INSTANCE_IDLE_TIMEOUT_SECONDS}s"
+echo "AGENT_TASK_READY transport=sse events=incremental gateway=streaming persistence=preserved idle_timeout=${INSTANCE_IDLE_TIMEOUT_SECONDS}s"
+echo "M15_STREAMING_READY pi=jsonl control_plane=sse reconnect=last-event-id tools=visible thinking=hidden"

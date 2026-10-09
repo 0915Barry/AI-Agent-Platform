@@ -118,6 +118,9 @@ h3 { font-size: 18px; }
 .user-message > span { text-align: right; }
 .user-message p { background: #29321d; border: 1px solid #465632; }
 .agent-message pre, .agent-message .typing { margin: 0; background: #171a15; border-left: 2px solid var(--accent); }
+.streaming-answer { min-height: 48px; }
+.stream-cursor { display: inline-block; width: 7px; height: 14px; margin-left: 3px; vertical-align: -2px; background: var(--accent); animation: cursor-blink .9s steps(1) infinite; }
+@keyframes cursor-blink { 50% { opacity: 0; } }
 .pending-message { margin-top: 12px; }
 .task-error { margin: 14px 0; padding: 12px 14px; border: 1px solid #613936; color: #ffaaa3; background: #251513; font-size: 12px; }
 .typing { display: flex; gap: 5px; padding: 18px; }

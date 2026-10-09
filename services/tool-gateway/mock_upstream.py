@@ -65,7 +65,28 @@ def main() -> None:
                 return
 
             content_length = int(self.headers.get("Content-Length", "0"))
-            self.rfile.read(min(content_length, 65536))
+            request_body = self.rfile.read(min(content_length, 65536))
+            try:
+                request_payload = json.loads(request_body)
+            except json.JSONDecodeError:
+                request_payload = {}
+            if request_payload.get("stream") is True:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                for delta in ("gateway-", "stream-", "ok"):
+                    payload = {
+                        "id": "gateway-stream-response",
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": delta}}],
+                    }
+                    self.wfile.write(f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode())
+                    self.wfile.flush()
+                    time.sleep(0.03)
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
             self.send_json(
                 200,
                 {

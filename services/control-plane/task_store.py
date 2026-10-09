@@ -349,7 +349,14 @@ class TaskStore:
     def append_event(self, instance_id: str, task_id: str, event_type: str, payload: dict[str, Any]) -> None:
         """追加 guest 事件，并在 completed/failed 时同步任务终态。"""
 
-        if event_type not in {"text", "tool_call", "tool_result", "completed", "failed"}:
+        if event_type not in {
+            "progress",
+            "text",
+            "tool_call",
+            "tool_result",
+            "completed",
+            "failed",
+        }:
             raise TaskStoreError(f"unsupported task event: {event_type}")
         task = self.get(instance_id, task_id)
         if task["status"] not in {"running", "queued"}:
@@ -400,14 +407,21 @@ class TaskStore:
             else:
                 connection.execute("UPDATE tasks SET updated_at=? WHERE id=?", (now, task_id))
 
-    def events(self, instance_id: str, task_id: str) -> list[dict[str, Any]]:
-        """按稳定序号返回任务事件，供前端轮询；后续可直接映射成 SSE。"""
+    def events(
+        self, instance_id: str, task_id: str, after_sequence: int = 0
+    ) -> list[dict[str, Any]]:
+        """返回指定序号之后的事件。
+
+        sequence 是 SQLite 自增游标。SSE 断线重连时浏览器会把最后收到的游标放入
+        Last-Event-ID，控制面据此只补发遗漏事件，避免重复拼接文本增量。
+        """
 
         self.get(instance_id, task_id)
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT sequence,event_type,payload,created_at FROM task_events WHERE task_id=? ORDER BY sequence",
-                (task_id,),
+                "SELECT sequence,event_type,payload,created_at FROM task_events "
+                "WHERE task_id=? AND sequence>? ORDER BY sequence",
+                (task_id, max(0, after_sequence)),
             ).fetchall()
         return [
             {

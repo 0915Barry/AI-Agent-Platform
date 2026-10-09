@@ -29,6 +29,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import parse_qs, urlsplit
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -47,7 +48,8 @@ TASK_COLLECTION_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/tasks$"
 )
 TASK_ROUTE_RE = re.compile(
-    r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/tasks/(task-[0-9a-f]{16})(/events)?$"
+    r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/tasks/"
+    r"(task-[0-9a-f]{16})(?:/(events|stream))?$"
 )
 CONVERSATION_COLLECTION_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/conversations$"
@@ -332,12 +334,14 @@ class ControlPlane:
         except TaskStoreError as error:
             raise ApiError(404, "task_not_found", str(error)) from error
 
-    def task_events(self, instance_id: str, task_id: str) -> list[dict[str, Any]]:
-        """返回按序号排列的任务事件，供 MVP 前端轮询。"""
+    def task_events(
+        self, instance_id: str, task_id: str, after_sequence: int = 0
+    ) -> list[dict[str, Any]]:
+        """返回游标之后的任务事件，供 JSON 查询和 SSE 断线续传。"""
 
         self.store.get(self.validate_requested_id(instance_id))
         try:
-            return self.tasks.events(instance_id, task_id)
+            return self.tasks.events(instance_id, task_id, after_sequence)
         except TaskStoreError as error:
             raise ApiError(404, "task_not_found", str(error)) from error
 
@@ -471,6 +475,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
     """只接受固定路由和 JSON 对象的小型 HTTP 适配层。"""
 
     server_version = "AgentControlPlane/0.1"
+    protocol_version = "HTTP/1.1"
 
     @property
     def control(self) -> ControlPlane:
@@ -518,23 +523,68 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             raise ApiError(400, "invalid_json", "request body must be a JSON object")
         return payload
 
+    def stream_task_events(self, instance_id: str, task_id: str, after_sequence: int) -> None:
+        """以 SSE 推送有序任务事件，并支持浏览器 Last-Event-ID 自动续传。
+
+        控制面仍只绑定 loopback。这里不发送提示词、模型密钥或 Gateway 审计内容；
+        只转发 TaskStore 已接受的脱敏运行事件。终态事件发出后主动结束连接。
+        """
+
+        task = self.control.get_task(instance_id, task_id)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        cursor = max(0, after_sequence)
+        last_heartbeat = time.monotonic()
+        try:
+            while True:
+                events = self.control.task_events(instance_id, task_id, cursor)
+                for event in events:
+                    cursor = event["sequence"]
+                    body = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+                    frame = f"id: {cursor}\nevent: task-event\ndata: {body}\n\n"
+                    self.wfile.write(frame.encode("utf-8"))
+                    self.wfile.flush()
+                    if event["type"] in {"completed", "failed"}:
+                        self.close_connection = True
+                        return
+
+                # 终态可能来自旧库或异常恢复路径；没有新事件时也不能永久挂住。
+                task = self.control.get_task(instance_id, task_id)
+                if task["status"] in {"completed", "failed"}:
+                    self.close_connection = True
+                    return
+                if time.monotonic() - last_heartbeat >= 10:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    last_heartbeat = time.monotonic()
+                time.sleep(0.15)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
     def do_GET(self) -> None:
         """处理健康检查、实例列表和单实例查询。"""
         try:
-            if self.path == "/healthz":
+            parsed = urlsplit(self.path)
+            request_path = parsed.path
+            if request_path == "/healthz":
                 self.send_payload(200, {"status": "ok"})
                 return
-            if self.path == "/api/instances":
+            if request_path == "/api/instances":
                 self.send_payload(200, {"instances": self.control.list()})
                 return
-            conversation_collection = CONVERSATION_COLLECTION_ROUTE_RE.fullmatch(self.path)
+            conversation_collection = CONVERSATION_COLLECTION_ROUTE_RE.fullmatch(request_path)
             if conversation_collection:
                 self.send_payload(
                     200,
                     {"conversations": self.control.list_conversations(conversation_collection.group(1))},
                 )
                 return
-            conversation_match = CONVERSATION_ROUTE_RE.fullmatch(self.path)
+            conversation_match = CONVERSATION_ROUTE_RE.fullmatch(request_path)
             if conversation_match:
                 instance_id, conversation_id, messages_suffix = conversation_match.groups()
                 if messages_suffix:
@@ -545,15 +595,34 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 else:
                     self.send_payload(200, self.control.get_conversation(instance_id, conversation_id))
                 return
-            task_match = TASK_ROUTE_RE.fullmatch(self.path)
+            task_match = TASK_ROUTE_RE.fullmatch(request_path)
             if task_match:
-                instance_id, task_id, events_suffix = task_match.groups()
-                if events_suffix:
-                    self.send_payload(200, {"events": self.control.task_events(instance_id, task_id)})
+                instance_id, task_id, task_suffix = task_match.groups()
+                if task_suffix == "events":
+                    after = parse_qs(parsed.query).get("after", ["0"])[0]
+                    try:
+                        after_sequence = int(after)
+                    except ValueError as error:
+                        raise ApiError(400, "invalid_event_cursor", "after must be an integer") from error
+                    self.send_payload(
+                        200,
+                        {"events": self.control.task_events(instance_id, task_id, after_sequence)},
+                    )
+                elif task_suffix == "stream":
+                    cursor_value = self.headers.get("Last-Event-ID")
+                    if cursor_value is None:
+                        cursor_value = parse_qs(parsed.query).get("after", ["0"])[0]
+                    try:
+                        cursor = int(cursor_value)
+                    except ValueError as error:
+                        raise ApiError(
+                            400, "invalid_event_cursor", "Last-Event-ID must be an integer"
+                        ) from error
+                    self.stream_task_events(instance_id, task_id, cursor)
                 else:
                     self.send_payload(200, self.control.get_task(instance_id, task_id))
                 return
-            match = INSTANCE_ROUTE_RE.fullmatch(self.path)
+            match = INSTANCE_ROUTE_RE.fullmatch(request_path)
             if match and match.group(2) is None:
                 self.send_payload(200, self.control.get(match.group(1)))
                 return

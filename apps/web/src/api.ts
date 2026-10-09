@@ -29,6 +29,13 @@ export interface AgentTask {
   conversationId: string | null;
 }
 
+export interface AgentTaskEvent {
+  sequence: number;
+  type: "queued" | "started" | "progress" | "text" | "tool_call" | "tool_result" | "completed" | "failed";
+  data: Record<string, unknown>;
+  createdAt: number;
+}
+
 export interface AgentConversation {
   id: string;
   instanceId: string;
@@ -104,6 +111,8 @@ export const api = {
     }),
   getTask: (instanceId: string, taskId: string) =>
     request<AgentTask>(`/api/instances/${instanceId}/tasks/${taskId}`),
+  streamTask: (instanceId: string, taskId: string) =>
+    new EventSource(`/api/instances/${instanceId}/tasks/${taskId}/stream`),
   listConversations: async (instanceId: string) =>
     (
       await request<{ conversations: AgentConversation[] }>(

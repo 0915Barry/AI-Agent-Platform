@@ -17,6 +17,9 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.request
+from contextlib import closing
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -178,6 +181,59 @@ class ControlPlaneTests(unittest.TestCase):
         event_types = [event["type"] for event in self.control.task_events("agent-task", claimed["id"])]
         self.assertEqual(event_types, ["queued", "started", "completed"])
 
+    def test_sse_replays_incremental_events_and_closes_at_terminal_state(self) -> None:
+        """SSE 应按序重放增量事件，并在 completed 后结束 HTTP 响应。"""
+
+        self.control.create({"id": "agent-stream"})
+        self.control.start("agent-stream")
+        queued = self.control.create_task("agent-stream", {"prompt": "stream this"})
+        claimed = self.tasks.claim_next("agent-stream")
+        assert claimed is not None
+        self.tasks.append_event(
+            "agent-stream", claimed["id"], "progress", {"stage": "model_started"}
+        )
+        self.tasks.append_event("agent-stream", claimed["id"], "text", {"delta": "hello"})
+        self.tasks.append_event(
+            "agent-stream", claimed["id"], "completed", {"output": "hello"}
+        )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SERVER.ControlPlaneHandler)
+        server.control = self.control  # type: ignore[attr-defined]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = (
+                f"http://127.0.0.1:{server.server_port}/api/instances/agent-stream/"
+                f"tasks/{queued['id']}/stream"
+            )
+            with urllib.request.urlopen(url, timeout=3) as response:
+                body = response.read().decode("utf-8")
+                self.assertEqual(response.headers.get_content_type(), "text/event-stream")
+            self.assertIn("event: task-event", body)
+            self.assertIn('"type":"text"', body)
+            self.assertIn('"type":"completed"', body)
+            event_ids = [
+                int(line.removeprefix("id: "))
+                for line in body.splitlines()
+                if line.startswith("id: ")
+            ]
+            self.assertEqual(event_ids, sorted(event_ids))
+            self.assertEqual(len(event_ids), len(set(event_ids)))
+
+            resume_request = urllib.request.Request(
+                url, headers={"Last-Event-ID": str(event_ids[1])}
+            )
+            with urllib.request.urlopen(resume_request, timeout=3) as response:
+                resumed = response.read().decode("utf-8")
+            self.assertNotIn('"type":"queued"', resumed)
+            self.assertNotIn('"type":"started"', resumed)
+            self.assertIn('"type":"progress"', resumed)
+            self.assertIn('"type":"completed"', resumed)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_task_requires_running_instance_and_valid_prompt(self) -> None:
         """任务只能发送给 running 实例，且提示词不能为空。"""
 
@@ -238,7 +294,7 @@ class ControlPlaneTests(unittest.TestCase):
         """旧任务表升级 M13 时应保留数据并增加 conversation_id。"""
 
         legacy_path = Path(self.temporary.name) / "legacy-tasks.db"
-        with sqlite3.connect(legacy_path) as connection:
+        with closing(sqlite3.connect(legacy_path)) as connection:
             connection.execute(
                 """
                 CREATE TABLE tasks (
@@ -252,6 +308,7 @@ class ControlPlaneTests(unittest.TestCase):
                 "INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?)",
                 ("task-0000000000000000", "agent-old", "hello", "completed", "ok", None, 1, 2),
             )
+            connection.commit()
         migrated = SERVER.TaskStore(legacy_path)
         task = migrated.get("agent-old", "task-0000000000000000")
         self.assertEqual(task["output"], "ok")

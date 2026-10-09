@@ -21,7 +21,7 @@ Usage: ./run.sh <command>
 Commands:
   bootstrap [vm-ip] [vm-user]
                          One-command install/build after the Ubuntu VM exists
-  verify                 Run the current M11 and M14 end-to-end tests
+  verify                 Run the current M15 and M14 end-to-end tests
   start                  Start the long-running loopback control plane
   stop                   Stop the control plane; preserve instance data
   status                 Show whether the control plane is running
@@ -49,7 +49,8 @@ Commands:
   deepseek-e2e-test      Run Pi Agent against DeepSeek through Tool Gateway
   control-plane-smoke-test
                          Control a real microVM through the M10 HTTP API
-  agent-task-smoke-test  Run a real M11 Pi task through the control plane
+  agent-task-smoke-test  Run the managed Pi task path (legacy command alias)
+  streaming-smoke-test   Verify M15 Pi JSONL, Gateway streaming, and SSE
   workspace-smoke-test   Verify M14 file operations and restart persistence
   control-plane-start    Start the loopback-only M10 API in the Linux VM
   control-plane-stop     Stop the M10 API; running instances remain managed
@@ -316,7 +317,7 @@ smoke_test_control_plane() {
 
 smoke_test_agent_task() {
   sync_repo
-  echo "Building and testing the M11 managed Pi Agent task path in ${VM_USER}@${VM_HOST}..."
+  echo "Building and testing the M15 streaming Pi Agent task path in ${VM_USER}@${VM_HOST}..."
   ssh \
     -o ConnectTimeout=10 \
     -o ConnectionAttempts=1 \
@@ -445,6 +446,9 @@ case "${command}" in
     smoke_test_control_plane
     ;;
   agent-task-smoke-test)
+    smoke_test_agent_task
+    ;;
+  streaming-smoke-test)
     smoke_test_agent_task
     ;;
   workspace-smoke-test)

@@ -7,17 +7,6 @@ bridge_url="${AGENT_BRIDGE_URL:?AGENT_BRIDGE_URL is required}"
 bridge_token="${AGENT_BRIDGE_TOKEN:?AGENT_BRIDGE_TOKEN is required}"
 runtime_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-post_event() {
-  task_id="$1"
-  payload_file="$2"
-  curl --fail --silent --show-error \
-    --connect-timeout 3 --max-time 15 \
-    --header "Authorization: Bearer ${bridge_token}" \
-    --header 'Content-Type: application/json' \
-    --data-binary "@${payload_file}" \
-    "${bridge_url}/guest/tasks/${task_id}/events" >/dev/null
-}
-
 post_workspace_result() {
   operation_id="$1"
   payload_file="$2"
@@ -78,43 +67,21 @@ while true; do
 
   task_id="$(jq -r '.id // empty' "${task_file}")"
   prompt="$(jq -r '.prompt // empty' "${task_file}")"
-  rm -f "${task_file}"
   if [[ ! "${task_id}" =~ ^task-[0-9a-f]{16}$ || -z "${prompt}" ]]; then
+    rm -f "${task_file}"
     sleep 1
     continue
   fi
 
-  response_file="$(mktemp /tmp/agent-response.XXXXXX.txt)"
-  error_file="$(mktemp /tmp/agent-error.XXXXXX.txt)"
-  event_file="$(mktemp /tmp/agent-event.XXXXXX.json)"
-
-  if (
-    cd /workspace
-    runuser -u pi -- env \
-      HOME=/home/pi \
-      PATH="${runtime_path}" \
-      PI_SKIP_VERSION_CHECK=1 \
-      /usr/local/bin/pi \
-        --offline \
-        --no-session \
-        --no-approve \
-        --no-extensions \
-        --no-skills \
-        --no-prompt-templates \
-        --no-context-files \
-        --tools read,write \
-        --provider deepseek-gateway \
-        --model deepseek-flash \
-        --print \
-        "${prompt}"
-  ) >"${response_file}" 2>"${error_file}"; then
-    jq -n --rawfile output "${response_file}" \
-      '{type:"completed",output:$output}' > "${event_file}"
-  else
-    jq -n --rawfile error "${error_file}" \
-      '{type:"failed",error:($error | .[0:4000])}' > "${event_file}"
-  fi
-
-  post_event "${task_id}" "${event_file}" || true
-  rm -f "${response_file}" "${error_file}" "${event_file}"
+  # Pi JSON 模式由低权限适配器持续消费。适配器会把文本增量和工具阶段直接回传，
+  # 最终 completed/failed 也由同一进程提交，避免 shell 缓冲完整答案。
+  chown pi:pi "${task_file}"
+  runuser -u pi -- env \
+    HOME=/home/pi \
+    PATH="${runtime_path}" \
+    PI_SKIP_VERSION_CHECK=1 \
+    AGENT_BRIDGE_URL="${bridge_url}" \
+    AGENT_BRIDGE_TOKEN="${bridge_token}" \
+    node /usr/local/sbin/pi-event-forwarder.mjs "${task_file}" || true
+  rm -f "${task_file}"
 done
