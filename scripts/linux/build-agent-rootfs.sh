@@ -60,6 +60,7 @@ build_id="$(
 if [[ -f "${rootfs_path}" && -f "${build_id_path}" && -f "${runtime_dir}/config.json" ]] \
   && [[ "$(<"${build_id_path}")" == "${build_id}" ]]; then
   echo "Verified existing runtime rootfs: ${rootfs_path}"
+  echo "Build ID: ${build_id}"
   exit 0
 fi
 

@@ -21,7 +21,7 @@ Usage: ./run.sh <command>
 Commands:
   bootstrap [vm-ip] [vm-user]
                          One-command install/build after the Ubuntu VM exists
-  verify                 Run the current M18, M16, and workspace checks
+  verify                 Run the current M19, M16, and workspace checks
   start                  Start the long-running loopback control plane
   stop                   Stop the control plane; preserve instance data
   status                 Show whether the control plane is running
@@ -56,6 +56,7 @@ Commands:
   agent-config-smoke-test
                          Verify M17 custom prompt and tool permissions
   skills-smoke-test      Verify M18 reviewed Skill injection into Pi
+  mcp-smoke-test         Verify M19 allowlisted host-side MCP integration
   workspace-smoke-test   Verify M14 file operations and restart persistence
   control-plane-start    Start the loopback-only M10 API in the Linux VM
   control-plane-stop     Stop the M10 API; running instances remain managed
@@ -132,7 +133,7 @@ sync_repo() {
   echo "Connecting to ${target} to prepare ${REMOTE_DIR}..."
   ssh "${ssh_options[@]}" -t "${target}" "sudo install -d -o '${VM_USER}' -g '${VM_USER}' '${REMOTE_DIR}'"
   echo "Synchronizing repository to ${target}:${REMOTE_DIR}..."
-  rsync -az \
+  rsync -az --checksum \
     -e 'ssh -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=2' \
     --exclude '.git/' \
     --exclude '.env' \
@@ -347,7 +348,7 @@ smoke_test_control_plane() {
 
 smoke_test_agent_task() {
   sync_repo
-  echo "Building and testing the M15 streaming Pi Agent task path in ${VM_USER}@${VM_HOST}..."
+  echo "Building and testing the M19 managed Pi Agent task path in ${VM_USER}@${VM_HOST}..."
   ssh \
     -o ConnectTimeout=10 \
     -o ConnectionAttempts=1 \
@@ -492,6 +493,9 @@ case "${command}" in
     smoke_test_agent_task
     ;;
   skills-smoke-test)
+    smoke_test_agent_task
+    ;;
+  mcp-smoke-test)
     smoke_test_agent_task
     ;;
   workspace-smoke-test)

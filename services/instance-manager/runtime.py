@@ -38,6 +38,7 @@ GATEWAY_USER = "agent-gateway"
 GATEWAY_GROUP = "agent-gateway"
 GATEWAY_PORT = 18082
 BRIDGE_PORT = 18083
+MCP_PORT = 18084
 
 
 class RuntimeFailure(RuntimeError):
@@ -90,6 +91,7 @@ class InstanceRuntime:
         self.manager = Path(__file__).resolve().with_name("lifecycle.py")
         self.gateway = Path(__file__).resolve().parents[1] / "tool-gateway" / "gateway.py"
         self.bridge = Path(__file__).resolve().parents[1] / "agent-bridge" / "bridge.py"
+        self.mcp_gateway = Path(__file__).resolve().parents[1] / "mcp-gateway" / "server.py"
         kernel_version = load_version("SMOKE_KERNEL_VERSION")
         self.agent_uid = int(load_version("AGENT_UID"))
         self.agent_gid = int(load_version("AGENT_GID"))
@@ -193,8 +195,12 @@ class InstanceRuntime:
             "gateway_audit": state_dir / "sidecars" / "gateway.audit.jsonl",
             "bridge_log": state_dir / "sidecars" / "bridge.log",
             "bridge_audit": state_dir / "sidecars" / "bridge.audit.jsonl",
+            "mcp_log": state_dir / "sidecars" / "mcp.log",
+            "mcp_audit": state_dir / "sidecars" / "mcp.audit.jsonl",
             "credential": state_dir / "sidecars" / "deepseek-api-key",
             "bridge_token": state_dir / "sidecars" / "bridge-token",
+            "mcp_token": state_dir / "sidecars" / "mcp-token",
+            "mcp_data": state_dir / "sidecars" / "mcp-verification-record",
         }
 
     def create_volume(self, volume_path: Path, uid: int, gid: int) -> None:
@@ -296,7 +302,7 @@ class InstanceRuntime:
             shutil.rmtree(mount_path, ignore_errors=True)
 
     def setup_network(self, network: dict[str, str], firecracker_uid: int) -> None:
-        """创建实例专用 TAP，并仅放行 guest 到 Gateway/bridge 的两个端口。"""
+        """创建实例专用 TAP，仅放行模型、任务桥和 MCP Gateway 三个端口。"""
 
         if run(["ip", "-4", "route", "show", "exact", network["subnet"]], check=False).stdout.strip():
             raise RuntimeFailure(f"instance subnet conflicts with an existing route: {network['subnet']}")
@@ -307,7 +313,7 @@ class InstanceRuntime:
             rules = f"""table inet {network['nft_table']} {{
   chain input {{
     type filter hook input priority -10; policy accept;
-    iifname \"{network['tap']}\" ip saddr {network['guest_ip']} ip daddr {network['host_ip']} tcp dport {{ {GATEWAY_PORT}, {BRIDGE_PORT} }} counter accept
+    iifname \"{network['tap']}\" ip saddr {network['guest_ip']} ip daddr {network['host_ip']} tcp dport {{ {GATEWAY_PORT}, {BRIDGE_PORT}, {MCP_PORT} }} counter accept
     iifname \"{network['tap']}\" ip saddr {network['guest_ip']} counter drop
   }}
   chain forward {{
@@ -350,13 +356,16 @@ class InstanceRuntime:
         gateway_uid: int,
         gateway_gid: int,
     ) -> list[subprocess.Popen[bytes]]:
-        """以专用低权限用户启动凭据 Gateway 与 guest 任务桥。"""
+        """以专用低权限用户启动模型 Gateway、任务桥与 MCP Gateway。"""
 
         if self.deepseek_credential is None or self.task_database is None:
             raise RuntimeFailure("managed Agent sidecars are not configured")
         paths["sidecars"].mkdir(parents=True, exist_ok=True, mode=0o750)
         os.chown(paths["sidecars"], gateway_uid, gateway_gid)
-        for log_path in (paths["gateway_log"], paths["gateway_audit"], paths["bridge_log"], paths["bridge_audit"]):
+        for log_path in (
+            paths["gateway_log"], paths["gateway_audit"], paths["bridge_log"],
+            paths["bridge_audit"], paths["mcp_log"], paths["mcp_audit"],
+        ):
             log_path.write_text("", encoding="utf-8")
             os.chown(log_path, gateway_uid, gateway_gid)
             os.chmod(log_path, 0o600)
@@ -366,6 +375,13 @@ class InstanceRuntime:
         paths["bridge_token"].write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
         os.chown(paths["bridge_token"], gateway_uid, gateway_gid)
         os.chmod(paths["bridge_token"], 0o400)
+        # mcp-token 只是 guest 到本实例 Gateway 的短期访问令牌。真正的外部凭据或
+        # 业务数据不进入 microVM；验收记录每次启动重新生成，避免模型从 prompt 猜值。
+        paths["mcp_token"].write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
+        paths["mcp_data"].write_text(secrets.token_hex(12) + "\n", encoding="utf-8")
+        for protected_path in (paths["mcp_token"], paths["mcp_data"]):
+            os.chown(protected_path, gateway_uid, gateway_gid)
+            os.chmod(protected_path, 0o400)
 
         task_parent = self.task_database.parent
         task_parent.mkdir(parents=True, exist_ok=True, mode=0o2770)
@@ -385,6 +401,7 @@ class InstanceRuntime:
         ]
         gateway_handle = paths["gateway_log"].open("ab", buffering=0)
         bridge_handle = paths["bridge_log"].open("ab", buffering=0)
+        mcp_handle = paths["mcp_log"].open("ab", buffering=0)
         gateway_process = subprocess.Popen(
             [
                 *base,
@@ -435,15 +452,39 @@ class InstanceRuntime:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        mcp_process = subprocess.Popen(
+            [
+                *base,
+                sys.executable,
+                str(self.mcp_gateway),
+                "--listen-host",
+                network["host_ip"],
+                "--listen-port",
+                str(MCP_PORT),
+                "--token-file",
+                str(paths["mcp_token"]),
+                "--data-file",
+                str(paths["mcp_data"]),
+                "--audit-file",
+                str(paths["mcp_audit"]),
+                "--instance-id",
+                instance_id,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=mcp_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
         gateway_handle.close()
         bridge_handle.close()
-        processes = [gateway_process, bridge_process]
+        mcp_handle.close()
+        processes = [gateway_process, bridge_process, mcp_process]
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if any(process.poll() is not None for process in processes):
                 break
             ready = True
-            for port in (GATEWAY_PORT, BRIDGE_PORT):
+            for port in (GATEWAY_PORT, BRIDGE_PORT, MCP_PORT):
                 try:
                     with socket.create_connection((network["host_ip"], port), timeout=0.2):
                         pass
@@ -456,7 +497,11 @@ class InstanceRuntime:
             self.terminate_process(process)
         gateway_tail = paths["gateway_log"].read_text(encoding="utf-8", errors="replace")[-2000:]
         bridge_tail = paths["bridge_log"].read_text(encoding="utf-8", errors="replace")[-2000:]
-        raise RuntimeFailure(f"managed sidecars did not become ready\ngateway={gateway_tail}\nbridge={bridge_tail}")
+        mcp_tail = paths["mcp_log"].read_text(encoding="utf-8", errors="replace")[-2000:]
+        raise RuntimeFailure(
+            "managed sidecars did not become ready"
+            f"\ngateway={gateway_tail}\nbridge={bridge_tail}\nmcp={mcp_tail}"
+        )
 
     def prepare_jail(
         self,
@@ -464,6 +509,7 @@ class InstanceRuntime:
         paths: dict[str, Path],
         network: dict[str, str] | None = None,
         bridge_token: str | None = None,
+        mcp_token: str | None = None,
     ) -> None:
         """建立 jail hard link，并生成只读 rootfs + 可写数据盘配置。"""
         shutil.rmtree(paths["jail"], ignore_errors=True)
@@ -484,8 +530,8 @@ class InstanceRuntime:
         )
         network_interfaces: list[dict[str, str]] = []
         if network is not None:
-            if bridge_token is None:
-                raise RuntimeFailure("bridge token is required for managed networking")
+            if bridge_token is None or mcp_token is None:
+                raise RuntimeFailure("bridge and MCP tokens are required for managed networking")
             boot_args += (
                 " agent_managed_runtime=1"
                 f" agent_ip={network['guest_cidr']}"
@@ -496,6 +542,9 @@ class InstanceRuntime:
                 f" agent_bridge_host={network['host_ip']}"
                 f" agent_bridge_port={BRIDGE_PORT}"
                 f" agent_bridge_token={bridge_token}"
+                f" agent_mcp_host={network['host_ip']}"
+                f" agent_mcp_port={MCP_PORT}"
+                f" agent_mcp_token={mcp_token}"
             )
             network_interfaces = [
                 {
@@ -603,7 +652,8 @@ class InstanceRuntime:
                     gateway_gid,
                 )
                 bridge_token = paths["bridge_token"].read_text(encoding="utf-8").strip()
-                self.prepare_jail(instance_id, paths, network, bridge_token)
+                mcp_token = paths["mcp_token"].read_text(encoding="utf-8").strip()
+                self.prepare_jail(instance_id, paths, network, bridge_token, mcp_token)
             except Exception:
                 for sidecar in sidecars:
                     self.terminate_process(sidecar)

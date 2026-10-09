@@ -12,6 +12,8 @@ import { spawn } from "node:child_process";
 const taskPath = process.argv[2];
 const bridgeUrl = process.env.AGENT_BRIDGE_URL;
 const bridgeToken = process.env.AGENT_BRIDGE_TOKEN;
+const mcpUrl = process.env.AGENT_MCP_URL;
+const mcpToken = process.env.AGENT_MCP_TOKEN;
 
 if (!taskPath || !bridgeUrl || !bridgeToken) {
   throw new Error("task path and bridge environment are required");
@@ -30,8 +32,18 @@ if (!Array.isArray(task.skills) || task.skills.length > 5 || task.skills.some((s
   typeof skill.content !== "string" || Buffer.byteLength(skill.content, "utf8") > 32768)) {
   throw new Error("invalid Skill snapshot");
 }
+if (!Array.isArray(task.mcps) || task.mcps.length > 3 || task.mcps.some((mcp) =>
+  !mcp || mcp.id !== "platform-records" || mcp.serverName !== "platform_records" ||
+  typeof mcp.description !== "string" || Buffer.byteLength(mcp.description, "utf8") > 1024)) {
+  throw new Error("invalid MCP snapshot");
+}
+if (task.mcps.length > 0 && (!mcpUrl || !mcpToken)) {
+  throw new Error("MCP environment is required by this task");
+}
 
-const enabledTools = task.toolMode === "read_only" ? "read" : "read,write";
+const fileTools = task.toolMode === "read_only" ? ["read"] : ["read", "write"];
+const mcpTools = task.mcps.map((mcp) => `mcp__${mcp.serverName}__get_verification_record`);
+const enabledTools = [...fileTools, ...mcpTools].join(",");
 // Pi 的 --system-prompt 同时接受文本或路径。写入一个固定权限的临时文件可以保证
 // 用户输入即使恰好像现有路径，也始终按提示词正文处理，而不会被解释成任意文件。
 const systemPromptPath = `/tmp/pi-system-prompt-${process.pid}.txt`;
@@ -44,6 +56,28 @@ for (const skill of task.skills) {
   await fs.writeFile(`${skillDirectory}/SKILL.md`, skill.content, { encoding: "utf8", mode: 0o600 });
   skillArguments.push("--skill", skillDirectory);
 }
+
+// 使用临时 HOME 注入任务专属的审核 MCP 配置。持久数据盘中的 models.json 被复制
+// 进来，但 mcp.json 和一次性访问令牌不会写回 /workspace 或跨任务残留。
+const piHome = `/tmp/pi-home-${process.pid}`;
+await fs.mkdir(`${piHome}/.pi/agent`, { recursive: true, mode: 0o700 });
+await fs.copyFile("/home/pi/.pi/agent/models.json", `${piHome}/.pi/agent/models.json`);
+if (task.mcps.length > 0) {
+  const mcpServers = Object.fromEntries(task.mcps.map((mcp) => [mcp.serverName, {
+    type: "streamable-http",
+    url: mcpUrl,
+    headers: { Authorization: "Bearer ${AGENT_MCP_TOKEN}" },
+    description: mcp.description,
+    exposure: "direct",
+    timeout: 15,
+  }]));
+  await fs.writeFile(
+    `${piHome}/.pi/agent/mcp.json`,
+    `${JSON.stringify({ mcpServers })}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
+}
+const extensionArguments = task.mcps.length > 0 ? ["--extension", "builtin:mcp"] : [];
 
 async function postEvent(type, data = {}) {
   const response = await fetch(`${bridgeUrl}/guest/tasks/${task.id}/events`, {
@@ -86,6 +120,7 @@ const pi = spawn(
     "--no-session",
     "--no-approve",
     "--no-extensions",
+    ...extensionArguments,
     "--no-skills",
     ...skillArguments,
     "--no-prompt-templates",
@@ -104,7 +139,7 @@ const pi = spawn(
   ],
   {
     cwd: "/workspace",
-    env: { ...process.env, PI_SKIP_VERSION_CHECK: "1" },
+    env: { ...process.env, HOME: piHome, PI_SKIP_VERSION_CHECK: "1" },
     stdio: ["ignore", "pipe", "pipe"],
   },
 );
@@ -201,6 +236,7 @@ await stderrDone;
 await flushText(true);
 await fs.unlink(systemPromptPath).catch(() => undefined);
 await fs.rm(skillsRoot, { recursive: true, force: true }).catch(() => undefined);
+await fs.rm(piHome, { recursive: true, force: true }).catch(() => undefined);
 
 if (exitCode !== 0 || terminalError || !settled) {
   await postEvent("failed", {

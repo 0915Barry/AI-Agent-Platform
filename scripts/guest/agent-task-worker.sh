@@ -5,6 +5,8 @@ set -euo pipefail
 # 每次只执行一个任务，避免两个 Pi 进程同时修改同一工作区和会话目录。
 bridge_url="${AGENT_BRIDGE_URL:?AGENT_BRIDGE_URL is required}"
 bridge_token="${AGENT_BRIDGE_TOKEN:?AGENT_BRIDGE_TOKEN is required}"
+mcp_url="${AGENT_MCP_URL:?AGENT_MCP_URL is required}"
+mcp_token="${AGENT_MCP_TOKEN:?AGENT_MCP_TOKEN is required}"
 runtime_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 post_workspace_result() {
@@ -82,6 +84,8 @@ while true; do
     PI_SKIP_VERSION_CHECK=1 \
     AGENT_BRIDGE_URL="${bridge_url}" \
     AGENT_BRIDGE_TOKEN="${bridge_token}" \
+    AGENT_MCP_URL="${mcp_url}" \
+    AGENT_MCP_TOKEN="${mcp_token}" \
     node /usr/local/sbin/pi-event-forwarder.mjs "${task_file}" || true
   rm -f "${task_file}"
 done

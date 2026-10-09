@@ -14,7 +14,7 @@
 
 ## 快速开始
 
-首次部署**不需要**从 M0 到 M18 逐项运行。里程碑命令是底层研发、故障定位和
+首次部署**不需要**从 M0 到 M19 逐项运行。里程碑命令是底层研发、故障定位和
 回归测试入口；首次运行只使用
 `bootstrap → configure-user → configure-deepseek → verify → start`。
 
@@ -187,6 +187,7 @@ Windows 浏览器打开 `http://127.0.0.1:5173` 并登录，在页面中选择�
 | M16 | 本地账户登录、HttpOnly 会话、实例归属隔离与每用户配额 | ✅ 已通过 |
 | M17 | 实例级 Agent 名称、System Prompt 与只读/读写工具权限 | ✅ 已通过 |
 | M18 | 仓库审核 Skill 目录、实例动态启停与任务快照注入 | ✅ 已通过 |
+| M19 | 审核 MCP 目录、宿主侧 MCP Gateway、实例认证与脱敏审计 | ✅ 已通过 |
 
 ## 当前支持范围
 
@@ -456,6 +457,7 @@ Linux/KVM checks passed
 | Agent 任务通道 | `./run.sh agent-task-smoke-test` | `./run-linux.sh agent-task-smoke-test` |
 | Agent 自定义配置 | `./run.sh agent-config-smoke-test` | `./run-linux.sh agent-config-smoke-test` |
 | Skill 动态注入 | `./run.sh skills-smoke-test` | `./run-linux.sh skills-smoke-test` |
+| MCP 安全接入 | `./run.sh mcp-smoke-test` | `./run-linux.sh mcp-smoke-test` |
 | 工作区文件通道 | `./run.sh workspace-smoke-test` | `./run-linux.sh workspace-smoke-test` |
 
 第一次 `runtime-smoke-test` 会从固定 Ubuntu 快照构建完整 rootfs，下载较多基础包并安装 Node.js 和 Pi Agent，耗时明显较长。构建指纹不变时后续测试会复用 `/srv/fc/artifacts/agent-rootfs.ext4`。
@@ -465,7 +467,7 @@ Linux/KVM checks passed
 | 命令 | 作用 |
 |---|---|
 | `bootstrap` | 新机器的一键入口：检查环境、安装 Firecracker、准备内核并构建或复用 rootfs |
-| `verify` | 运行 M11 Agent 任务与 M14 工作区端到端验收；新机器建议执行一次 |
+| `verify` | 运行当前 M19 Agent 任务与 M14 工作区端到端验收；新机器建议执行一次 |
 | `start` / `stop` / `status` | 日常启动、停止和查询长期运行的控制面 |
 | `tunnel`（仅 `run.sh`） | 将 Mac 的 `127.0.0.1:18090` 安全转发到 Ubuntu loopback 控制面 |
 | `web-install` | 安装 lockfile 固定的前端依赖；Linux 自动使用项目固定的 Node.js |
@@ -492,6 +494,7 @@ Linux/KVM checks passed
 | `agent-task-smoke-test` | 通过控制面向 microVM 内 Pi 下发真实任务，并验证 DeepSeek、工具读取和事件结果 |
 | `agent-config-smoke-test` | 验证自定义 System Prompt、只读工具权限和任务配置快照进入真实 Pi |
 | `skills-smoke-test` | 验证审核目录中的 Skill 经任务快照动态注入真实 Pi |
+| `mcp-smoke-test` | 验证 Pi 通过实例专属认证调用宿主 MCP Gateway，且审计不泄露返回值 |
 | `workspace-smoke-test` | 在真实 microVM 中验证文件读写、路径隔离与重启持久化 |
 | `control-plane-start` | 构建所需镜像并在 Ubuntu loopback 启动长期运行的控制面 |
 | `control-plane-stop` | 停止控制面进程；已启动实例仍由独立空闲回收器管理 |
@@ -1322,7 +1325,7 @@ M18_SKILLS_READY source=reviewed-catalog selection=dynamic snapshot=verified pi=
 ```
 
 页面验收时，在实例“配置”中勾选“文档总结”并保存，刷新后确认仍勾选，再让 Agent
-总结工作区中的文档。MCP、可执行 Skill 和用户上传 Skill 仍属于后续安全评审范围。
+总结工作区中的文档。可执行 Skill 和用户上传 Skill 仍属于后续安全评审范围。
 
 ### M18 实测结果
 
@@ -1331,6 +1334,53 @@ M18_SKILLS_READY source=reviewed-catalog selection=dynamic snapshot=verified pi=
 文件并输出 `M18_SKILLS_READY`；页面启用“文档总结”后，刷新仍保留选择，并成功读取
 工作区真实文件生成摘要。测试也确认缺失文件时 Skill 会报告 `ENOENT` 而不会编造内容。
 同时修复了切换实例时旧会话请求晚返回导致的 `conversation not found` 红色误报警。
+
+## M19 MCP 安全接入
+
+M19 第一版把 MCP 作为“Agent 调用宿主受控能力”的标准协议层，而不是允许用户上传
+任意 MCP 服务器。页面“配置”只展示仓库审核目录中的“平台验收记录”；选择会保存到
+实例，并在任务创建时冻结为不可变快照。没有选中的任务不会加载 MCP 扩展。
+
+实例启动时，Ubuntu 宿主会以 `agent-gateway` 低权限账户额外启动一个实例专属 MCP
+Gateway。microVM 只能通过自己的 TAP 网络访问该实例的 18084 端口，并使用每次启动
+随机生成的一次性访问令牌。宿主数据文件权限为 `0400`，不会进入 rootfs、数据盘、
+任务 SQLite 或页面；MCP 审计只记录实例、工具、记录 ID 和结果状态，不记录认证头或
+工具返回正文。
+
+Pi Agent 1.0.0 使用其内置 `builtin:mcp` 扩展和 Streamable HTTP 协议。guest 为每项
+任务生成临时 `~/.pi/agent/mcp.json`，只包含控制面下发的白名单服务器，任务结束后
+删除。第一版只提供只读、幂等、无开放网络语义的 `get_verification_record` 工具，
+不允许页面提交 URL、stdio 命令、环境变量或真实数据库凭据。
+
+真实链路验收：
+
+```bash
+# macOS
+./run.sh mcp-smoke-test
+
+# Windows 的 Ubuntu VM
+./run-linux.sh mcp-smoke-test
+```
+
+测试会先回归 M17/M18，再让真实 Pi 调用
+`mcp__platform_records__get_verification_record`。返回值在实例启动后才由宿主随机生成，
+提示词无法预知；测试同时检查任务工具事件、MCP 允许审计以及审计正文脱敏。预期标志：
+
+```text
+M19_MCP_READY transport=streamable-http catalog=allowlisted auth=instance-token data=host-only audit=redacted
+```
+
+以后接数据库时应在宿主 Gateway 内新增最小权限工具和企业密钥引用，不把数据库账号
+发给 microVM。
+
+### M19 实测结果
+
+已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境完成真实验收：Pi Agent 1.0.0
+从任务快照加载唯一允许的 MCP 连接，经实例 TAP 和一次性令牌调用宿主
+`get_verification_record` 工具，并返回启动后生成、提示词无法预知的随机值。测试同时
+确认任务流包含 MCP 工具事件、MCP 审计记录允许结果且不包含返回正文，并输出
+`M19_MCP_READY`。此外，2 项 MCP 协议/安全测试、1 项 Bridge 快照测试、19 项控制面
+测试和前端生产构建均已通过。
 
 ## 跨平台常见错误
 

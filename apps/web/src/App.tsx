@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { api, ApiRequestError } from "./api";
-import type { AgentConversation, AgentInstance, AgentMessage, AgentSkill, AgentTask, AgentTaskEvent, AuthUser, WorkspaceEntry, WorkspaceFile } from "./api";
+import type { AgentConversation, AgentInstance, AgentMcp, AgentMessage, AgentSkill, AgentTask, AgentTaskEvent, AuthUser, WorkspaceEntry, WorkspaceFile } from "./api";
 
 const statusLabel: Record<string, string> = {
   created: "待启动", starting: "启动中", running: "运行中", stopping: "停止中",
@@ -67,6 +67,8 @@ export default function App() {
   const [toolMode, setToolMode] = useState<"read_only" | "read_write">("read_write");
   const [skillCatalog, setSkillCatalog] = useState<AgentSkill[]>([]);
   const [skillIds, setSkillIds] = useState<string[]>([]);
+  const [mcpCatalog, setMcpCatalog] = useState<AgentMcp[]>([]);
+  const [mcpIds, setMcpIds] = useState<string[]>([]);
   const [workspacePath, setWorkspacePath] = useState("");
   const [workspaceEntries, setWorkspaceEntries] = useState<WorkspaceEntry[]>([]);
   const [workspacePreview, setWorkspacePreview] = useState<WorkspaceFile | null>(null);
@@ -165,7 +167,9 @@ export default function App() {
   useEffect(() => {
     if (!currentUser) return;
     void refresh();
-    void api.listSkills().then(setSkillCatalog).catch(() => setSkillCatalog([]));
+    void Promise.all([api.listSkills(), api.listMcps()])
+      .then(([skills, mcps]) => { setSkillCatalog(skills); setMcpCatalog(mcps); })
+      .catch(() => { setSkillCatalog([]); setMcpCatalog([]); });
     const timer = window.setInterval(() => void refresh(true), 3000);
     return () => window.clearInterval(timer);
   }, [currentUser, refresh]);
@@ -197,6 +201,7 @@ export default function App() {
     setSystemPrompt(selected.systemPrompt);
     setToolMode(selected.toolMode);
     setSkillIds(selected.skillIds ?? []);
+    setMcpIds(selected.mcpIds ?? []);
   }, [selected?.id]);
 
   useEffect(() => {
@@ -401,7 +406,7 @@ export default function App() {
     if (!selected || !agentName.trim() || !systemPrompt.trim()) return;
     void runAction("config", () => api.updateAgentConfig(selected.id, {
       agentName: agentName.trim(), systemPrompt: systemPrompt.trim(), toolMode,
-      skillIds,
+      skillIds, mcpIds,
     }));
   }
 
@@ -540,7 +545,7 @@ export default function App() {
             {error ? <div className="error-banner">{error}</div> : null}
             {selected.lastError ? <div className="error-banner">{selected.lastError}</div> : null}
             <div className="agent-console">
-              <div className="console-heading"><div><span className="eyebrow">PI AGENT · M17</span><h3>{consoleView === "chat" ? selectedConversation?.title ?? selected.agentName : consoleView === "files" ? "/workspace 文件" : "Agent 配置"}</h3></div><div className="console-tabs"><button className={consoleView === "chat" ? "active" : ""} onClick={() => setConsoleView("chat")}>会话</button><button className={consoleView === "files" ? "active" : ""} onClick={() => { setConsoleView("files"); void loadWorkspace(""); }}>文件</button><button className={consoleView === "config" ? "active" : ""} onClick={() => setConsoleView("config")}>配置</button></div></div>
+              <div className="console-heading"><div><span className="eyebrow">PI AGENT · M19</span><h3>{consoleView === "chat" ? selectedConversation?.title ?? selected.agentName : consoleView === "files" ? "/workspace 文件" : "Agent 配置"}</h3></div><div className="console-tabs"><button className={consoleView === "chat" ? "active" : ""} onClick={() => setConsoleView("chat")}>会话</button><button className={consoleView === "files" ? "active" : ""} onClick={() => { setConsoleView("files"); void loadWorkspace(""); }}>文件</button><button className={consoleView === "config" ? "active" : ""} onClick={() => setConsoleView("config")}>配置</button></div></div>
               {consoleView === "chat" ? <div className="chat-layout">
                 <aside className="conversation-sidebar">
                   <button className="new-conversation" onClick={createConversation} disabled={action !== null}><Icon name="plus" /> 新建会话</button>
@@ -584,6 +589,7 @@ export default function App() {
                 <label>System Prompt<textarea value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} rows={10} maxLength={8192} /></label>
                 <label>工具权限<select value={toolMode} onChange={(event) => setToolMode(event.target.value as "read_only" | "read_write")}><option value="read_only">只读文件（read）</option><option value="read_write">读写文件（read、write）</option></select></label>
                 <fieldset><legend>启用 Skills</legend>{skillCatalog.map((skill) => <label className="skill-option" key={skill.id}><input type="checkbox" checked={skillIds.includes(skill.id)} onChange={(event) => setSkillIds((current) => event.target.checked ? [...current, skill.id] : current.filter((id) => id !== skill.id))} /><span><strong>{skill.name}</strong><small>{skill.description}</small></span></label>)}</fieldset>
+                <fieldset><legend>启用 MCP 连接</legend>{mcpCatalog.map((mcp) => <label className="skill-option" key={mcp.id}><input type="checkbox" checked={mcpIds.includes(mcp.id)} onChange={(event) => setMcpIds((current) => event.target.checked ? [...current, mcp.id] : current.filter((id) => id !== mcp.id))} /><span><strong>{mcp.name}</strong><small>{mcp.description}</small></span></label>)}</fieldset>
                 <p>配置只影响之后创建的任务。microVM 隔离、网络策略和宿主凭据不可在这里修改。</p>
                 <button className="primary-button" disabled={action !== null || !agentName.trim() || !systemPrompt.trim()}>{action === "config" ? "保存中…" : "保存 Agent 配置"}</button>
               </form>}

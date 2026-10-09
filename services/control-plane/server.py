@@ -90,6 +90,13 @@ SKILL_CATALOG = {
     },
 }
 SKILL_CATALOG_ROOT = REPO_ROOT / "skills" / "catalog"
+MCP_CATALOG = {
+    "platform-records": {
+        "name": "平台验收记录",
+        "description": "只读访问宿主侧审核数据；用于验证 MCP 安全链路",
+        "serverName": "platform_records",
+    },
+}
 
 
 def resolve_skill_snapshot(skill_ids: list[str]) -> list[dict[str, str]]:
@@ -104,6 +111,19 @@ def resolve_skill_snapshot(skill_ids: list[str]) -> list[dict[str, str]]:
             raise ApiError(500, "invalid_skill_catalog", f"Skill 过大：{skill_id}")
         snapshots.append({"id": skill_id, "content": content})
     return snapshots
+
+
+def resolve_mcp_snapshot(mcp_ids: list[str]) -> list[dict[str, str]]:
+    """把审核目录中的 MCP 元数据固化到任务，拒绝用户自定义 URL 或命令。"""
+
+    return [
+        {
+            "id": mcp_id,
+            "serverName": MCP_CATALOG[mcp_id]["serverName"],
+            "description": MCP_CATALOG[mcp_id]["description"],
+        }
+        for mcp_id in mcp_ids
+    ]
 
 
 class ApiError(Exception):
@@ -180,6 +200,10 @@ class InstanceStore:
                 connection.execute(
                     "ALTER TABLE instances ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "mcp_ids_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE instances ADD COLUMN mcp_ids_json TEXT NOT NULL DEFAULT '[]'"
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS instances_owner_created "
                 "ON instances(owner_id,created_at,id)"
@@ -199,6 +223,7 @@ class InstanceStore:
             "systemPrompt": row["system_prompt"],
             "toolMode": row["tool_mode"],
             "skillIds": json.loads(row["skills_json"] or "[]"),
+            "mcpIds": json.loads(row["mcp_ids_json"] or "[]"),
         }
 
     def create(self, instance_id: str, owner_id: str | None = None) -> dict[str, Any]:
@@ -208,9 +233,10 @@ class InstanceStore:
             with self.connect() as connection:
                 connection.execute(
                     "INSERT INTO instances(id,status,created_at,updated_at,last_error,owner_id,"
-                    "agent_name,system_prompt,tool_mode,skills_json) VALUES(?,?,?,?,NULL,?,?,?,?,?)",
+                    "agent_name,system_prompt,tool_mode,skills_json,mcp_ids_json) "
+                    "VALUES(?,?,?,?,NULL,?,?,?,?,?,?)",
                     (instance_id, "created", now, now, owner_id, DEFAULT_AGENT_NAME,
-                     DEFAULT_SYSTEM_PROMPT, "read_write", "[]"),
+                     DEFAULT_SYSTEM_PROMPT, "read_write", "[]", "[]"),
                 )
         except sqlite3.IntegrityError as error:
             raise ApiError(409, "instance_exists", f"instance already exists: {instance_id}") from error
@@ -267,14 +293,15 @@ class InstanceStore:
 
     def update_config(
         self, instance_id: str, agent_name: str, system_prompt: str, tool_mode: str,
-        skill_ids: list[str],
+        skill_ids: list[str], mcp_ids: list[str],
     ) -> dict[str, Any]:
         with self.connect() as connection:
             cursor = connection.execute(
-                "UPDATE instances SET agent_name=?,system_prompt=?,tool_mode=?,skills_json=?,"
+                "UPDATE instances SET agent_name=?,system_prompt=?,tool_mode=?,skills_json=?,mcp_ids_json=?,"
                 "updated_at=? WHERE id=?",
                 (agent_name, system_prompt, tool_mode,
-                 json.dumps(skill_ids, separators=(",", ":")), int(time.time()), instance_id),
+                 json.dumps(skill_ids, separators=(",", ":")),
+                 json.dumps(mcp_ids, separators=(",", ":")), int(time.time()), instance_id),
             )
         if cursor.rowcount != 1:
             raise ApiError(404, "instance_not_found", f"instance not found: {instance_id}")
@@ -471,6 +498,7 @@ class ControlPlane:
             return self.tasks.create(
                 instance_id, prompt, record["systemPrompt"], record["toolMode"],
                 resolve_skill_snapshot(record["skillIds"]),
+                resolve_mcp_snapshot(record["mcpIds"]),
             )
         except (RuntimeFailure, TaskStoreError, OSError, sqlite3.Error) as error:
             raise ApiError(500, "task_create_failed", str(error)) from error
@@ -557,6 +585,7 @@ class ControlPlane:
                 record["systemPrompt"],
                 record["toolMode"],
                 resolve_skill_snapshot(record["skillIds"]),
+                resolve_mcp_snapshot(record["mcpIds"]),
             )
         except TaskStoreError as error:
             if "conversation not found" in str(error):
@@ -573,6 +602,7 @@ class ControlPlane:
         system_prompt = payload.get("systemPrompt", current["systemPrompt"])
         tool_mode = payload.get("toolMode", current["toolMode"])
         skill_ids = payload.get("skillIds", current["skillIds"])
+        mcp_ids = payload.get("mcpIds", current["mcpIds"])
         if not isinstance(agent_name, str) or not agent_name.strip():
             raise ApiError(400, "invalid_agent_name", "Agent 名称不能为空")
         if len(agent_name.strip().encode("utf-8")) > 80:
@@ -590,8 +620,14 @@ class ControlPlane:
             raise ApiError(400, "invalid_skills", "Skill 列表包含未知或过多项目")
         if len(set(skill_ids)) != len(skill_ids):
             raise ApiError(400, "invalid_skills", "Skill 列表不能重复")
+        if not isinstance(mcp_ids, list) or len(mcp_ids) > 3 or any(
+            not isinstance(mcp_id, str) or mcp_id not in MCP_CATALOG for mcp_id in mcp_ids
+        ):
+            raise ApiError(400, "invalid_mcps", "MCP 列表包含未知或过多项目")
+        if len(set(mcp_ids)) != len(mcp_ids):
+            raise ApiError(400, "invalid_mcps", "MCP 列表不能重复")
         return self.store.update_config(
-            instance_id, agent_name.strip(), system_prompt.strip(), tool_mode, skill_ids
+            instance_id, agent_name.strip(), system_prompt.strip(), tool_mode, skill_ids, mcp_ids
         )
 
     @staticmethod
@@ -812,6 +848,16 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                          "description": details["description"]}
                         for skill_id, details in SKILL_CATALOG.items()
                         if not details.get("internal")
+                    ]},
+                )
+                return
+            if request_path == "/api/mcps":
+                self.send_payload(
+                    200,
+                    {"mcps": [
+                        {"id": mcp_id, "name": details["name"],
+                         "description": details["description"]}
+                        for mcp_id, details in MCP_CATALOG.items()
                     ]},
                 )
                 return

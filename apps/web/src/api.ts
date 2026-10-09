@@ -12,6 +12,12 @@ export interface AgentSkill {
   description: string;
 }
 
+export interface AgentMcp {
+  id: string;
+  name: string;
+  description: string;
+}
+
 export class ApiRequestError extends Error {
   constructor(public status: number, public code: string, message: string) {
     super(message);
@@ -35,6 +41,7 @@ export interface AgentInstance {
   systemPrompt: string;
   toolMode: "read_only" | "read_write";
   skillIds: string[];
+  mcpIds: string[];
   runtime?: RuntimeStatus;
 }
 
@@ -123,6 +130,7 @@ export const api = {
   health: () => request<{ status: string }>("/healthz"),
   authSession: () => request<{ authenticated: boolean; user: AuthUser | null }>("/api/auth/session"),
   listSkills: async () => (await request<{ skills: AgentSkill[] }>("/api/skills")).skills,
+  listMcps: async () => (await request<{ mcps: AgentMcp[] }>("/api/mcps")).mcps,
   login: (username: string, password: string) =>
     request<{ user: AuthUser; expiresAt: number }>("/api/auth/login", {
       method: "POST", body: JSON.stringify({ username, password }),
@@ -139,7 +147,7 @@ export const api = {
   destroyInstance: (id: string) => request<{ id: string; status: string }>(`/api/instances/${id}`, { method: "DELETE" }),
   updateAgentConfig: (
     id: string,
-    config: { agentName: string; systemPrompt: string; toolMode: "read_only" | "read_write"; skillIds: string[] },
+    config: { agentName: string; systemPrompt: string; toolMode: "read_only" | "read_write"; skillIds: string[]; mcpIds: string[] },
   ) => request<AgentInstance>(`/api/instances/${id}/config`, {
     method: "POST", body: JSON.stringify(config),
   }),

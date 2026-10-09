@@ -247,10 +247,15 @@ if [[ "${managed_runtime}" == "1" ]]; then
   bridge_host="$(cmdline_value agent_bridge_host)"
   bridge_port="$(cmdline_value agent_bridge_port)"
   bridge_token="$(cmdline_value agent_bridge_token)"
+  mcp_host="$(cmdline_value agent_mcp_host)"
+  mcp_port="$(cmdline_value agent_mcp_port)"
+  mcp_token="$(cmdline_value agent_mcp_token)"
   echo "AGENT_TASK_WORKER_READY bridge=${bridge_host}:${bridge_port} credential=instance-token"
   exec env \
     AGENT_BRIDGE_URL="http://${bridge_host}:${bridge_port}" \
     AGENT_BRIDGE_TOKEN="${bridge_token}" \
+    AGENT_MCP_URL="http://${mcp_host}:${mcp_port}/mcp" \
+    AGENT_MCP_TOKEN="${mcp_token}" \
     /usr/local/sbin/agent-task-worker
 fi
 

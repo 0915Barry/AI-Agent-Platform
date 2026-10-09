@@ -79,6 +79,10 @@ class TaskStore:
                 connection.execute(
                     "ALTER TABLE tasks ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "mcps_json" not in task_columns:
+                connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN mcps_json TEXT NOT NULL DEFAULT '[]'"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS task_events (
@@ -173,6 +177,7 @@ class TaskStore:
             ),
             "toolMode": row["tool_mode"] or "read_write",
             "skills": json.loads(row["skills_json"] or "[]"),
+            "mcps": json.loads(row["mcps_json"] or "[]"),
         }
 
     @staticmethod
@@ -279,6 +284,7 @@ class TaskStore:
         system_prompt: str | None = None,
         tool_mode: str = "read_write",
         skills: list[dict[str, str]] | None = None,
+        mcps: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """原子保存用户消息、裁剪上下文并创建对应 queued 任务。"""
 
@@ -299,9 +305,10 @@ class TaskStore:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 "INSERT INTO tasks(id,instance_id,prompt,status,created_at,updated_at,conversation_id,"
-                "system_prompt,tool_mode,skills_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "system_prompt,tool_mode,skills_json,mcps_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (task_id, instance_id, prompt, "queued", now, now, conversation_id,
-                 system_prompt, tool_mode, json.dumps(skills or [], separators=(",", ":"))),
+                 system_prompt, tool_mode, json.dumps(skills or [], separators=(",", ":")),
+                 json.dumps(mcps or [], separators=(",", ":"))),
             )
             connection.execute(
                 "INSERT INTO task_events(task_id,event_type,payload,created_at) VALUES(?,?,?,?)",
@@ -325,6 +332,7 @@ class TaskStore:
         system_prompt: str | None = None,
         tool_mode: str = "read_write",
         skills: list[dict[str, str]] | None = None,
+        mcps: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """创建一个排队任务，并同时写入 queued 事件。"""
 
@@ -333,9 +341,10 @@ class TaskStore:
         with self.connect() as connection:
             connection.execute(
                 "INSERT INTO tasks(id,instance_id,prompt,status,created_at,updated_at,"
-                "system_prompt,tool_mode,skills_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                "system_prompt,tool_mode,skills_json,mcps_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (task_id, instance_id, prompt, "queued", now, now, system_prompt, tool_mode,
-                 json.dumps(skills or [], separators=(",", ":"))),
+                 json.dumps(skills or [], separators=(",", ":")),
+                 json.dumps(mcps or [], separators=(",", ":"))),
             )
             connection.execute(
                 "INSERT INTO task_events(task_id,event_type,payload,created_at) VALUES(?,?,?,?)",

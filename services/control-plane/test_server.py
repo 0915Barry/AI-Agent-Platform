@@ -263,6 +263,7 @@ class ControlPlaneTests(unittest.TestCase):
                 "systemPrompt": "只分析文件内容，不要修改任何文件。",
                 "toolMode": "read_only",
                 "skillIds": ["code-review"],
+                "mcpIds": ["platform-records"],
             },
         )
         self.assertEqual(configured["agentName"], "只读审查员")
@@ -275,6 +276,8 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(claimed["toolMode"], "read_only")
         self.assertEqual(claimed["skills"][0]["id"], "code-review")
         self.assertIn("# Code review", claimed["skills"][0]["content"])
+        self.assertEqual(claimed["mcps"][0]["id"], "platform-records")
+        self.assertEqual(claimed["mcps"][0]["serverName"], "platform_records")
 
         with self.assertRaises(SERVER.ApiError) as invalid_tools:
             self.control.update_agent_config(
@@ -282,6 +285,13 @@ class ControlPlaneTests(unittest.TestCase):
                 {"agentName": "危险配置", "systemPrompt": "test", "toolMode": "bash"},
             )
         self.assertEqual(invalid_tools.exception.code, "invalid_tool_mode")
+
+        with self.assertRaises(SERVER.ApiError) as invalid_mcp:
+            self.control.update_agent_config(
+                "agent-config",
+                {"agentName": "危险配置", "systemPrompt": "test", "mcpIds": ["user-url"]},
+            )
+        self.assertEqual(invalid_mcp.exception.code, "invalid_mcps")
 
     def test_sse_replays_incremental_events_and_closes_at_terminal_state(self) -> None:
         """SSE 应按序重放增量事件，并在 completed 后结束 HTTP 响应。"""

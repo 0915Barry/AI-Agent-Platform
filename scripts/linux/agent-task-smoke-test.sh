@@ -79,6 +79,16 @@ check_volume() {
   fi
 }
 
+dump_instance_diagnostics() {
+  echo "--- guest console tail ---" >&2
+  tail -n 120 "${state_root}/control-plane/${instance_id}/console.log" >&2 2>/dev/null || true
+  for component in gateway bridge mcp; do
+    echo "--- ${component} sidecar tail ---" >&2
+    tail -n 80 "${state_root}/control-plane/${instance_id}/sidecars/${component}.log" \
+      >&2 2>/dev/null || true
+  done
+}
+
 export DEBIAN_FRONTEND=noninteractive
 missing_packages=false
 for required_command in curl e2fsck ip jq mkfs.ext4 mount nft python3 setpriv ss truncate; do
@@ -141,11 +151,11 @@ instance_created=true
 config_payload="$(jq -n \
   --arg name 'M17 read-only verifier' \
   --arg system 'Follow the user request exactly. You are a read-only verification agent.' \
-  '{agentName:$name,systemPrompt:$system,toolMode:"read_only",skillIds:["m18-verifier"]}')"
+  '{agentName:$name,systemPrompt:$system,toolMode:"read_only",skillIds:["m18-verifier"],mcpIds:[]}')"
 curl --fail --silent --show-error --max-time 10 \
   --request POST --header 'Content-Type: application/json' \
   --data "${config_payload}" "${base_url}/api/instances/${instance_id}/config" \
-  | jq -e '.agentName == "M17 read-only verifier" and .toolMode == "read_only" and .skillIds == ["m18-verifier"]' >/dev/null
+  | jq -e '.agentName == "M17 read-only verifier" and .toolMode == "read_only" and .skillIds == ["m18-verifier"] and .mcpIds == []' >/dev/null
 
 echo "Starting managed Pi Agent microVM with isolated Gateway and task bridge..."
 curl --fail --silent --show-error --max-time 120 \
@@ -207,6 +217,7 @@ done
 if [[ "${task_status}" != "completed" \
   || ! "${task_output}" =~ ^M18_SKILL_OK:[[:space:]]*${token}[[:space:]]*$ ]]; then
   echo "FAIL: unexpected task result status=${task_status} output=${task_output}" >&2
+  dump_instance_diagnostics
   exit 1
 fi
 
@@ -233,6 +244,64 @@ if [[ "${sse_response}" != *'event: task-event'* ]]; then
 fi
 if [[ "${sse_response}" != *'"type":"completed"'* ]]; then
   echo "FAIL: SSE stream did not reach the completed event" >&2
+  exit 1
+fi
+
+# M19：验收值只存在于宿主 sidecar 的 0400 文件中，提示词不知道该值。Pi 必须通过
+# MCP Streamable HTTP 工具读取，任务事件和独立审计日志都必须留下可核验记录。
+mcp_config_payload="$(jq -n \
+  --arg name 'M19 MCP verifier' \
+  --arg system 'Follow the user request exactly. Use only the explicitly requested reviewed MCP tool.' \
+  '{agentName:$name,systemPrompt:$system,toolMode:"read_only",skillIds:[],mcpIds:["platform-records"]}')"
+curl --fail --silent --show-error --max-time 10 \
+  --request POST --header 'Content-Type: application/json' \
+  --data "${mcp_config_payload}" "${base_url}/api/instances/${instance_id}/config" \
+  | jq -e '.agentName == "M19 MCP verifier" and .skillIds == [] and .mcpIds == ["platform-records"]' >/dev/null
+mcp_data_path="${state_root}/control-plane/${instance_id}/sidecars/mcp-verification-record"
+mcp_audit_path="${state_root}/control-plane/${instance_id}/sidecars/mcp.audit.jsonl"
+mcp_expected="$(tr -d '\n' < "${mcp_data_path}")"
+mcp_prompt='Call mcp__platform_records__get_verification_record with recordId m19-verification. Reply with exactly the complete text returned by the tool and no other text.'
+mcp_task_payload="$(jq -n --arg prompt "${mcp_prompt}" '{prompt:$prompt}')"
+mcp_task_response="$(
+  curl --fail --silent --show-error --max-time 10 \
+    --request POST --header 'Content-Type: application/json' \
+    --data "${mcp_task_payload}" "${base_url}/api/instances/${instance_id}/tasks"
+)"
+mcp_task_id="$(printf '%s' "${mcp_task_response}" | jq -r '.id')"
+mcp_status="queued"
+mcp_output=""
+for _ in $(seq 1 240); do
+  mcp_task_response="$(curl --fail --silent --show-error --max-time 5 \
+    "${base_url}/api/instances/${instance_id}/tasks/${mcp_task_id}")"
+  mcp_status="$(printf '%s' "${mcp_task_response}" | jq -r '.status')"
+  if [[ "${mcp_status}" == "completed" ]]; then
+    mcp_output="$(printf '%s' "${mcp_task_response}" | jq -r '.output')"
+    break
+  fi
+  if [[ "${mcp_status}" == "failed" ]]; then
+    echo "FAIL: MCP task failed: $(printf '%s' "${mcp_task_response}" | jq -r '.error')" >&2
+    exit 1
+  fi
+  sleep 1
+done
+if [[ "${mcp_status}" != "completed" \
+  || ! "${mcp_output}" =~ ^M19_MCP_OK:${mcp_expected}[[:space:]]*$ ]]; then
+  echo "FAIL: unexpected MCP task result status=${mcp_status} output=${mcp_output}" >&2
+  dump_instance_diagnostics
+  exit 1
+fi
+mcp_events="$(curl --fail --silent --show-error --max-time 10 \
+  "${base_url}/api/instances/${instance_id}/tasks/${mcp_task_id}/events")"
+printf '%s' "${mcp_events}" | jq -e '
+  [.events[] | select(.type == "tool_call") | .data.toolName]
+  | index("mcp__platform_records__get_verification_record") != null
+' >/dev/null
+if ! grep -q '"event":"tool_call".*"status":"allowed"' "${mcp_audit_path}"; then
+  echo "FAIL: MCP Gateway did not write an allowed tool audit record" >&2
+  exit 1
+fi
+if grep -q "${mcp_expected}" "${mcp_audit_path}"; then
+  echo "FAIL: MCP audit leaked the protected response value" >&2
   exit 1
 fi
 
@@ -273,3 +342,4 @@ echo "AGENT_TASK_READY transport=sse events=incremental gateway=streaming persis
 echo "M15_STREAMING_READY pi=jsonl control_plane=sse reconnect=last-event-id tools=visible thinking=hidden"
 echo "M17_AGENT_CONFIG_READY system_prompt=custom tools=read_only task_snapshot=verified"
 echo "M18_SKILLS_READY source=reviewed-catalog selection=dynamic snapshot=verified pi=explicit-skill"
+echo "M19_MCP_READY transport=streamable-http catalog=allowlisted auth=instance-token data=host-only audit=redacted"

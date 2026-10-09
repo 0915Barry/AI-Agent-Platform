@@ -27,6 +27,19 @@ WORKSPACE_RESULT_ROUTE = re.compile(
 )
 
 
+def guest_task_payload(task: dict) -> dict:
+    """只向 guest 转发执行所需的不可变任务快照，不暴露数据库内部字段。"""
+
+    return {
+        "id": task["id"],
+        "prompt": task["prompt"],
+        "systemPrompt": task["systemPrompt"],
+        "toolMode": task["toolMode"],
+        "skills": task["skills"],
+        "mcps": task["mcps"],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--listen-host", required=True)
@@ -85,16 +98,7 @@ def main() -> None:
                         return
                     args.activity_file.touch()
                     audit({"instance": args.instance_id, "task": task["id"], "event": "claimed"})
-                    self.send_json(
-                        200,
-                        {
-                            "id": task["id"],
-                            "prompt": task["prompt"],
-                            "systemPrompt": task["systemPrompt"],
-                            "toolMode": task["toolMode"],
-                            "skills": task["skills"],
-                        },
-                    )
+                    self.send_json(200, guest_task_payload(task))
                     return
 
                 if self.path == "/guest/workspace/next":
