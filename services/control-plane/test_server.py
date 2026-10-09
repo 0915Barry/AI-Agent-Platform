@@ -12,6 +12,8 @@
 """
 
 import importlib.util
+import http.client
+import json
 import sqlite3
 import tempfile
 import threading
@@ -87,6 +89,7 @@ class ControlPlaneTests(unittest.TestCase):
 
         self.temporary = tempfile.TemporaryDirectory()
         database = Path(self.temporary.name) / "control-plane.db"
+        self.database = database
         task_database = Path(self.temporary.name) / "tasks.db"
         self.store = SERVER.InstanceStore(database)
         self.tasks = SERVER.TaskStore(task_database)
@@ -138,6 +141,74 @@ class ControlPlaneTests(unittest.TestCase):
         generated = self.control.create({})
         self.assertRegex(generated["id"], r"^agent-[0-9a-f]{12}$")
         self.assertEqual(len(self.control.list()), 1)
+
+    def test_owner_scoping_and_instance_quotas(self) -> None:
+        """用户只能列出自己的实例，并受总数和同时运行数限制。"""
+
+        alice = "user-alice"
+        bob = "user-bob"
+        self.control.create({"id": "alice-one"}, alice)
+        self.control.create({"id": "bob-one"}, bob)
+        self.assertEqual([item["id"] for item in self.control.list(alice)], ["alice-one"])
+        with self.assertRaises(SERVER.ApiError):
+            self.store.assert_owner("bob-one", alice)
+
+        for index in range(2, 6):
+            self.control.create({"id": f"alice-{index}"}, alice)
+        with self.assertRaises(SERVER.ApiError) as total_quota:
+            self.control.create({"id": "alice-six"}, alice)
+        self.assertEqual(total_quota.exception.code, "instance_quota_exceeded")
+
+        self.control.start("alice-one", alice)
+        self.control.start("alice-2", alice)
+        with self.assertRaises(SERVER.ApiError) as running_quota:
+            self.control.start("alice-3", alice)
+        self.assertEqual(running_quota.exception.code, "running_quota_exceeded")
+
+    def test_http_login_cookie_and_cross_user_access_denial(self) -> None:
+        """登录 Cookie 应只看到本人实例，跨用户 ID 查询统一返回 404。"""
+
+        auth = SERVER.AuthStore(self.database)
+        alice = auth.create_user("alice", "correct horse battery")
+        bob = auth.create_user("bob-user", "another secure password")
+        self.control.create({"id": "alice-agent"}, alice["id"])
+        self.control.create({"id": "bob-agent"}, bob["id"])
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SERVER.ControlPlaneHandler)
+        server.control = self.control  # type: ignore[attr-defined]
+        server.auth_store = auth  # type: ignore[attr-defined]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        try:
+            connection.request("GET", "/api/instances")
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 401)
+
+            body = json.dumps({"username": "alice", "password": "correct horse battery"})
+            connection.request(
+                "POST", "/api/auth/login", body=body, headers={"Content-Type": "application/json"}
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 200)
+            cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+
+            connection.request("GET", "/api/instances", headers={"Cookie": cookie})
+            response = connection.getresponse()
+            instances = json.loads(response.read())["instances"]
+            self.assertEqual([item["id"] for item in instances], ["alice-agent"])
+
+            connection.request("GET", "/api/instances/bob-agent", headers={"Cookie": cookie})
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 404)
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_dead_runtime_is_reconciled(self) -> None:
         """运行时进程已退出时，控制面不能继续把实例报告为 running。"""

@@ -21,7 +21,7 @@ Usage: ./run.sh <command>
 Commands:
   bootstrap [vm-ip] [vm-user]
                          One-command install/build after the Ubuntu VM exists
-  verify                 Run the current M15 and M14 end-to-end tests
+  verify                 Run the current M16, M15, and M14 checks
   start                  Start the long-running loopback control plane
   stop                   Stop the control plane; preserve instance data
   status                 Show whether the control plane is running
@@ -46,6 +46,8 @@ Commands:
   gateway-smoke-test     Verify host-side credential injection and audit logs
   lifecycle-smoke-test   Verify heartbeat, idle reaping, restart, and destroy
   configure-deepseek     Securely save a DeepSeek API key in the Linux VM
+  configure-user         Create an M16 login user and claim legacy instances
+  auth-smoke-test        Verify M16 sessions, ownership, and quotas
   deepseek-e2e-test      Run Pi Agent against DeepSeek through Tool Gateway
   control-plane-smoke-test
                          Control a real microVM through the M10 HTTP API
@@ -78,7 +80,7 @@ bootstrap_environment() {
     -o ServerAliveCountMax=2 \
     -t "${VM_USER}@${VM_HOST}" \
     "sudo '${REMOTE_DIR}/scripts/linux/install-firecracker.sh' && sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh'"
-  echo "BOOTSTRAP_READY host=${VM_HOST} runtime=pinned next=configure-deepseek"
+  echo "BOOTSTRAP_READY host=${VM_HOST} runtime=pinned next=configure-user,configure-deepseek"
 }
 
 configure_vm() {
@@ -291,6 +293,31 @@ configure_deepseek() {
   unset deepseek_api_key
 }
 
+configure_user() {
+  require_vm_host
+  sync_repo
+  echo "Validating M16 before creating the login user in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "'${REMOTE_DIR}/scripts/linux/auth-smoke-test.sh' && '${REMOTE_DIR}/scripts/linux/configure-user.sh'"
+}
+
+smoke_test_auth() {
+  sync_repo
+  echo "Testing M16 authentication and instance ownership in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    "${VM_USER}@${VM_HOST}" \
+    "'${REMOTE_DIR}/scripts/linux/auth-smoke-test.sh'"
+}
+
 test_deepseek_e2e() {
   sync_repo
   echo "Building and testing Pi Agent with DeepSeek in ${VM_USER}@${VM_HOST}..."
@@ -370,6 +397,7 @@ case "${command}" in
     bootstrap_environment "${2:-}" "${3:-}"
     ;;
   verify)
+    smoke_test_auth
     smoke_test_agent_task
     smoke_test_workspace
     ;;
@@ -438,6 +466,12 @@ case "${command}" in
     ;;
   configure-deepseek)
     configure_deepseek
+    ;;
+  configure-user)
+    configure_user
+    ;;
+  auth-smoke-test)
+    smoke_test_auth
     ;;
   deepseek-e2e-test)
     test_deepseek_e2e

@@ -14,8 +14,9 @@
 
 ## 快速开始
 
-首次部署**不需要**从 M0 到 M14 逐项运行。里程碑命令是底层研发、故障定位和
-回归测试入口；首次运行只使用 `bootstrap → configure-deepseek → verify → start`。
+首次部署**不需要**从 M0 到 M16 逐项运行。里程碑命令是底层研发、故障定位和
+回归测试入口；首次运行只使用
+`bootstrap → configure-user → configure-deepseek → verify → start`。
 
 开始前仍需人工创建一台支持嵌套虚拟化的 Ubuntu 24.04 VM：Mac 使用 UTM +
 Apple Virtualization + ARM64 Ubuntu，Windows x86_64 使用 VMware Workstation +
@@ -32,6 +33,9 @@ cd AI-Agent-Platform
 
 # 首次安装：检查 Mac/UTM/KVM，同步代码，安装 Firecracker 并准备 rootfs
 ./run.sh bootstrap <UTM-Linux-IP> agentdev
+
+# 创建页面登录账户；密码隐藏输入且至少 12 个 UTF-8 字节
+./run.sh configure-user
 
 # 隐藏输入并把 Key 保存到 Ubuntu VM，不写入仓库或 microVM
 ./run.sh configure-deepseek
@@ -54,12 +58,13 @@ cd AI-Agent-Platform
 ./run.sh web-dev
 ```
 
-浏览器打开 `http://127.0.0.1:5173`。结束开发时分别按 `Ctrl-C` 停止页面和隧道，
-再运行 `./run.sh stop`；停止控制面不会删除实例数据盘。
+浏览器打开 `http://127.0.0.1:5173`，使用 `configure-user` 创建的账户登录。结束开发时
+分别按 `Ctrl-C` 停止页面和隧道，再运行 `./run.sh stop`；停止控制面不会删除实例数据盘。
 
 #### macOS 日常开启
 
-`bootstrap`、`configure-deepseek` 和 `verify` 只需要在首次部署或排查底层问题时运行。
+`bootstrap`、`configure-user`、`configure-deepseek` 和 `verify` 只需要在首次部署、
+新增本地账户或排查底层问题时运行。
 日常使用先启动 UTM 中的 Ubuntu VM，然后在仓库根目录打开三个终端：
 
 ```bash
@@ -73,8 +78,8 @@ cd AI-Agent-Platform
 ./run.sh web-dev
 ```
 
-浏览器打开 `http://127.0.0.1:5173`，在页面中选择实例并点击“启动实例”。不需要再
-单独运行 microVM 脚本；页面的“启动实例”会通过控制面启动 Firecracker。
+浏览器打开 `http://127.0.0.1:5173` 并登录，在页面中选择实例并点击“启动实例”。
+不需要再单独运行 microVM 脚本；页面的“启动实例”会通过控制面启动 Firecracker。
 
 #### macOS 正常关闭
 
@@ -97,6 +102,7 @@ cd AI-Agent-Platform
 chmod +x run-linux.sh scripts/common/*.sh scripts/linux/*.sh scripts/guest/*.sh
 
 ./run-linux.sh bootstrap
+./run-linux.sh configure-user
 ./run-linux.sh configure-deepseek
 ./run-linux.sh verify
 ./run-linux.sh start
@@ -115,13 +121,14 @@ chmod +x run-linux.sh scripts/common/*.sh scripts/linux/*.sh scripts/guest/*.sh
 ssh -N -L 5173:127.0.0.1:5173 agentdev@<Ubuntu-VM-IP>
 ```
 
-Windows 浏览器打开 `http://127.0.0.1:5173`。结束开发时按 `Ctrl-C` 停止页面隧道，
-在 Ubuntu 运行 `./run-linux.sh stop`。不要在 PowerShell、Git Bash 或 WSL2 中直接
-执行 `run-linux.sh`。
+Windows 浏览器打开 `http://127.0.0.1:5173`，使用 `configure-user` 创建的账户登录。
+结束开发时按 `Ctrl-C` 停止页面隧道，在 Ubuntu 运行 `./run-linux.sh stop`。不要在
+PowerShell、Git Bash 或 WSL2 中直接执行 `run-linux.sh`。
 
 #### Windows + VMware 日常开启
 
-首次部署完成后，不需要每天重复 `bootstrap`、`configure-deepseek` 或 `verify`。
+首次部署完成后，不需要每天重复 `bootstrap`、`configure-user`、
+`configure-deepseek` 或 `verify`。
 先启动 VMware 中的 Ubuntu VM，再按下面方式运行：
 
 ```bash
@@ -138,8 +145,8 @@ Windows 浏览器打开 `http://127.0.0.1:5173`。结束开发时按 `Ctrl-C` �
 ssh -N -L 5173:127.0.0.1:5173 agentdev@<Ubuntu-VM-IP>
 ```
 
-Windows 浏览器打开 `http://127.0.0.1:5173`，在页面中选择实例并点击“启动实例”。
-Firecracker 仍运行在 Ubuntu VM 内，Windows 不需要直接执行任何 `.sh` 文件。
+Windows 浏览器打开 `http://127.0.0.1:5173` 并登录，在页面中选择实例并点击“启动
+实例”。Firecracker 仍运行在 Ubuntu VM 内，Windows 不需要直接执行任何 `.sh` 文件。
 
 #### Windows + VMware 正常关闭
 
@@ -177,6 +184,7 @@ Firecracker 仍运行在 Ubuntu VM 内，Windows 不需要直接执行任何 `.s
 | M13 | 持久化会话、消息历史与受限多轮上下文 | ✅ 已通过 |
 | M14 | 工作区文件上传、列表、预览、下载、目录与持久化 | ✅ 已通过 |
 | M15 | Pi JSONL、Gateway 流式转发、控制面 SSE 与页面增量输出 | ✅ 已通过 |
+| M16 | 本地账户登录、HttpOnly 会话、实例归属隔离与每用户配额 | ✅ 已通过 |
 
 ## 当前支持范围
 
@@ -439,6 +447,8 @@ Linux/KVM checks passed
 | Tool Gateway | `./run.sh gateway-smoke-test` | `./run-linux.sh gateway-smoke-test` |
 | 生命周期 | `./run.sh lifecycle-smoke-test` | `./run-linux.sh lifecycle-smoke-test` |
 | 保存 DeepSeek Key | `./run.sh configure-deepseek` | `./run-linux.sh configure-deepseek` |
+| 创建页面账户 | `./run.sh configure-user` | `./run-linux.sh configure-user` |
+| 认证与归属 | `./run.sh auth-smoke-test` | `./run-linux.sh auth-smoke-test` |
 | DeepSeek 端到端 | `./run.sh deepseek-e2e-test` | `./run-linux.sh deepseek-e2e-test` |
 | HTTP 控制面 | `./run.sh control-plane-smoke-test` | `./run-linux.sh control-plane-smoke-test` |
 | Agent 任务通道 | `./run.sh agent-task-smoke-test` | `./run-linux.sh agent-task-smoke-test` |
@@ -471,6 +481,8 @@ Linux/KVM checks passed
 | `gateway-smoke-test` | 验证宿主侧凭据注入、脱敏审计和上游隔离 |
 | `lifecycle-smoke-test` | 以 6 秒测试阈值验证心跳、空闲回收、重启和销毁 |
 | `configure-deepseek` | 隐藏输入并将 API Key 保存到 Linux 用户私有目录 |
+| `configure-user` | 隐藏输入并创建本地页面账户；首个账户接管升级前的无主实例 |
+| `auth-smoke-test` | 验证密码派生、会话、跨用户隔离和每用户实例配额；不会重建 rootfs |
 | `deepseek-e2e-test` | 让 Pi Agent 经 Tool Gateway 调用 DeepSeek 并执行 `read` 工具 |
 | `control-plane-smoke-test` | 通过 HTTP API 创建、启动、查询、心跳、停止并销毁真实 microVM |
 | `agent-task-smoke-test` | 通过控制面向 microVM 内 Pi 下发真实任务，并验证 DeepSeek、工具读取和事件结果 |
@@ -1171,6 +1183,64 @@ M15_STREAMING_READY pi=jsonl control_plane=sse reconnect=last-event-id tools=vis
 回答会在任务结束前逐步出现，阶段、工具名称和耗时正常显示；对于上游一次送达的较大
 文本块，页面使用自适应缓冲按约 40 帧/秒平滑呈现，并在缓冲内容显示完后再切换到
 SQLite 中的最终消息。日常使用不需要重复运行 smoke test。
+
+## M16 本地账户、实例归属与配额
+
+M16 给此前仅靠 loopback/SSH 隧道保护的管理页面增加应用层登录。账户由 Ubuntu
+管理员显式创建，不开放网页注册：
+
+```bash
+# macOS 仓库根目录
+./run.sh configure-user
+
+# Windows 的 Ubuntu VM 仓库目录
+./run-linux.sh configure-user
+```
+
+用户名为 3–32 位小写字母、数字、点、下划线或连字符；密码为 12–256 个 UTF-8
+字节，输入过程不回显。密码使用独立随机盐和 PBKDF2-SHA256（600,000 次）保存，
+不会写入 `.env`、Git、浏览器存储或 microVM。首次创建的账户会接管 M16 升级前已有
+但尚无属主的实例，原来的数据盘、会话和工作区不会因此删除。
+
+浏览器登录后获得 12 小时随机会话。Cookie 使用 `HttpOnly` 与 `SameSite=Strict`；
+SQLite 只保存令牌的 SHA-256 摘要。退出登录会立即撤销该会话。由于开发页面当前经
+本机 HTTP 和 SSH 隧道访问，Cookie 暂未设置 `Secure`；部署到带 TLS 的真实服务器时
+必须启用 `Secure`，并改接企业 SSO/OIDC，而不是把这套本地账户当作生产身份系统。
+
+每个实例记录自己的 `owner_id`。实例、会话、消息、任务流和工作区路由都会先验证
+属主；访问其他账户的实例统一返回 404，避免泄露资源是否存在。当前 MVP 默认每个
+账户最多创建 5 个实例、同时运行 2 个实例。控制面仍强制绑定 loopback，认证不是将
+端口直接暴露到局域网或互联网的许可。
+
+`configure-user` 会先自动运行代码级回归，再进入账户创建；整个过程无需重建 rootfs。
+需要单独重复回归时可运行：
+
+```bash
+# macOS
+./run.sh auth-smoke-test
+
+# Windows 的 Ubuntu VM
+./run-linux.sh auth-smoke-test
+```
+
+成功标志为：
+
+```text
+PASS: local authentication, session, ownership, and quota checks passed
+M16_AUTH_READY password=pbkdf2-sha256 session=httponly:12h ownership=isolated quota=5:2 bind=loopback
+```
+
+升级当前开发环境时，先执行一次 `configure-user`，再运行 `stop`、`start` 让长期控制
+面启用认证。随后打开页面，依次验证正确密码可登录、错误密码被拒绝、刷新页面会话
+仍有效，以及点击“退出”后无法再看到实例。
+
+### M16 实测结果
+
+已在当前 Apple M4、UTM Ubuntu ARM64 环境完成升级验收：旧版控制面被安全停止，首个
+本地账户创建成功，长期控制面以强制认证模式启动，页面能够使用新账户登录并正常访问
+原有实例。认证、会话撤销、跨用户 404 隔离和配额的 18 项自动测试及前端生产构建均
+已通过。服务脚本还会在 PID 文件丢失时从 `/proc` 找回旧控制面进程，避免升级过程中
+遗留无法停止的孤儿服务。
 
 ## 跨平台常见错误
 

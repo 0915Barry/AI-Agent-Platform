@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { api } from "./api";
-import type { AgentConversation, AgentInstance, AgentMessage, AgentTask, AgentTaskEvent, WorkspaceEntry, WorkspaceFile } from "./api";
+import { api, ApiRequestError } from "./api";
+import type { AgentConversation, AgentInstance, AgentMessage, AgentTask, AgentTaskEvent, AuthUser, WorkspaceEntry, WorkspaceFile } from "./api";
 
 const statusLabel: Record<string, string> = {
   created: "待启动", starting: "启动中", running: "运行中", stopping: "停止中",
@@ -41,6 +41,10 @@ function formatTime(timestamp?: number) {
 }
 
 export default function App() {
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [loginUsername, setLoginUsername] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
   const [instances, setInstances] = useState<AgentInstance[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<AgentConversation[]>([]);
@@ -100,6 +104,7 @@ export default function App() {
       if (!quiet) setError(null);
     } catch (caught) {
       setOnline(false);
+      if (caught instanceof ApiRequestError && caught.status === 401) setCurrentUser(null);
       if (!quiet) setError(caught instanceof Error ? caught.message : "无法连接控制面");
     } finally {
       setLoading(false);
@@ -125,10 +130,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    void api.authSession()
+      .then((session) => setCurrentUser(session.authenticated ? session.user : null))
+      .catch(() => setCurrentUser(null))
+      .finally(() => setAuthChecked(true));
+  }, []);
+
+  useEffect(() => {
+    if (!currentUser) return;
     void refresh();
     const timer = window.setInterval(() => void refresh(true), 3000);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [currentUser, refresh]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
@@ -288,6 +301,35 @@ export default function App() {
     });
   }
 
+  function login(event: FormEvent) {
+    event.preventDefault();
+    if (!loginUsername.trim() || !loginPassword) return;
+    setAction("login");
+    setError(null);
+    void api.login(loginUsername.trim().toLowerCase(), loginPassword)
+      .then(({ user }) => {
+        setCurrentUser(user);
+        setLoginPassword("");
+        setLoading(true);
+      })
+      .catch((caught) => setError(caught instanceof Error ? caught.message : "登录失败"))
+      .finally(() => setAction(null));
+  }
+
+  function logout() {
+    setAction("logout");
+    void api.logout().catch(() => undefined).finally(() => {
+      setCurrentUser(null);
+      setInstances([]);
+      setSelectedId(null);
+      setConversations([]);
+      setMessages([]);
+      setTask(null);
+      setOnline(false);
+      setAction(null);
+    });
+  }
+
   function createConversation() {
     if (!selectedId) return;
     void runAction("conversation", async () => {
@@ -388,12 +430,30 @@ export default function App() {
     return Math.max(0, Math.ceil((deadline - clock) / 1000));
   }, [clock, selected]);
 
+  if (!authChecked) {
+    return <div className="auth-shell"><div className="auth-card"><div className="auth-mark">π</div><p>正在检查登录状态…</p></div></div>;
+  }
+
+  if (!currentUser) {
+    return <div className="auth-shell"><form className="auth-card" onSubmit={login}>
+      <div className="auth-mark">π</div>
+      <span className="eyebrow">M16 · LOCAL ACCOUNT</span>
+      <h1>登录 Agent Platform</h1>
+      <p>账户由 Ubuntu 管理员创建；密码和会话不会进入 microVM。</p>
+      {error ? <div className="error-banner">{error}</div> : null}
+      <label>用户名<input autoComplete="username" value={loginUsername} onChange={(event) => setLoginUsername(event.target.value)} maxLength={32} autoFocus /></label>
+      <label>密码<input type="password" autoComplete="current-password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} maxLength={256} /></label>
+      <button className="primary-button" disabled={action === "login"}>{action === "login" ? "正在登录…" : "登录"}</button>
+    </form></div>;
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
         <div className="brand-mark">π</div>
         <div className="brand-copy"><strong>Agent Platform</strong><span>Firecracker control workspace</span></div>
         <div className={`connection ${online ? "online" : "offline"}`}><span className="connection-dot" />{online ? "控制面在线" : "控制面离线"}</div>
+        <div className="user-menu"><span>{currentUser.username}</span><button onClick={logout} disabled={action === "logout"}>退出</button></div>
       </header>
       <main className="workspace">
         <aside className="instance-panel">

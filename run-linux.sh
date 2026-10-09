@@ -11,7 +11,7 @@ Run this entry point inside the Ubuntu KVM host VM.
 
 Commands:
   bootstrap             One-command install/build after the Ubuntu VM exists
-  verify                Run the current M15 and M14 end-to-end tests
+  verify                Run the current M16, M15, and M14 checks
   start                 Start the long-running loopback control plane
   stop                  Stop the control plane; preserve instance data
   status                Show whether the control plane is running
@@ -31,6 +31,8 @@ Commands:
   gateway-smoke-test    Verify host-side credential injection
   lifecycle-smoke-test  Verify idle reaping and restart persistence
   configure-deepseek    Securely save a DeepSeek API key outside the repo
+  configure-user        Create an M16 login user and claim legacy instances
+  auth-smoke-test       Verify M16 sessions, ownership, and quotas
   deepseek-e2e-test     Run Pi Agent against DeepSeek through Tool Gateway
   control-plane-smoke-test
                         Control a real microVM through the M10 HTTP API
@@ -59,9 +61,10 @@ case "${command}" in
     "${repo_dir}/scripts/linux/doctor.sh"
     sudo "${repo_dir}/scripts/linux/install-firecracker.sh"
     build_rootfs
-    echo "BOOTSTRAP_READY runtime=pinned next=configure-deepseek"
+    echo "BOOTSTRAP_READY runtime=pinned next=configure-user,configure-deepseek"
     ;;
   verify)
+    "${repo_dir}/scripts/linux/auth-smoke-test.sh"
     build_rootfs
     sudo "${repo_dir}/scripts/linux/agent-task-smoke-test.sh"
     sudo "${repo_dir}/scripts/linux/workspace-smoke-test.sh"
@@ -127,6 +130,13 @@ case "${command}" in
     ;;
   configure-deepseek)
     "${repo_dir}/scripts/linux/configure-deepseek.sh"
+    ;;
+  configure-user)
+    "${repo_dir}/scripts/linux/auth-smoke-test.sh"
+    "${repo_dir}/scripts/linux/configure-user.sh"
+    ;;
+  auth-smoke-test)
+    "${repo_dir}/scripts/linux/auth-smoke-test.sh"
     ;;
   deepseek-e2e-test)
     build_rootfs

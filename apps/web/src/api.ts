@@ -1,6 +1,17 @@
 export type InstanceStatus = "created" | "starting" | "running" | "stopping" | "stopped" | "failed";
 export type TaskStatus = "queued" | "running" | "completed" | "failed";
 
+export interface AuthUser {
+  id: string;
+  username: string;
+}
+
+export class ApiRequestError extends Error {
+  constructor(public status: number, public code: string, message: string) {
+    super(message);
+  }
+}
+
 export interface RuntimeStatus {
   processAlive: boolean;
   idleSeconds: number;
@@ -81,6 +92,7 @@ interface ApiErrorPayload {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
+    credentials: "same-origin",
     headers: {
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
       ...init?.headers,
@@ -88,13 +100,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   const payload = (await response.json().catch(() => ({}))) as T & ApiErrorPayload;
   if (!response.ok) {
-    throw new Error(payload.error?.message ?? `请求失败（HTTP ${response.status}）`);
+    throw new ApiRequestError(
+      response.status,
+      payload.error?.code ?? "request_failed",
+      payload.error?.message ?? `请求失败（HTTP ${response.status}）`,
+    );
   }
   return payload;
 }
 
 export const api = {
   health: () => request<{ status: string }>("/healthz"),
+  authSession: () => request<{ authenticated: boolean; user: AuthUser | null }>("/api/auth/session"),
+  login: (username: string, password: string) =>
+    request<{ user: AuthUser; expiresAt: number }>("/api/auth/login", {
+      method: "POST", body: JSON.stringify({ username, password }),
+    }),
+  logout: () => request<{ status: string }>("/api/auth/logout", { method: "POST" }),
   listInstances: async () => (await request<{ instances: AgentInstance[] }>("/api/instances")).instances,
   createInstance: (id?: string) =>
     request<AgentInstance>("/api/instances", {

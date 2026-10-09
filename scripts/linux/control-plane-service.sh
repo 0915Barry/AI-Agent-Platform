@@ -38,11 +38,31 @@ is_control_plane_process() {
     && tr '\0' ' ' < "/proc/${process_pid}/cmdline" | grep -Fq -- "${server_path}"
 }
 
+find_control_plane_pid() {
+  # 优先使用正常 PID 文件；若之前启动中断导致 PID 文件丢失，则扫描 /proc 找回仍在
+  # 监听的控制面，避免留下无法由 stop 管理的旧版孤儿进程。
+  local process_pid=""
+  if process_pid="$(read_pid 2>/dev/null)" \
+    && kill -0 "${process_pid}" 2>/dev/null \
+    && is_control_plane_process "${process_pid}"; then
+    printf '%s\n' "${process_pid}"
+    return 0
+  fi
+  local process_dir
+  for process_dir in /proc/[0-9]*; do
+    process_pid="${process_dir##*/}"
+    if is_control_plane_process "${process_pid}"; then
+      printf '%s\n' "${process_pid}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 start_service() {
   local existing_pid=""
-  if existing_pid="$(read_pid 2>/dev/null)" \
-    && kill -0 "${existing_pid}" 2>/dev/null \
-    && is_control_plane_process "${existing_pid}"; then
+  if existing_pid="$(find_control_plane_pid 2>/dev/null)"; then
+    printf '%s\n' "${existing_pid}" > "${pid_path}"
     echo "Control plane is already running with PID ${existing_pid}"
     return
   fi
@@ -73,6 +93,7 @@ start_service() {
     --deepseek-credential "${credential_path}" \
     --state-root /var/lib/fc \
     --idle-timeout "${INSTANCE_IDLE_TIMEOUT_SECONDS}" \
+    --require-auth \
     >> "${log_path}" 2>&1 &
   local process_pid=$!
   printf '%s\n' "${process_pid}" > "${pid_path}"
@@ -101,7 +122,8 @@ start_service() {
 
 stop_service() {
   local process_pid=""
-  if ! process_pid="$(read_pid 2>/dev/null)"; then
+  if ! process_pid="$(find_control_plane_pid 2>/dev/null)"; then
+    rm -f "${pid_path}"
     echo "Control plane is not running"
     return
   fi
@@ -129,9 +151,8 @@ stop_service() {
 
 status_service() {
   local process_pid=""
-  if process_pid="$(read_pid 2>/dev/null)" \
-    && kill -0 "${process_pid}" 2>/dev/null \
-    && is_control_plane_process "${process_pid}"; then
+  if process_pid="$(find_control_plane_pid 2>/dev/null)"; then
+    printf '%s\n' "${process_pid}" > "${pid_path}"
     echo "CONTROL_PLANE_SERVICE_STATUS status=running pid=${process_pid} bind=${listen_host}:${listen_port}"
     return
   fi
