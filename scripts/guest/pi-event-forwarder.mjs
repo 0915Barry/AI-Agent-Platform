@@ -3,7 +3,7 @@
  * 在 microVM 内运行一次 Pi JSON 模式，并把结构化增量事件回传给宿主 bridge。
  *
  * 这里刻意不转发 thinking_delta：模型内部思考不属于产品输出。文本增量会按短时间窗
- * 合并，既让页面尽快看到首字，又避免每个 token 都产生一次 HTTP/SQLite 写入。
+ * 合并，既让调试客户端尽快看到首字，又避免每个 token 都产生一次 HTTP/SQLite 写入。
  */
 
 import fs from "node:fs/promises";

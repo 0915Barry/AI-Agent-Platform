@@ -136,7 +136,7 @@ def main() -> None:
                         while True:
                             # DeepSeek 的 Chat Completions 流使用 SSE：每条 data 记录以换行
                             # 结束。按行读取可在单条事件到达时立即转发；read1(8192)
-                            # 可能把首个事件之后的多个 token 合并成一个较大块，页面就会
+                            # 可能把首个事件之后的多个 token 合并成一个较大块，客户端就会
                             # 表现为“先出现一句，随后整段突然完成”。限制单行大小仍保留
                             # 对异常上游的内存边界，超长行会在下一轮继续转发。
                             chunk = response.readline(64 * 1024)

@@ -26,9 +26,6 @@ Commands:
   stop                   Stop the control plane; preserve instance data
   status                 Show whether the control plane is running
   tunnel                Forward local port 18090 to the VM control plane
-  web-install           Install the pinned M12 web dependencies
-  web-build             Type-check and build the M12 web console
-  web-dev               Start the loopback-only M12 web console
   doctor                Check the macOS host
   configure <vm-ip> [vm-user]
                          Save the Linux VM connection settings
@@ -416,15 +413,6 @@ case "${command}" in
     ;;
   tunnel)
     control_plane_tunnel
-    ;;
-  web-install)
-    "${repo_dir}/scripts/common/web.sh" install
-    ;;
-  web-build)
-    "${repo_dir}/scripts/common/web.sh" build
-    ;;
-  web-dev)
-    "${repo_dir}/scripts/common/web.sh" dev
     ;;
   doctor)
     "${repo_dir}/scripts/macos/doctor.sh"

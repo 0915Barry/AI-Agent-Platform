@@ -147,7 +147,7 @@ curl --fail --silent --show-error --max-time 10 \
 instance_created=true
 
 # M17：把自定义 System Prompt 与只读工具模式保存到实例。后面的真实任务只有 read
-# 工具可用，因此同时验证配置从控制面进入 guest Pi，而不是仅停留在页面。
+# 工具可用，因此同时验证配置从控制面进入 guest Pi，而不是仅停留在调用层。
 config_payload="$(jq -n \
   --arg name 'M17 read-only verifier' \
   --arg system 'Follow the user request exactly. You are a read-only verification agent.' \
@@ -234,7 +234,7 @@ printf '%s' "${events_response}" \
       and ($types | index("tool_result")) != null
     ' >/dev/null
 
-# 终态任务也必须能通过 SSE 从序号 0 完整重放后自行关闭；这同时验证浏览器首次连接
+# 终态任务也必须能通过 SSE 从序号 0 完整重放后自行关闭；这同时验证客户端首次连接
 # 和 Last-Event-ID 断线续传所依赖的稳定事件序号。
 sse_response="$(curl --fail --silent --show-error --no-buffer --max-time 10 \
   "${base_url}/api/instances/${instance_id}/tasks/${task_id}/stream")"

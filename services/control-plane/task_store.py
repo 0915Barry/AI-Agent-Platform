@@ -452,7 +452,7 @@ class TaskStore:
     ) -> list[dict[str, Any]]:
         """返回指定序号之后的事件。
 
-        sequence 是 SQLite 自增游标。SSE 断线重连时浏览器会把最后收到的游标放入
+        sequence 是 SQLite 自增游标。SSE 断线重连时客户端会把最后收到的游标放入
         Last-Event-ID，控制面据此只补发遗漏事件，避免重复拼接文本增量。
         """
 

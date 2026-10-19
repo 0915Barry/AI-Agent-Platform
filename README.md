@@ -12,157 +12,40 @@
 - [架构与实现方案汇报](./docs/架构与实现方案汇报.md)
 - [服务器单机 MVP 架构设计图](./docs/服务器单机MVP架构设计图.md)
 
-## 快速开始
+## 技术版说明
 
-首次部署**不需要**从 M0 到 M19 逐项运行。里程碑命令是底层研发、故障定位和
-回归测试入口；首次运行只使用
-`bootstrap → configure-user → configure-deepseek → verify → start`。
+当前分支正在将原有网页MVP收缩为无页面的底层运行平台原型。React/Vite展示层已移除，后续使用终端CLI分别验证实例管理、状态管理和Pi RPC通信。完整网页MVP保留在Git标签`mvp-web-m19`中。
 
-开始前仍需人工创建一台支持嵌套虚拟化的 Ubuntu 24.04 VM：Mac 使用 UTM +
-Apple Virtualization + ARM64 Ubuntu，Windows x86_64 使用 VMware Workstation +
-AMD64 Ubuntu。VM 必须存在可读写的 `/dev/kvm`，并将仓库/镜像放在 Ubuntu 原生
-ext4 磁盘中。这部分涉及宿主 BIOS、公司安全策略和虚拟机安装，仓库不能自动代办。
+在新的终端CLI完成前，仓库仍保留原HTTP控制面和旧Agent Bridge链路，用于底层回归测试；它们不代表最新架构的最终通信方案。
 
-### macOS 首次部署
+## 环境准备
 
-在 Mac 克隆仓库后执行：
+开始前需人工创建一台支持嵌套虚拟化的Ubuntu 24.04 VM：Mac使用UTM + Apple Virtualization + ARM64 Ubuntu，Windows x86_64使用VMware Workstation + AMD64 Ubuntu。VM必须存在可读写的`/dev/kvm`，并将仓库与镜像放在Ubuntu原生ext4磁盘中。
+
+### macOS + UTM
 
 ```bash
 git clone https://github.com/0915Barry/AI-Agent-Platform.git
 cd AI-Agent-Platform
-
-# 首次安装：检查 Mac/UTM/KVM，同步代码，安装 Firecracker 并准备 rootfs
 ./run.sh bootstrap <UTM-Linux-IP> agentdev
-
-# 创建页面登录账户；密码隐藏输入且至少 12 个 UTF-8 字节
-./run.sh configure-user
-
-# 隐藏输入并把 Key 保存到 Ubuntu VM，不写入仓库或 microVM
 ./run.sh configure-deepseek
-
-# 首次部署建议执行一次完整端到端验收
 ./run.sh verify
-
-# 日常开发只启动长期运行的控制面
-./run.sh start
-./run.sh status
 ```
 
-需要使用 Web 管理页面（包含 M13 多轮会话和 M14 工作区文件）时，再开两个 macOS 终端分别运行：
+### Windows + VMware
 
-```bash
-# 终端 2：把只监听 Ubuntu loopback 的控制面安全转发到 Mac
-./run.sh tunnel
-
-# 终端 3：安装依赖（首次）并启动本地页面
-./run.sh web-dev
-```
-
-浏览器打开 `http://127.0.0.1:5173`，使用 `configure-user` 创建的账户登录。结束开发时
-分别按 `Ctrl-C` 停止页面和隧道，再运行 `./run.sh stop`；停止控制面不会删除实例数据盘。
-
-#### macOS 日常开启
-
-`bootstrap`、`configure-user`、`configure-deepseek` 和 `verify` 只需要在首次部署、
-新增本地账户或排查底层问题时运行。
-日常使用先启动 UTM 中的 Ubuntu VM，然后在仓库根目录打开三个终端：
-
-```bash
-# 终端 1：启动 Ubuntu VM 内的长期控制面；命令完成后可以关闭此终端
-./run.sh start
-
-# 终端 2：控制面 SSH 隧道；必须保持运行
-./run.sh tunnel
-
-# 终端 3：前端开发页面；必须保持运行
-./run.sh web-dev
-```
-
-浏览器打开 `http://127.0.0.1:5173` 并登录，在页面中选择实例并点击“启动实例”。
-不需要再单独运行 microVM 脚本；页面的“启动实例”会通过控制面启动 Firecracker。
-
-#### macOS 正常关闭
-
-1. 在页面中点击正在运行实例的“停止”。这会保留会话、工作区文件和数据盘。
-2. 在运行 `web-dev` 的终端按 `Ctrl-C`。
-3. 在运行 `tunnel` 的终端按 `Ctrl-C`。
-4. 在仓库根目录运行 `./run.sh stop`，停止 Ubuntu VM 内的控制面。
-5. 不再使用 Ubuntu 时，可以正常关闭 Ubuntu，再退出 UTM。
-
-不要用页面的“销毁”代替“停止”；“销毁”会删除该实例的数据盘、工作区文件、会话
-和任务记录。
-
-### Windows + VMware 首次部署
-
-在 VMware 的 Ubuntu VM 内克隆仓库并执行：
+在VMware中的Ubuntu VM执行：
 
 ```bash
 git clone https://github.com/0915Barry/AI-Agent-Platform.git
 cd AI-Agent-Platform
-chmod +x run-linux.sh scripts/common/*.sh scripts/linux/*.sh scripts/guest/*.sh
-
+chmod +x run-linux.sh scripts/linux/*.sh scripts/guest/*.sh
 ./run-linux.sh bootstrap
-./run-linux.sh configure-user
 ./run-linux.sh configure-deepseek
 ./run-linux.sh verify
-./run-linux.sh start
-./run-linux.sh status
 ```
 
-需要使用 Web 管理页面（包含 M13 多轮会话和 M14 工作区文件）时，在 Ubuntu VM 再开一个终端运行：
-
-```bash
-./run-linux.sh web-dev
-```
-
-然后在 Windows PowerShell 建立仅本机可见的页面隧道：
-
-```powershell
-ssh -N -L 5173:127.0.0.1:5173 agentdev@<Ubuntu-VM-IP>
-```
-
-Windows 浏览器打开 `http://127.0.0.1:5173`，使用 `configure-user` 创建的账户登录。
-结束开发时按 `Ctrl-C` 停止页面隧道，在 Ubuntu 运行 `./run-linux.sh stop`。不要在
-PowerShell、Git Bash 或 WSL2 中直接执行 `run-linux.sh`。
-
-#### Windows + VMware 日常开启
-
-首次部署完成后，不需要每天重复 `bootstrap`、`configure-user`、
-`configure-deepseek` 或 `verify`。
-先启动 VMware 中的 Ubuntu VM，再按下面方式运行：
-
-```bash
-# Ubuntu 终端 1：启动长期控制面；命令完成后可以关闭此终端
-./run-linux.sh start
-
-# Ubuntu 终端 2：启动前端页面；必须保持运行
-./run-linux.sh web-dev
-```
-
-然后在 Windows PowerShell 中运行并保持该窗口开启：
-
-```powershell
-ssh -N -L 5173:127.0.0.1:5173 agentdev@<Ubuntu-VM-IP>
-```
-
-Windows 浏览器打开 `http://127.0.0.1:5173` 并登录，在页面中选择实例并点击“启动
-实例”。Firecracker 仍运行在 Ubuntu VM 内，Windows 不需要直接执行任何 `.sh` 文件。
-
-#### Windows + VMware 正常关闭
-
-1. 在页面中点击正在运行实例的“停止”，保留会话和工作区数据。
-2. 在 Ubuntu 中运行 `web-dev` 的终端按 `Ctrl-C`。
-3. 在 Windows PowerShell 的 SSH 隧道窗口按 `Ctrl-C`。
-4. 在 Ubuntu 仓库目录运行 `./run-linux.sh stop`，停止控制面。
-5. 不再使用时，正常关闭 Ubuntu VM，再退出 VMware。
-
-同样不要误点“销毁”；只有确定不再需要实例的全部持久化数据时才使用该操作。
-
-`bootstrap` 是一个幂等总入口，内部仍按检查、安装、下载和构建分阶段执行。当前
-仓库尚未发布预构建的 ARM64/AMD64 rootfs，因此每台全新机器第一次仍需完成一次
-本地构建，耗时不会因为合成一个命令而消失；之后构建指纹不变时会直接复用
-`/srv/fc/artifacts/agent-rootfs.ext4`。未来发布经过校验的双架构 runtime bundle 后，
-`bootstrap` 可以改为优先下载，失败时再回退到本地构建。
+`bootstrap`会分阶段完成检查、安装、下载和rootfs构建。新机器首次需要本地构建；构建指纹不变时会复用`/srv/fc/artifacts/agent-rootfs.ext4`。
 
 ## 当前进度
 
@@ -180,10 +63,10 @@ Windows 浏览器打开 `http://127.0.0.1:5173` 并登录，在页面中选择�
 | M9 | Pi Agent → Tool Gateway → DeepSeek 真实联调 | ✅ 已通过 |
 | M10 | HTTP 控制面管理真实 microVM 生命周期 | ✅ 已通过 |
 | M11 | 控制面向 Pi Agent 下发任务并经 DeepSeek 返回结果 | ✅ 已通过 |
-| M12 | React 管理页面操作实例并提交 Agent 任务 | ✅ 已通过 |
+| M12 | React管理页面 | 📦 已归档至`mvp-web-m19` |
 | M13 | 持久化会话、消息历史与受限多轮上下文 | ✅ 已通过 |
 | M14 | 工作区文件上传、列表、预览、下载、目录与持久化 | ✅ 已通过 |
-| M15 | Pi JSONL、Gateway 流式转发、控制面 SSE 与页面增量输出 | ✅ 已通过 |
+| M15 | Pi JSONL、Gateway流式转发与控制面SSE | ✅ 已通过 |
 | M16 | 本地账户登录、HttpOnly 会话、实例归属隔离与每用户配额 | ✅ 已通过 |
 | M17 | 实例级 Agent 名称、System Prompt 与只读/读写工具权限 | ✅ 已通过 |
 | M18 | 仓库审核 Skill 目录、实例动态启停与任务快照注入 | ✅ 已通过 |
@@ -450,7 +333,7 @@ Linux/KVM checks passed
 | Tool Gateway | `./run.sh gateway-smoke-test` | `./run-linux.sh gateway-smoke-test` |
 | 生命周期 | `./run.sh lifecycle-smoke-test` | `./run-linux.sh lifecycle-smoke-test` |
 | 保存 DeepSeek Key | `./run.sh configure-deepseek` | `./run-linux.sh configure-deepseek` |
-| 创建页面账户 | `./run.sh configure-user` | `./run-linux.sh configure-user` |
+| 创建本地测试账户 | `./run.sh configure-user` | `./run-linux.sh configure-user` |
 | 认证与归属 | `./run.sh auth-smoke-test` | `./run-linux.sh auth-smoke-test` |
 | DeepSeek 端到端 | `./run.sh deepseek-e2e-test` | `./run-linux.sh deepseek-e2e-test` |
 | HTTP 控制面 | `./run.sh control-plane-smoke-test` | `./run-linux.sh control-plane-smoke-test` |
@@ -470,9 +353,6 @@ Linux/KVM checks passed
 | `verify` | 运行当前 M19 Agent 任务与 M14 工作区端到端验收；新机器建议执行一次 |
 | `start` / `stop` / `status` | 日常启动、停止和查询长期运行的控制面 |
 | `tunnel`（仅 `run.sh`） | 将 Mac 的 `127.0.0.1:18090` 安全转发到 Ubuntu loopback 控制面 |
-| `web-install` | 安装 lockfile 固定的前端依赖；Linux 自动使用项目固定的 Node.js |
-| `web-build` | 执行 TypeScript 检查并生成生产构建 |
-| `web-dev` | 在 `127.0.0.1:5173` 启动管理页面和控制面反向代理 |
 | `doctor` | 检查当前控制端或 Linux/KVM 环境 |
 | `configure`（仅 `run.sh`） | 保存 Mac 到 UTM Linux 的连接设置 |
 | `sync`（仅 `run.sh`） | 通过 rsync 将源码同步到 UTM Linux |
@@ -487,7 +367,7 @@ Linux/KVM checks passed
 | `gateway-smoke-test` | 验证宿主侧凭据注入、脱敏审计和上游隔离 |
 | `lifecycle-smoke-test` | 以 6 秒测试阈值验证心跳、空闲回收、重启和销毁 |
 | `configure-deepseek` | 隐藏输入并将 API Key 保存到 Linux 用户私有目录 |
-| `configure-user` | 隐藏输入并创建本地页面账户；首个账户接管升级前的无主实例 |
+| `configure-user` | 隐藏输入并创建旧HTTP控制面回归测试账户 |
 | `auth-smoke-test` | 验证密码派生、会话、跨用户隔离和每用户实例配额；不会重建 rootfs |
 | `deepseek-e2e-test` | 让 Pi Agent 经 Tool Gateway 调用 DeepSeek 并执行 `read` 工具 |
 | `control-plane-smoke-test` | 通过 HTTP API 创建、启动、查询、心跳、停止并销毁真实 microVM |
@@ -942,86 +822,14 @@ Gateway 使用 DeepSeek，并能读取 prompt 中未知的工作区随机标记�
 实例后，同一数据盘内容仍然保留，任务事件按 `queued → started → completed` 顺序
 记录，正式空闲回收阈值保持为 5 分钟。
 
-## M12 Web 管理页面
+## 已归档：M12 Web管理页面
 
-M12 在 M10/M11 API 上增加一个 React + TypeScript 页面，代码位于 `apps/web/`。
-它没有绕过现有安全边界：浏览器只连接本机 Vite 代理，代理再访问 loopback 控制面；
-DeepSeek Key 仍只保存在 Ubuntu 宿主的受限文件中，不会进入浏览器、仓库或 microVM。
-
-当前页面支持：
-
-- 查看、创建、启动、停止和显式销毁 Agent 实例；
-- 查看 microVM 进程状态、最后更新时间和 5 分钟空闲回收倒计时；
-- 向运行中的 Pi Agent 提交任务，并通过 SSE 查看阶段、工具调用和增量回答；
-- 清晰显示控制面离线、实例错误和任务失败信息；
-- 窄屏自适应布局，便于演示和后续继续开发。
-
-### macOS 真实链路验收
-
-以下三个命令分别使用三个终端。`start` 返回后不需要保持终端占用：
-
-```bash
-# 终端 1
-./run.sh start
-
-# 终端 2：保持运行
-./run.sh tunnel
-
-# 终端 3：保持运行
-./run.sh web-dev
-```
-
-打开 `http://127.0.0.1:5173`，页面右上角应显示“控制面在线”。随后依次：
-
-1. 创建实例；
-2. 点击“启动实例”，等待状态变为“运行中”；
-3. 输入一个小任务并发送，等待任务显示“已完成”和 DeepSeek 返回内容；
-4. 点击“停止”验证数据保留；仅在确认不再需要数据时点击“销毁”。
-
-前端的独立构建检查可随时运行：
-
-```bash
-./run.sh web-build
-```
-
-### Windows + VMware 真实链路验收
-
-控制面和页面都在 Ubuntu VM 内运行，因此 Vite 代理无需跨虚拟机访问 M10 API：
-
-```bash
-# Ubuntu 终端 1
-./run-linux.sh start
-
-# Ubuntu 终端 2：保持运行
-./run-linux.sh web-dev
-```
-
-在 Windows PowerShell 运行下面的转发，并保持窗口打开：
-
-```powershell
-ssh -N -L 5173:127.0.0.1:5173 agentdev@<Ubuntu-VM-IP>
-```
-
-然后用 Windows 浏览器打开 `http://127.0.0.1:5173`，按与 macOS 相同的四步进行
-验收。Linux 入口会从 rootfs 下载缓存复用固定 Node.js 22.19.0；缓存不存在时会从
-Node.js 官方地址下载并校验 SHA-256，因此不依赖 Ubuntu 自带 Node 版本。
-
-页面仍沿用 M10 的 loopback-only 无认证边界，不得把 5173 或 18090 改为
-`0.0.0.0` 暴露到局域网。用户登录、多租户授权和生产静态部署仍属于后续里程碑，
-不是当前阶段的安全承诺。
-
-### M12 验收结果
-
-已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境中通过页面创建并启动真实
-实例，向 Pi Agent 提交问题，并成功取得 DeepSeek 回答。页面与 API 之间通过 SSH
-loopback 隧道连接，模型凭据仍由宿主 Tool Gateway 隔离。空闲倒计时只把真实任务
-领取、模型请求和事件回传计为活动；guest 对空任务队列的内部轮询不会延长实例寿命。
-已继续等待完整 5 分钟并确认实例自动停止，独立数据盘保持不变，可重新启动恢复工作区。
+M12的React/Vite展示层已从当前技术版分支移除。其完整实现、依赖和验收记录保留在Git标签`mvp-web-m19`中。
 
 ## M13 会话历史与多轮上下文
 
-M13 将 M12 的单次任务界面升级为持久化多轮会话。会话和消息保存在 Ubuntu 宿主的
-`/var/lib/fc/tasks/tasks.db`，不写入浏览器本地存储，也不会进入只读 rootfs。停止、
+M13为旧HTTP控制面增加持久化多轮会话。会话和消息保存在Ubuntu宿主的
+`/var/lib/fc/tasks/tasks.db`，不会进入只读rootfs。停止、
 空闲回收和重新启动 microVM 都会保留历史；显式销毁实例时，会话、消息、任务记录
 和数据盘一起删除。
 
@@ -1040,48 +848,19 @@ Pi 任务。当前最多选择最近 20 条消息，并限制完整上下文为 
 为 16 KiB；达到预算时优先保留较新的消息。该限制防止历史无限增长导致请求延迟、
 Token 成本和模型上下文占用失控。
 
-页面现在支持创建和切换会话、恢复历史消息、显示正在执行的任务，并在刷新浏览器后
-从宿主 SQLite 重新加载记录。Pi 仍以 `--no-session --no-context-files` 运行，因此会话
+调用方可通过HTTP API创建和切换会话、恢复历史消息并查询正在执行的任务。Pi 仍以 `--no-session --no-context-files` 运行，因此会话
 边界、裁剪规则和数据删除语义都由控制面显式管理，不依赖 Pi 内部隐藏状态。
-
-### M13 真实链路验收
-
-M13 修改了控制面 API 和 SQLite 表结构，因此更新代码后需要重启控制面；启动时会
-自动执行幂等数据库迁移，已有 M11/M12 任务记录不会被删除：
-
-```bash
-# macOS 仓库根目录；start 会自动同步最新源码到 Ubuntu VM
-./run.sh stop
-./run.sh start
-
-# Windows 的 Ubuntu VM 仓库目录
-./run-linux.sh stop
-./run-linux.sh start
-```
-
-保持原有 SSH 隧道和 `web-dev` 运行，刷新 `http://127.0.0.1:5173`。在同一个会话
-依次发送：
-
-```text
-请记住我的代号是 Alpha。
-我的代号是什么？
-```
-
-第二次回答应包含 `Alpha`。随后刷新浏览器、停止并重新启动实例，会话列表和消息历史
-仍应存在。新建另一个实例后，不应看到原实例的任何会话。
 
 ### M13 验收结果
 
 已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境中完成真实验收：同一会话的
-第二轮问题能够使用首轮内容，刷新浏览器后消息历史仍然存在，停止并重新启动实例后
+第二轮问题能够使用首轮内容，停止并重新启动实例后
 会话与消息继续保留。控制面使用宿主 SQLite 管理显式上下文，DeepSeek 凭据仍只由
 Tool Gateway 持有，M13 没有引入向量数据库或改变现有 microVM 隔离边界。
 
 ## M14 工作区文件管理
 
-M14 在管理页面增加“文件”视图，可以浏览 `/workspace`、新建文件夹、上传、预览、
-下载和删除文件。上传与读取的单文件上限均为 5 MiB；页面只直接预览 UTF-8 文本，
-其他格式仍可下载。文件保存在实例独立的 ext4 数据盘中，因此停止、空闲回收和重启
+M14提供受限的`/workspace`文件操作通道，支持列表、新建目录、写入、读取和删除。单文件上限为5 MiB。文件保存在实例独立的ext4数据盘中，因此停止、空闲回收和重启
 实例后仍会保留；显式“销毁”实例才会删除该数据盘。
 
 控制面不会在 microVM 运行时二次挂载 ext4。它把操作写入宿主 SQLite 队列，由
@@ -1121,15 +900,13 @@ WORKSPACE_READY scope=/workspace max_file=5MiB traversal=denied symlinks=denied 
 
 验收脚本会在真实 microVM 内完成目录创建、文件写入、列表、读取、路径穿越拒绝，
 然后停止并重启实例，确认随机文件内容仍然存在，最后清理专用的 `m14-smoke` 实例。
-日常使用时只需按快速开始启动控制面、隧道和页面，不需要重复运行验收命令。
 
 ### M14 验收结果
 
 已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境中通过真实验收：文件
 通道的 guest Worker 能在 `/workspace` 内完成目录与文件操作，路径穿越被拒绝，
 文件经强制落盘后在停止并重启 microVM 后仍保持原内容。模型 API Key 没有进入
-microVM，宿主也没有在实例运行时并发挂载数据盘。Web 页面已完成文件夹创建、文件
-上传与预览测试；Pi Agent 能通过 `read` 工具读取页面上传到同一工作区的 RTF 文件，
+microVM，宿主也没有在实例运行时并发挂载数据盘。Pi Agent能通过 `read` 工具读取同一工作区的 RTF 文件，
 并正确提取其中的可见文本。停止并重启实例后，工作区文件仍然存在。
 
 ## M15 流式任务体验
@@ -1143,17 +920,13 @@ DeepSeek SSE
   → microVM 事件适配器（文本短批次、工具阶段；不外发 thinking）
   → Agent Bridge / SQLite 有序事件
   → 控制面 SSE（Last-Event-ID 断线续传）
-  → React 页面
 ```
 
-页面在任务运行时会显示排队、领取、模型生成、重试、工具执行等阶段，回答文本随
-事件增长，并显示从任务创建开始的耗时。用户主动向上滚动查看历史时，流式更新不会
-抢走滚动位置。最终回答仍只在 `completed` 后写入 M13 消息表，因此刷新页面后以宿主
-SQLite 中的权威消息为准。
+调试客户端可按顺序观察排队、领取、模型生成、重试和工具执行事件。最终回答仍只在`completed`后写入M13消息表，宿主SQLite中的记录为权威结果。
 
-安全边界没有改变：浏览器和控制面仍仅通过 loopback/SSH 隧道访问；真实 DeepSeek
+安全边界没有改变：控制面仍仅通过loopback/SSH隧道访问；真实 DeepSeek
 Key 仍是权限 `0400` 的 Ubuntu 宿主文件；microVM 只持有占位值。`thinking_delta`
-不会进入任务数据库或页面，工具结果只保存最多 2000 字符的预览。
+不会进入任务数据库或对外事件流，工具结果只保存最多 2000 字符的预览。
 
 M15 修改了 guest Worker，因此第一次验收会重建一次 rootfs；构建指纹不变后继续
 复用。已经配置 DeepSeek 的环境运行：
@@ -1188,15 +961,11 @@ AGENT_TASK_READY transport=sse events=incremental gateway=streaming persistence=
 M15_STREAMING_READY pi=jsonl control_plane=sse reconnect=last-event-id tools=visible thinking=hidden
 ```
 
-本地自动测试、前端构建和真实 KVM 后端链路均已通过。管理页面也已完成实际验收：
-回答会在任务结束前逐步出现，阶段、工具名称和耗时正常显示；对于上游一次送达的较大
-文本块，页面使用自适应缓冲按约 40 帧/秒平滑呈现，并在缓冲内容显示完后再切换到
-SQLite 中的最终消息。日常使用不需要重复运行 smoke test。
+本地自动测试和真实KVM后端链路均已通过：文本增量、阶段事件、工具名称和耗时均能通过SSE观察。
 
 ## M16 本地账户、实例归属与配额
 
-M16 给此前仅靠 loopback/SSH 隧道保护的管理页面增加应用层登录。账户由 Ubuntu
-管理员显式创建，不开放网页注册：
+M16给此前仅靠loopback/SSH隧道保护的旧HTTP控制面增加应用层认证。账户由Ubuntu管理员显式创建：
 
 ```bash
 # macOS 仓库根目录
@@ -1208,12 +977,11 @@ M16 给此前仅靠 loopback/SSH 隧道保护的管理页面增加应用层登�
 
 用户名为 3–32 位小写字母、数字、点、下划线或连字符；密码为 12–256 个 UTF-8
 字节，输入过程不回显。密码使用独立随机盐和 PBKDF2-SHA256（600,000 次）保存，
-不会写入 `.env`、Git、浏览器存储或 microVM。首次创建的账户会接管 M16 升级前已有
+不会写入 `.env`、Git、客户端存储或 microVM。首次创建的账户会接管 M16 升级前已有
 但尚无属主的实例，原来的数据盘、会话和工作区不会因此删除。
 
-浏览器登录后获得 12 小时随机会话。Cookie 使用 `HttpOnly` 与 `SameSite=Strict`；
-SQLite 只保存令牌的 SHA-256 摘要。退出登录会立即撤销该会话。由于开发页面当前经
-本机 HTTP 和 SSH 隧道访问，Cookie 暂未设置 `Secure`；部署到带 TLS 的真实服务器时
+认证成功后可获得12小时随机会话。Cookie使用`HttpOnly`与`SameSite=Strict`；
+SQLite只保存令牌的SHA-256摘要。退出会立即撤销该会话。部署到带TLS的真实服务器时
 必须启用 `Secure`，并改接企业 SSO/OIDC，而不是把这套本地账户当作生产身份系统。
 
 每个实例记录自己的 `owner_id`。实例、会话、消息、任务流和工作区路由都会先验证
@@ -1239,22 +1007,17 @@ PASS: local authentication, session, ownership, and quota checks passed
 M16_AUTH_READY password=pbkdf2-sha256 session=httponly:12h ownership=isolated quota=5:2 bind=loopback
 ```
 
-升级当前开发环境时，先执行一次 `configure-user`，再运行 `stop`、`start` 让长期控制
-面启用认证。随后打开页面，依次验证正确密码可登录、错误密码被拒绝、刷新页面会话
-仍有效，以及点击“退出”后无法再看到实例。
+旧控制面的认证、会话撤销、跨用户404隔离和配额由`auth-smoke-test`回归验证。
 
 ### M16 实测结果
 
 已在当前 Apple M4、UTM Ubuntu ARM64 环境完成升级验收：旧版控制面被安全停止，首个
-本地账户创建成功，长期控制面以强制认证模式启动，页面能够使用新账户登录并正常访问
-原有实例。认证、会话撤销、跨用户 404 隔离和配额的 18 项自动测试及前端生产构建均
-已通过。服务脚本还会在 PID 文件丢失时从 `/proc` 找回旧控制面进程，避免升级过程中
+本地账户创建成功，长期控制面以强制认证模式启动。认证、会话撤销、跨用户404隔离和配额的18项自动测试已通过。服务脚本还会在PID文件丢失时从`/proc`找回旧控制面进程，避免升级过程中
 遗留无法停止的孤儿服务。
 
 ## M17 自定义 Agent 配置
 
-M17 第一版把每个实例变成可独立配置的 Agent。登录后选择实例，打开“配置”页即可
-修改 Agent 名称、System Prompt 和工具权限。模型仍固定为已经验收的 DeepSeek，避免
+M17第一版为每个实例增加独立的Agent名称、System Prompt和工具权限配置。模型仍固定为已经验收的DeepSeek，避免
 在同一里程碑同时扩大供应商和密钥管理范围。
 
 工具权限只允许两个由平台定义的安全集合：
@@ -1262,7 +1025,7 @@ M17 第一版把每个实例变成可独立配置的 Agent。登录后选择实�
 - 只读文件：Pi 只获得 `read`；
 - 读写文件：Pi 获得 `read,write`。
 
-页面不能开放 `bash`、关闭 jailer、改变网络策略、读取宿主凭据或挂载任意目录。
+配置入口不能开放 `bash`、关闭 jailer、改变网络策略、读取宿主凭据或挂载任意目录。
 System Prompt 最大 8 KiB，任务创建时连同工具模式写入不可变任务快照；因此任务排队
 后再修改实例配置，不会在执行中途改变旧任务的行为。guest 适配器通过 Pi 1.0.0 的
 正式 `--system-prompt` 参数传入系统指令，并用 `--tools` 设置精确工具白名单。
@@ -1284,25 +1047,22 @@ Pi 使用唯一允许的 `read` 工具读取随机文件。成功时除 M15 标�
 M17_AGENT_CONFIG_READY system_prompt=custom tools=read_only task_snapshot=verified
 ```
 
-后端和页面代码已经通过自动测试与生产构建。可复用的跨实例模板、Skill 与 MCP 动态
-挂载不属于本里程碑。
+后端代码已经通过自动测试。可复用的跨实例模板、Skill与MCP动态挂载不属于本里程碑。
 
 ### M17 实测结果
 
 已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境完成真实验收：控制面保存了
 自定义名称、System Prompt 和只读工具模式；任务以不可变快照进入 microVM；Pi 通过
 正式系统提示参数和唯一允许的 `read` 工具完成 DeepSeek 任务，并输出
-`M17_AGENT_CONFIG_READY`。页面也已验证配置保存及自定义角色回答正常。19 项控制面
-自动测试与前端生产构建全部通过。
+`M17_AGENT_CONFIG_READY`。控制面自动测试全部通过。
 
 ## M18 动态 Skill 管理
 
-M18 第一版提供由仓库审核的指令型 Skill 目录。页面“配置”中可以为每个实例独立启用
-“代码审查”和“文档总结”；选择结果保存在实例记录中，并在创建任务时连同 Skill
+M18第一版提供由仓库审核的指令型Skill目录。每个实例可独立启用“代码审查”和“文档总结”；选择结果保存在实例记录中，并在创建任务时连同Skill
 正文写入不可变快照。guest 会为本次任务创建临时 Skill 目录，通过 Pi 1.0.0 的正式
 `--skill` 参数显式加载，任务结束后立即清理。
 
-这一版不接受页面上传任意 Skill，也不允许 Skill 携带脚本、密钥或新的工具权限。
+这一版不接受任意Skill上传，也不允许Skill携带脚本、密钥或新的工具权限。
 Skill 只能补充模型工作流程，实际能力仍受 M17 的 `read` 或 `read,write` 白名单、
 microVM、jailer 和网络策略限制。新增 Skill 必须作为仓库文件经过代码审查；实例启停
 已有 Skill 不需要重建 rootfs。
@@ -1324,33 +1084,30 @@ Skill，并使用只读工具读取随机文件。成功标志：
 M18_SKILLS_READY source=reviewed-catalog selection=dynamic snapshot=verified pi=explicit-skill
 ```
 
-页面验收时，在实例“配置”中勾选“文档总结”并保存，刷新后确认仍勾选，再让 Agent
-总结工作区中的文档。可执行 Skill 和用户上传 Skill 仍属于后续安全评审范围。
+可执行Skill和用户上传Skill仍属于后续安全评审范围。
 
 ### M18 实测结果
 
 已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境通过真实验收：内部验收 Skill
 经任务快照和 Pi `--skill` 参数进入 microVM，使用唯一允许的 `read` 工具读取随机
-文件并输出 `M18_SKILLS_READY`；页面启用“文档总结”后，刷新仍保留选择，并成功读取
-工作区真实文件生成摘要。测试也确认缺失文件时 Skill 会报告 `ENOENT` 而不会编造内容。
-同时修复了切换实例时旧会话请求晚返回导致的 `conversation not found` 红色误报警。
+文件并输出 `M18_SKILLS_READY`。测试也确认缺失文件时Skill会报告`ENOENT`而不会编造内容。
 
 ## M19 MCP 安全接入
 
 M19 第一版把 MCP 作为“Agent 调用宿主受控能力”的标准协议层，而不是允许用户上传
-任意 MCP 服务器。页面“配置”只展示仓库审核目录中的“平台验收记录”；选择会保存到
+任意MCP服务器。配置入口只接受仓库审核目录中的“平台验收记录”；选择会保存到
 实例，并在任务创建时冻结为不可变快照。没有选中的任务不会加载 MCP 扩展。
 
 实例启动时，Ubuntu 宿主会以 `agent-gateway` 低权限账户额外启动一个实例专属 MCP
 Gateway。microVM 只能通过自己的 TAP 网络访问该实例的 18084 端口，并使用每次启动
 随机生成的一次性访问令牌。宿主数据文件权限为 `0400`，不会进入 rootfs、数据盘、
-任务 SQLite 或页面；MCP 审计只记录实例、工具、记录 ID 和结果状态，不记录认证头或
+任务 SQLite 或对外事件；MCP 审计只记录实例、工具、记录 ID 和结果状态，不记录认证头或
 工具返回正文。
 
 Pi Agent 1.0.0 使用其内置 `builtin:mcp` 扩展和 Streamable HTTP 协议。guest 为每项
 任务生成临时 `~/.pi/agent/mcp.json`，只包含控制面下发的白名单服务器，任务结束后
 删除。第一版只提供只读、幂等、无开放网络语义的 `get_verification_record` 工具，
-不允许页面提交 URL、stdio 命令、环境变量或真实数据库凭据。
+不允许调用方提交 URL、stdio 命令、环境变量或真实数据库凭据。
 
 真实链路验收：
 

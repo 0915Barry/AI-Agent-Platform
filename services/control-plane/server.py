@@ -785,7 +785,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self.control.store.assert_owner(instance_id, user["id"])
 
     def stream_task_events(self, instance_id: str, task_id: str, after_sequence: int) -> None:
-        """以 SSE 推送有序任务事件，并支持浏览器 Last-Event-ID 自动续传。
+        """以 SSE 推送有序任务事件，并支持客户端 Last-Event-ID 续传。
 
         控制面仍只绑定 loopback。这里不发送提示词、模型密钥或 Gateway 审计内容；
         只转发 TaskStore 已接受的脱敏运行事件。终态事件发出后主动结束连接。

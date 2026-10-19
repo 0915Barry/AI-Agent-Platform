@@ -15,9 +15,6 @@ Commands:
   start                 Start the long-running loopback control plane
   stop                  Stop the control plane; preserve instance data
   status                Show whether the control plane is running
-  web-install           Install pinned Node.js and M12 web dependencies
-  web-build             Type-check and build the M12 web console
-  web-dev               Start the loopback-only M12 web console
   doctor                Check Linux, architecture, and /dev/kvm
   install-firecracker   Install the pinned Firecracker version
   prepare-microvm       Download verified artifacts for this CPU architecture
@@ -82,15 +79,6 @@ case "${command}" in
     ;;
   status)
     sudo "${repo_dir}/scripts/linux/control-plane-service.sh" status
-    ;;
-  web-install)
-    "${repo_dir}/scripts/common/web.sh" install
-    ;;
-  web-build)
-    "${repo_dir}/scripts/common/web.sh" build
-    ;;
-  web-dev)
-    "${repo_dir}/scripts/common/web.sh" dev
     ;;
   doctor)
     "${repo_dir}/scripts/linux/doctor.sh"
