@@ -113,6 +113,12 @@ class AgentCtlTests(unittest.TestCase):
         self.assertEqual(payload["user"]["username"], "demo")
         self.assertEqual(cli.extract_cookie(headers), "aap_session=test-token")
 
+    def test_help_explains_required_identifiers_and_examples(self) -> None:
+        help_text = cli.build_parser().format_help()
+        self.assertIn("start <实例ID>", help_text)
+        self.assertIn("CONVERSATION_ID 可通过 conversations 命令查询", help_text)
+        self.assertIn("./agentctl chat cli-demo", help_text)
+
     def test_sse_events_are_decoded(self) -> None:
         events = list(cli.ApiClient(self.base_url, "aap_session=test-token").events("/stream"))
         self.assertEqual(events[0]["data"]["delta"], "你好")

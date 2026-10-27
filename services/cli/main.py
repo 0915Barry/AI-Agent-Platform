@@ -476,8 +476,43 @@ def command_chat(args: argparse.Namespace, store: SessionStore, console: Console
         render_task_events(client, args.instance_id, task["id"], console)
 
 
+def message_limit(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("必须是整数") from error
+    if parsed < 1 or parsed > 100:
+        raise argparse.ArgumentTypeError("必须在 1 到 100 之间")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agentctl", description="AI Agent Platform 终端客户端")
+    parser = argparse.ArgumentParser(
+        prog="agentctl",
+        description=(
+            "AI Agent Platform 终端客户端。\n"
+            "INSTANCE_ID 是 create 时指定或系统生成的实例 ID；\n"
+            "CONVERSATION_ID 可通过 conversations 命令查询。"
+        ),
+        epilog=(
+            "常用流程：\n"
+            "  ./agentctl login <用户名>\n"
+            "  ./agentctl create <实例ID>\n"
+            "  ./agentctl start <实例ID>\n"
+            "  ./agentctl status <实例ID>\n"
+            "  ./agentctl chat <实例ID>\n"
+            "  ./agentctl conversations <实例ID>\n"
+            "  ./agentctl history <实例ID> <会话ID>\n"
+            "  ./agentctl chat <实例ID> --conversation <会话ID>\n"
+            "  ./agentctl stop <实例ID>\n"
+            "  ./agentctl destroy <实例ID>\n\n"
+            "示例：\n"
+            "  ./agentctl create cli-demo\n"
+            "  ./agentctl start cli-demo\n"
+            "  ./agentctl chat cli-demo"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--base-url",
         default=os.environ.get("AAP_BASE_URL", DEFAULT_BASE_URL),
@@ -485,39 +520,105 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--state-file", type=Path, default=default_state_path())
     parser.add_argument("--no-color", action="store_true", help="关闭 ANSI 颜色")
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(
+        dest="command", required=True, title="命令", metavar="COMMAND"
+    )
 
-    login = commands.add_parser("login", help="登录并保存本地会话")
-    login.add_argument("username", nargs="?")
-    commands.add_parser("logout", help="撤销并删除本地会话")
+    login = commands.add_parser(
+        "login",
+        help="登录平台：login [USERNAME]",
+        description="登录 Control Plane，并以 0600 权限在本机保存短期会话 Cookie。",
+        epilog="示例：./agentctl login barry-dev",
+    )
+    login.add_argument("username", nargs="?", metavar="USERNAME", help="平台用户名；省略时交互输入")
+    commands.add_parser(
+        "logout",
+        help="退出平台：logout",
+        description="撤销服务端会话并删除本机保存的 Cookie。",
+    )
 
-    create = commands.add_parser("create", help="创建逻辑实例")
-    create.add_argument("instance_id", nargs="?")
-    start = commands.add_parser("start", help="启动 microVM")
-    start.add_argument("instance_id")
-    status_parser = commands.add_parser("status", help="查看一个或全部实例")
-    status_parser.add_argument("instance_id", nargs="?")
-    conversations = commands.add_parser("conversations", help="列出实例的历史会话")
-    conversations.add_argument("instance_id")
-    history = commands.add_parser("history", help="分页查看会话消息")
-    history.add_argument("instance_id")
-    history.add_argument("conversation_id")
-    history.add_argument("--limit", type=int, choices=range(1, 101), default=20)
-    history.add_argument("--before", type=int, help="读取该消息序号之前的一页")
-    chat = commands.add_parser("chat", help="进入流式对话")
-    chat.add_argument("instance_id")
-    chat.add_argument("--conversation", help="继续已有会话 ID")
+    create = commands.add_parser(
+        "create",
+        help="创建实例记录：create [INSTANCE_ID]",
+        description="创建属于当前用户的逻辑实例；此时不会启动 microVM。",
+        epilog="示例：./agentctl create cli-demo",
+    )
+    create.add_argument(
+        "instance_id", nargs="?", metavar="INSTANCE_ID", help="实例 ID；省略时由平台自动生成"
+    )
+    start = commands.add_parser(
+        "start",
+        help="启动实例：start INSTANCE_ID",
+        description="为指定实例准备数据盘和网络，并启动 Firecracker microVM。",
+        epilog="示例：./agentctl start cli-demo",
+    )
+    start.add_argument("instance_id", metavar="INSTANCE_ID", help="要启动的实例 ID")
+    status_parser = commands.add_parser(
+        "status",
+        help="查看状态：status [INSTANCE_ID]",
+        description="查看指定实例；省略 INSTANCE_ID 时列出当前用户的全部实例。",
+        epilog="示例：./agentctl status cli-demo\n      ./agentctl status",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    status_parser.add_argument(
+        "instance_id", nargs="?", metavar="INSTANCE_ID", help="可选的实例 ID"
+    )
+    conversations = commands.add_parser(
+        "conversations",
+        help="列出会话：conversations INSTANCE_ID",
+        description="列出指定实例的会话 ID、标题、更新时间和消息预览。",
+        epilog="示例：./agentctl conversations cli-demo",
+    )
+    conversations.add_argument("instance_id", metavar="INSTANCE_ID", help="实例 ID")
+    history = commands.add_parser(
+        "history",
+        help="查看历史：history INSTANCE_ID CONVERSATION_ID",
+        description="分页查看指定实例、指定会话的历史消息。",
+        epilog=(
+            "示例：./agentctl history cli-demo conversation-1234\n"
+            "      ./agentctl history cli-demo conversation-1234 --limit 50 --before 120"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    history.add_argument("instance_id", metavar="INSTANCE_ID", help="实例 ID")
+    history.add_argument("conversation_id", metavar="CONVERSATION_ID", help="会话 ID")
+    history.add_argument(
+        "--limit", type=message_limit, default=20, metavar="COUNT", help="本页消息数，1-100（默认 20）"
+    )
+    history.add_argument("--before", type=int, metavar="SEQUENCE", help="读取该消息序号之前的一页")
+    chat = commands.add_parser(
+        "chat",
+        help="进入对话：chat INSTANCE_ID [--conversation ID]",
+        description="与运行中的实例进行流式对话；未指定会话时创建新会话。",
+        epilog=(
+            "示例：./agentctl chat cli-demo\n"
+            "      ./agentctl chat cli-demo --conversation conversation-1234\n"
+            "对话中输入 /exit 或 /quit 返回终端，不会停止实例。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    chat.add_argument("instance_id", metavar="INSTANCE_ID", help="必须处于 running 状态的实例 ID")
+    chat.add_argument("--conversation", metavar="CONVERSATION_ID", help="继续已有会话 ID")
     chat.add_argument(
         "--history-limit",
-        type=int,
-        choices=range(1, 101),
+        type=message_limit,
         default=10,
         help="继续会话时展示的最近消息数（默认 10）",
     )
-    stop = commands.add_parser("stop", help="停止实例并保留数据")
-    stop.add_argument("instance_id")
-    destroy = commands.add_parser("destroy", help="永久删除实例和关联数据")
-    destroy.add_argument("instance_id")
+    stop = commands.add_parser(
+        "stop",
+        help="停止实例：stop INSTANCE_ID",
+        description="停止 microVM 并释放临时网络资源，但保留数据盘、任务和会话。",
+        epilog="示例：./agentctl stop cli-demo",
+    )
+    stop.add_argument("instance_id", metavar="INSTANCE_ID", help="要停止的实例 ID")
+    destroy = commands.add_parser(
+        "destroy",
+        help="销毁实例：destroy INSTANCE_ID",
+        description="永久删除实例、数据盘以及关联任务和会话；默认要求二次确认。",
+        epilog="示例：./agentctl destroy cli-demo",
+    )
+    destroy.add_argument("instance_id", metavar="INSTANCE_ID", help="要永久销毁的实例 ID")
     destroy.add_argument("--yes", action="store_true", help="跳过实例 ID 二次确认")
     return parser
 
