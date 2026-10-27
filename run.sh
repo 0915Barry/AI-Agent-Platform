@@ -52,6 +52,7 @@ Commands:
                          Control a real microVM through the HTTP API
   agent-task-smoke-test  Verify host Pi Gateway with a real DeepSeek task
   cli-smoke-test         Verify authenticated agentctl lifecycle and resumed chat
+  recovery-smoke-test    Verify Control Plane restart and Firecracker crash recovery
   control-plane-start    Start the loopback-only API in the Linux VM
   control-plane-stop     Stop the API; running instances remain managed
   control-plane-status   Show whether the API service is running
@@ -376,6 +377,18 @@ smoke_test_cli() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/cli-smoke-test.sh'"
 }
 
+smoke_test_recovery() {
+  sync_repo
+  echo "Building and testing instance recovery in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/recovery-smoke-test.sh'"
+}
+
 control_plane_service() {
   action="$1"
   sync_repo
@@ -490,6 +503,9 @@ case "${command}" in
     ;;
   cli-smoke-test)
     smoke_test_cli
+    ;;
+  recovery-smoke-test)
+    smoke_test_recovery
     ;;
   control-plane-start)
     control_plane_service start

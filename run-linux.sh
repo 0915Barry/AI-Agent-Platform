@@ -37,6 +37,7 @@ Commands:
                         Control a real microVM through the HTTP API
   agent-task-smoke-test Verify host Pi Gateway with a real DeepSeek task
   cli-smoke-test        Verify the authenticated agentctl lifecycle and resumed chat
+  recovery-smoke-test   Verify Control Plane restart and Firecracker crash recovery
   control-plane-start   Start the loopback-only HTTP API
   control-plane-stop    Stop the API; running instances remain managed
   control-plane-status  Show whether the API service is running
@@ -146,6 +147,10 @@ case "${command}" in
   cli-smoke-test)
     build_rootfs
     sudo "${repo_dir}/scripts/linux/cli-smoke-test.sh"
+    ;;
+  recovery-smoke-test)
+    build_rootfs
+    sudo "${repo_dir}/scripts/linux/recovery-smoke-test.sh"
     ;;
   control-plane-start)
     build_rootfs
