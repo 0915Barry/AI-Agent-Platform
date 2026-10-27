@@ -58,10 +58,8 @@ network_test="$(cmdline_value agent_network_test || true)"
 gateway_test="$(cmdline_value agent_gateway_test || true)"
 deepseek_e2e_test="$(cmdline_value agent_deepseek_e2e_test || true)"
 managed_runtime="$(cmdline_value agent_managed_runtime || true)"
-lab_mode="$(cmdline_value agent_lab || true)"
 if [[ "${network_test}" == "1" || "${gateway_test}" == "1" \
-  || "${deepseek_e2e_test}" == "1" || "${managed_runtime}" == "1" \
-  || "${lab_mode}" == "1" ]]; then
+  || "${deepseek_e2e_test}" == "1" || "${managed_runtime}" == "1" ]]; then
   guest_ip_cidr="$(cmdline_value agent_ip)"
   guest_gateway="$(cmdline_value agent_gateway)"
   guest_dns="$(cmdline_value agent_dns)"
@@ -184,24 +182,7 @@ runuser -u pi -- sh -c \
 echo "AGENT_RUNTIME_READY node=${node_version} pi=${pi_version} uid=${pi_uid}"
 echo "AGENT_SECURITY_READY runtime_owner=${node_owner} shadow=denied runtime_write=denied workspace_write=allowed"
 
-# 实验分支只额外输出 Guest 诊断信息。Pi RPC 监听器已经是正式受管实例和
-# 教学实例共同使用的 Guest 能力，不再依赖 agent_lab 标志。
-if [[ "${lab_mode}" == "1" ]]; then
-  echo "MICROVM_LAB_READY hostname=$(hostname) pid=$$"
-  echo "--- LAB: kernel command line ---"
-  cat /proc/cmdline
-  echo "--- LAB: block devices ---"
-  lsblk -o NAME,MAJ:MIN,SIZE,RO,TYPE,FSTYPE,MOUNTPOINTS
-  echo "--- LAB: mounted filesystems ---"
-  findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS
-  echo "--- LAB: processes ---"
-  ps -eo pid,ppid,user,comm,args
-  echo "--- LAB: identity ---"
-  id pi
-  echo "MICROVM_LAB_INSPECTION_READY"
-fi
-
-if [[ "${lab_mode}" == "1" || "${managed_runtime}" == "1" ]]; then
+if [[ "${managed_runtime}" == "1" ]]; then
   rpc_port="$(cmdline_value agent_rpc_port)"
   rpc_bind_ip="${guest_ip_cidr%/*}"
   rpc_provider="$(cmdline_value agent_rpc_provider || true)"

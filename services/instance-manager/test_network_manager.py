@@ -2,16 +2,12 @@
 """NetworkManager 的纯本地单元测试，不创建真实 TAP 或 nftables 规则。"""
 
 import json
-import io
 import stat
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from contextlib import redirect_stdout
-from unittest.mock import patch
 
-import lab_network
 from network_manager import FileLeaseStore, LinuxNetworkDriver, NetworkManager
 
 
@@ -88,8 +84,8 @@ class NetworkManagerTests(unittest.TestCase):
         self.assertEqual(second["subnet"], "172.29.0.8/30")
         self.assertNotEqual(first["tap"], second["tap"])
 
-    def test_lab_replies_are_opt_in_and_forwarding_stays_blocked(self) -> None:
-        lease = self.manager.allocate("microvm-lab")
+    def test_host_rpc_replies_are_opt_in_and_forwarding_stays_blocked(self) -> None:
+        lease = self.manager.allocate("agent-rpc")
         default_rules = self.manager.network._build_firewall_rules(lease, (18082,))
         self.assertNotIn("ct state established,related", default_rules)
         driver = LinuxNetworkDriver(self.runner, allow_host_connections=True)
@@ -103,32 +99,6 @@ class NetworkManagerTests(unittest.TestCase):
         self.assertLess(rules.index(reply), rules.index(drop))
         self.assertIn(f'iifname "{lease["tap"]}" counter drop', rules)
         self.assertIn(f'oifname "{lease["tap"]}" counter drop', rules)
-
-    def test_lab_command_prepares_reads_activates_and_releases(self) -> None:
-        def command(action):
-            arguments = ["lab_network.py", action, "--lease-path", str(self.lease_path)]
-            if action == "prepare":
-                arguments.extend(["--uid", "999"])
-            output = io.StringIO()
-            with patch("sys.argv", arguments), patch(
-                "lab_network.NetworkManager", return_value=self.manager
-            ), redirect_stdout(output):
-                lab_network.main()
-            return output.getvalue()
-
-        prepared = command("prepare")
-        self.assertEqual(len(prepared.strip().split("\t")), 8)
-        self.assertEqual(command("get"), prepared)
-        command("activate")
-        self.assertEqual(self.store.get("microvm-lab")["status"], "active")
-        # 模拟 lab 已退出但尚未清理，重启时先清理旧租约再分配。
-        self.assertEqual(command("prepare"), prepared)
-        command("release")
-        command("release")
-        self.assertEqual(self.store.list(), [])
-        self.assertEqual(self.runner.links, set())
-        self.assertEqual(self.runner.tables, set())
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,10 +15,6 @@ Commands:
   start                 Start the long-running loopback control plane
   stop                  Stop the control plane; preserve instance data
   status                Show whether the control plane is running
-  lab-start             Start a long-running two-disk learning microVM
-  lab-status            Show the laboratory process, paths, and drives
-  lab-inspect           Show disk and process data reported by the Guest
-  lab-stop              Stop the laboratory microVM; preserve its data disk
   doctor                Check Linux, architecture, and /dev/kvm
   install-firecracker   Install the pinned Firecracker version
   prepare-microvm       Download verified artifacts for this CPU architecture
@@ -79,19 +75,6 @@ case "${command}" in
     ;;
   status)
     sudo "${repo_dir}/scripts/linux/control-plane-service.sh" status
-    ;;
-  lab-start)
-    build_rootfs
-    sudo "${repo_dir}/scripts/linux/microvm-lab.sh" start
-    ;;
-  lab-status)
-    sudo "${repo_dir}/scripts/linux/microvm-lab.sh" status
-    ;;
-  lab-inspect)
-    sudo "${repo_dir}/scripts/linux/microvm-lab.sh" inspect
-    ;;
-  lab-stop)
-    sudo "${repo_dir}/scripts/linux/microvm-lab.sh" stop
     ;;
   doctor)
     "${repo_dir}/scripts/linux/doctor.sh"

@@ -25,10 +25,6 @@ Commands:
   start                  Start the long-running loopback control plane
   stop                   Stop the control plane; preserve instance data
   status                 Show whether the control plane is running
-  lab-start              Start a long-running two-disk learning microVM
-  lab-status             Show the laboratory process, paths, and drives
-  lab-inspect            Show disk and process data reported by the Guest
-  lab-stop               Stop the laboratory microVM; preserve its data disk
   tunnel                Forward local port 18090 to the VM control plane
   doctor                Check the macOS host
   configure <vm-ip> [vm-user]
@@ -394,23 +390,6 @@ control_plane_tunnel() {
     "${VM_USER}@${VM_HOST}"
 }
 
-microvm_lab() {
-  action="$1"
-  require_vm_host
-  if [[ "${action}" == "start" ]]; then
-    sync_repo
-    remote_command="sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/microvm-lab.sh' start"
-  else
-    remote_command="sudo '${REMOTE_DIR}/scripts/linux/microvm-lab.sh' '${action}'"
-  fi
-  ssh \
-    -o ConnectTimeout=10 \
-    -o ConnectionAttempts=1 \
-    -o ServerAliveInterval=5 \
-    -o ServerAliveCountMax=2 \
-    -t "${VM_USER}@${VM_HOST}" "${remote_command}"
-}
-
 command="${1:-}"
 case "${command}" in
   bootstrap)
@@ -429,18 +408,6 @@ case "${command}" in
     ;;
   status)
     control_plane_service status
-    ;;
-  lab-start)
-    microvm_lab start
-    ;;
-  lab-status)
-    microvm_lab status
-    ;;
-  lab-inspect)
-    microvm_lab inspect
-    ;;
-  lab-stop)
-    microvm_lab stop
     ;;
   tunnel)
     control_plane_tunnel

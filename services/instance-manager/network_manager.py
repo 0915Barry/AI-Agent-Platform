@@ -362,7 +362,7 @@ class LinuxNetworkDriver:
             raise NetworkFailure("allowed host ports must contain valid TCP ports")
 
         port_set = ", ".join(str(port) for port in ports)
-        # 教学 lab 允许宿主机直接连接 Guest RPC，需要接收该连接的响应。
+        # Host Pi Gateway 主动连接 Guest RPC 时，需要允许已建立连接的响应包。
         host_reply_rule = ""
         if self.allow_host_connections:
             host_reply_rule = (
@@ -552,7 +552,7 @@ class NetworkManager:
 
     def release(self, instance_id: str, *, lease: dict | None = None) -> None:
         """删除 Linux 网络资源；完全清理后再删除租约记录。"""
-        # 从 JSON 账本里查到 microvm-lab 的网络配置
+        # 从租约存储中查找该实例当前使用的网络配置。
         stored_lease = self.store.get(instance_id)
         # 这里要确认一下两个记录是不是都没有
         effective_lease = stored_lease or lease

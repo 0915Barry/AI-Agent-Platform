@@ -316,33 +316,6 @@ Network Manager 从 `172.29.0.0/16` 地址池按 `/30` 分配槽位。每个运�
 Git 仓库不保存 API Key、SSH 私钥、实例磁盘、Jailer 目录或运行日志。模型密钥只由
 Ubuntu Host 的 Tool Gateway 读取，不写入 rootfs 或实例数据盘。
 
-## microVM 学习模式
-
-`lab-*` 命令用于观察最基础的 Jailer、磁盘、TAP 与 Pi RPC 结构，不依赖页面和业务
-数据库：
-
-```bash
-./run.sh lab-start
-./run.sh lab-status
-./run.sh lab-inspect
-./run.sh lab-stop
-```
-
-启动后 SSH 进入 Ubuntu，并按输出执行：
-
-```bash
-nc <Guest-IP> 8080
-```
-
-然后可发送一行 Pi RPC JSONL：
-
-```json
-{"id":"demo-1","type":"get_state"}
-```
-
-`lab-stop` 删除临时 Jailer、TAP 和 nftables 规则，但保留
-`/srv/fc/volumes/lab/data.ext4`。
-
 ## 构建与运行速度
 
 第一次构建会从固定 Ubuntu 快照生成 rootfs，并安装 Node.js 和 Pi Agent，因此耗时
