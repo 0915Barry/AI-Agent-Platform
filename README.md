@@ -173,6 +173,41 @@ macOS 如需从本机访问 HTTP 控制面，另开一个终端保持 SSH 隧道
 该命令正常情况下不会继续输出；它正在保持
 `127.0.0.1:18090 → Ubuntu 127.0.0.1:18090` 的端口转发。按 `Ctrl-C` 关闭隧道。
 
+## 终端 CLI
+
+`agentctl` 通过 Control Plane 管理实例和会话，不直接连接 Firecracker 或 Pi RPC。
+macOS 使用前应先运行 `./run.sh start`，并在另一个终端保持 `./run.sh tunnel`；Windows
+则直接在已经启动 Control Plane 的 VMware Ubuntu 终端中使用。
+
+首次登录：
+
+```bash
+./agentctl login <username>
+```
+
+密码不会回显。会话 Cookie 以 `0600` 权限保存在用户配置目录，不写入仓库。随后可以
+完成实例的完整操作：
+
+```bash
+./agentctl create demo-agent
+./agentctl start demo-agent
+./agentctl status demo-agent
+./agentctl chat demo-agent
+./agentctl stop demo-agent
+./agentctl destroy demo-agent
+```
+
+`chat` 使用 SSE 显示流式回答，并以不同颜色区分用户输入、Pi 输出、工具调用、系统
+状态和错误。输入 `/exit` 只退出对话，不停止实例。`destroy` 会永久删除实例数据，默认
+要求再次输入实例 ID；自动化环境必须显式添加 `--yes`。不支持 ANSI 颜色的终端可用：
+
+```bash
+./agentctl --no-color status
+```
+
+CLI 默认连接 `http://127.0.0.1:18090`，也可使用 `--base-url` 或 `AAP_BASE_URL` 指定
+其他 Control Plane 地址。
+
 ## 核心验收
 
 `verify` 会执行账户认证、网络租约以及真实 Pi Gateway 任务链路。需要拆分排错时，按

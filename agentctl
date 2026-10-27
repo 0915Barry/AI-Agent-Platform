@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""AI Agent Platform 终端客户端入口。"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+CLI_DIR = Path(__file__).resolve().parent / "services" / "cli"
+sys.path.insert(0, str(CLI_DIR))
+
+from main import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    main()
