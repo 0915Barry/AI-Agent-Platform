@@ -11,6 +11,8 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import main as cli
 
@@ -40,7 +42,8 @@ class MockControlPlane(BaseHTTPRequestHandler):
         self.send_json(404, {"error": {"code": "missing", "message": "missing"}})
 
     def do_GET(self) -> None:
-        if self.path.endswith("/stream"):
+        parsed = urlsplit(self.path)
+        if parsed.path.endswith("/stream"):
             body = (
                 'id: 1\nevent: task-event\ndata: {"sequence":1,"type":"text",'
                 '"data":{"delta":"你好"}}\n\n'
@@ -52,6 +55,41 @@ class MockControlPlane(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if parsed.path.endswith("/messages"):
+            self.send_json(
+                200,
+                {
+                    "messages": [
+                        {"sequence": 1, "role": "user", "content": "旧问题", "createdAt": 1},
+                        {
+                            "sequence": 2,
+                            "role": "assistant",
+                            "content": "旧回答",
+                            "createdAt": 2,
+                        },
+                    ],
+                    "nextBefore": None,
+                },
+            )
+            return
+        if parsed.path == "/api/instances/agent-demo/conversations":
+            self.send_json(
+                200,
+                {
+                    "conversations": [
+                        {
+                            "id": "conversation-demo",
+                            "title": "演示会话",
+                            "preview": "旧回答",
+                            "updatedAt": 2,
+                        }
+                    ]
+                },
+            )
+            return
+        if parsed.path == "/api/instances/agent-demo/conversations/conversation-demo":
+            self.send_json(200, {"id": "conversation-demo", "title": "演示会话"})
             return
         self.send_json(404, {"error": {"code": "missing", "message": "missing"}})
 
@@ -98,6 +136,30 @@ class AgentCtlTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("Pi > 你好", rendered)
         self.assertEqual(rendered.count("你好"), 1)
+
+    def test_conversation_list_and_history_are_human_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = cli.SessionStore(Path(directory) / "state.json")
+            store.save({"cookie": "aap_session=test-token", "baseUrl": self.base_url})
+            output = io.StringIO()
+            console = cli.Console(False, output)
+            common = {"base_url": self.base_url, "instance_id": "agent-demo"}
+            cli.command_conversations(SimpleNamespace(**common), store, console)
+            cli.command_history(
+                SimpleNamespace(
+                    **common,
+                    conversation_id="conversation-demo",
+                    limit=20,
+                    before=None,
+                ),
+                store,
+                console,
+            )
+        rendered = output.getvalue()
+        self.assertIn("conversation-demo", rendered)
+        self.assertIn("演示会话", rendered)
+        self.assertIn("你 > 旧问题", rendered)
+        self.assertIn("Pi > 旧回答", rendered)
 
 
 if __name__ == "__main__":

@@ -465,6 +465,24 @@ class ControlPlane:
         except TaskStoreError as error:
             raise ApiError(404, "conversation_not_found", str(error)) from error
 
+    def conversation_messages_page(
+        self,
+        instance_id: str,
+        conversation_id: str,
+        limit: int,
+        before_sequence: int | None,
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        """为终端和页面返回有上限的历史消息，避免长会话被一次性载入。"""
+
+        instance_id = self.validate_requested_id(instance_id)
+        self.store.get(instance_id)
+        try:
+            return self.tasks.list_messages_page(
+                instance_id, conversation_id, limit, before_sequence
+            )
+        except TaskStoreError as error:
+            raise ApiError(404, "conversation_not_found", str(error)) from error
+
     def create_conversation_message(
         self, instance_id: str, conversation_id: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
@@ -753,9 +771,27 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 instance_id, conversation_id, messages_suffix = conversation_match.groups()
                 self.authorize_instance(instance_id, user)
                 if messages_suffix:
+                    query = parse_qs(parsed.query)
+                    try:
+                        limit = int(query.get("limit", ["50"])[0])
+                        before_value = query.get("before", [None])[0]
+                        before = None if before_value is None else int(before_value)
+                    except (TypeError, ValueError) as error:
+                        raise ApiError(
+                            400, "invalid_message_cursor", "limit and before must be integers"
+                        ) from error
+                    if limit < 1 or limit > 100 or (before is not None and before < 1):
+                        raise ApiError(
+                            400,
+                            "invalid_message_cursor",
+                            "limit must be 1-100 and before must be positive",
+                        )
+                    messages, next_before = self.control.conversation_messages_page(
+                        instance_id, conversation_id, limit, before
+                    )
                     self.send_payload(
                         200,
-                        {"messages": self.control.conversation_messages(instance_id, conversation_id)},
+                        {"messages": messages, "nextBefore": next_before},
                     )
                 else:
                     self.send_payload(200, self.control.get_conversation(instance_id, conversation_id))

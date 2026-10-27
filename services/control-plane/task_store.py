@@ -157,6 +157,7 @@ class TaskStore:
         """把消息记录映射成前端可直接渲染的格式。"""
 
         return {
+            "sequence": row["sequence"],
             "id": row["id"],
             "conversationId": row["conversation_id"],
             "role": row["role"],
@@ -214,6 +215,34 @@ class TaskStore:
                 (conversation_id,),
             ).fetchall()
         return [self.message_from_row(row) for row in rows]
+
+    def list_messages_page(
+        self,
+        instance_id: str,
+        conversation_id: str,
+        limit: int,
+        before_sequence: int | None = None,
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        """倒序查询一页消息，再按正常阅读顺序返回，并生成向前翻页游标。"""
+
+        self.get_conversation(instance_id, conversation_id)
+        parameters: list[Any] = [conversation_id]
+        before_clause = ""
+        if before_sequence is not None:
+            before_clause = " AND sequence<?"
+            parameters.append(before_sequence)
+        parameters.append(limit + 1)
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM messages WHERE conversation_id=?" + before_clause
+                + " ORDER BY sequence DESC LIMIT ?",
+                parameters,
+            ).fetchall()
+        has_older = len(rows) > limit
+        selected = rows[:limit]
+        messages = [self.message_from_row(row) for row in reversed(selected)]
+        next_before = selected[-1]["sequence"] if has_older and selected else None
+        return messages, next_before
 
     @classmethod
     def build_context_prompt(cls, messages: list[dict[str, str]]) -> str:

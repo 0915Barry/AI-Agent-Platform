@@ -193,6 +193,7 @@ macOS 使用前应先运行 `./run.sh start`，并在另一个终端保持 `./ru
 ./agentctl start demo-agent
 ./agentctl status demo-agent
 ./agentctl chat demo-agent
+./agentctl conversations demo-agent
 ./agentctl stop demo-agent
 ./agentctl destroy demo-agent
 ```
@@ -207,6 +208,23 @@ macOS 使用前应先运行 `./run.sh start`，并在另一个终端保持 `./ru
 
 CLI 默认连接 `http://127.0.0.1:18090`，也可使用 `--base-url` 或 `AAP_BASE_URL` 指定
 其他 Control Plane 地址。
+
+查看会话列表后，可以读取历史或继续指定会话：
+
+```bash
+./agentctl conversations demo-agent
+./agentctl history demo-agent <conversation-id>
+./agentctl chat demo-agent --conversation <conversation-id>
+```
+
+`history` 默认读取最近 20 条消息，最多允许每页 100 条。如果输出提示仍有更早消息，
+使用提示中的游标继续向前翻页：
+
+```bash
+./agentctl history demo-agent <conversation-id> --before <sequence>
+```
+
+继续旧会话时，CLI 会先展示最近 10 条历史消息，再进入新的流式对话。
 
 ## 核心验收
 

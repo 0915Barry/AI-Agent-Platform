@@ -13,11 +13,12 @@ import json
 import os
 import stat
 import sys
+from datetime import datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Iterator, TextIO
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -256,6 +257,33 @@ def print_instance(instance: dict[str, Any], console: Console) -> None:
     )
 
 
+def display_time(value: Any) -> str:
+    if not isinstance(value, int):
+        return "未知时间"
+    return datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def one_line(value: Any, limit: int = 72) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def print_message(message: dict[str, Any], console: Console) -> None:
+    role = message.get("role")
+    if role == "user":
+        label = console.paint("你 > ", "cyan")
+    elif role == "assistant":
+        label = console.paint("Pi > ", "green")
+    else:
+        label = console.paint(f"{role or 'unknown'} > ", "yellow")
+    print(
+        console.paint(f"[{display_time(message.get('createdAt'))}] ", "blue")
+        + label
+        + str(message.get("content") or ""),
+        file=console.output,
+    )
+
+
 def authenticated_client(args: argparse.Namespace, store: SessionStore) -> ApiClient:
     cookie, _ = require_cookie(store, args.base_url)
     return ApiClient(args.base_url, cookie)
@@ -289,6 +317,63 @@ def command_status(args: argparse.Namespace, store: SessionStore, console: Conso
         return
     for instance in instances:
         print_instance(instance, console)
+
+
+def command_conversations(
+    args: argparse.Namespace, store: SessionStore, console: Console
+) -> None:
+    client = authenticated_client(args, store)
+    payload, _ = client.json("GET", f"/api/instances/{args.instance_id}/conversations")
+    conversations = payload.get("conversations", [])
+    if not conversations:
+        console.warning("该实例还没有会话")
+        return
+    for conversation in conversations:
+        print(
+            f"{conversation['id']}  "
+            f"{display_time(conversation.get('updatedAt'))}  "
+            f"{one_line(conversation.get('title'), 32)}",
+            file=console.output,
+        )
+        preview = one_line(conversation.get("preview"))
+        print(console.paint(f"  {preview}", "blue"), file=console.output)
+
+
+def fetch_history(
+    client: ApiClient,
+    instance_id: str,
+    conversation_id: str,
+    limit: int,
+    before: int | None = None,
+) -> dict[str, Any]:
+    query: dict[str, Any] = {"limit": limit}
+    if before is not None:
+        query["before"] = before
+    path = (
+        f"/api/instances/{instance_id}/conversations/{conversation_id}/messages?"
+        + urlencode(query)
+    )
+    payload, _ = client.json("GET", path)
+    return payload
+
+
+def render_history(payload: dict[str, Any], console: Console) -> None:
+    messages = payload.get("messages", [])
+    if not messages:
+        console.warning("该页没有消息")
+    for message in messages:
+        print_message(message, console)
+    next_before = payload.get("nextBefore")
+    if isinstance(next_before, int):
+        console.system(f"还有更早消息，可添加 --before {next_before} 继续查看")
+
+
+def command_history(args: argparse.Namespace, store: SessionStore, console: Console) -> None:
+    client = authenticated_client(args, store)
+    payload = fetch_history(
+        client, args.instance_id, args.conversation_id, args.limit, args.before
+    )
+    render_history(payload, console)
 
 
 def command_stop(args: argparse.Namespace, store: SessionStore, console: Console) -> None:
@@ -362,6 +447,15 @@ def command_chat(args: argparse.Namespace, store: SessionStore, console: Console
             "POST", f"/api/instances/{args.instance_id}/conversations", {"title": "新会话"}
         )
         conversation_id = conversation["id"]
+    else:
+        conversation, _ = client.json(
+            "GET", f"/api/instances/{args.instance_id}/conversations/{conversation_id}"
+        )
+        console.system(f"继续会话：{conversation.get('title') or conversation_id}")
+        render_history(
+            fetch_history(client, args.instance_id, conversation_id, args.history_limit),
+            console,
+        )
     console.system(f"会话={conversation_id}；输入 /exit 退出，不会停止实例")
 
     while True:
@@ -403,9 +497,23 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("instance_id")
     status_parser = commands.add_parser("status", help="查看一个或全部实例")
     status_parser.add_argument("instance_id", nargs="?")
+    conversations = commands.add_parser("conversations", help="列出实例的历史会话")
+    conversations.add_argument("instance_id")
+    history = commands.add_parser("history", help="分页查看会话消息")
+    history.add_argument("instance_id")
+    history.add_argument("conversation_id")
+    history.add_argument("--limit", type=int, choices=range(1, 101), default=20)
+    history.add_argument("--before", type=int, help="读取该消息序号之前的一页")
     chat = commands.add_parser("chat", help="进入流式对话")
     chat.add_argument("instance_id")
     chat.add_argument("--conversation", help="继续已有会话 ID")
+    chat.add_argument(
+        "--history-limit",
+        type=int,
+        choices=range(1, 101),
+        default=10,
+        help="继续会话时展示的最近消息数（默认 10）",
+    )
     stop = commands.add_parser("stop", help="停止实例并保留数据")
     stop.add_argument("instance_id")
     destroy = commands.add_parser("destroy", help="永久删除实例和关联数据")
@@ -420,6 +528,8 @@ COMMANDS = {
     "create": command_create,
     "start": command_start,
     "status": command_status,
+    "conversations": command_conversations,
+    "history": command_history,
     "chat": command_chat,
     "stop": command_stop,
     "destroy": command_destroy,

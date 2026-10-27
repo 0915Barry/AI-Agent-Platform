@@ -393,6 +393,16 @@ class ControlPlaneTests(unittest.TestCase):
         messages = self.control.conversation_messages("agent-chat", conversation["id"])
         self.assertEqual([message["role"] for message in messages], ["user", "assistant", "user"])
         self.assertEqual(messages[1]["content"], "好的，我会记住。")
+        page, next_before = self.control.conversation_messages_page(
+            "agent-chat", conversation["id"], 2, None
+        )
+        self.assertEqual([message["role"] for message in page], ["assistant", "user"])
+        self.assertIsInstance(next_before, int)
+        older, final_cursor = self.control.conversation_messages_page(
+            "agent-chat", conversation["id"], 2, next_before
+        )
+        self.assertEqual([message["role"] for message in older], ["user"])
+        self.assertIsNone(final_cursor)
         listed = self.control.list_conversations("agent-chat")
         self.assertEqual(listed[0]["title"], "请记住我的代号是 Alpha")
 
