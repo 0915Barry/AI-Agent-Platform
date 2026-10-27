@@ -247,6 +247,7 @@ CLI 默认连接 `http://127.0.0.1:18090`，也可使用 `--base-url` 或 `AAP_B
 | 认证与归属 | `./run.sh auth-smoke-test` | `./run-linux.sh auth-smoke-test` |
 | HTTP 实例控制 | `./run.sh control-plane-smoke-test` | `./run-linux.sh control-plane-smoke-test` |
 | Host Pi Gateway | `./run.sh agent-task-smoke-test` | `./run-linux.sh agent-task-smoke-test` |
+| 终端完整链路 | `./run.sh cli-smoke-test` | `./run-linux.sh cli-smoke-test` |
 
 网络租约成功标志：
 
@@ -261,6 +262,13 @@ Pi Gateway 成功标志：
 ```text
 PASS: host Pi Gateway dispatched a real task to microVM Pi RPC
 PI_GATEWAY_READY guest=172.29.0.2:8080 transport=tcp protocol=jsonl dispatch=host events=streamed bridge=absent
+```
+
+CLI 完整链路成功标志：
+
+```text
+PASS: agentctl completed authenticated lifecycle, chat, restart, and cleanup
+CLI_SMOKE_READY auth=session lifecycle=create,start,stop,restart,destroy conversation=preserved cleanup=verified
 ```
 
 ## Control Plane 与 Pi Gateway

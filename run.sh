@@ -51,6 +51,7 @@ Commands:
   control-plane-smoke-test
                          Control a real microVM through the HTTP API
   agent-task-smoke-test  Verify host Pi Gateway with a real DeepSeek task
+  cli-smoke-test         Verify authenticated agentctl lifecycle and resumed chat
   control-plane-start    Start the loopback-only API in the Linux VM
   control-plane-stop     Stop the API; running instances remain managed
   control-plane-status   Show whether the API service is running
@@ -363,6 +364,18 @@ smoke_test_agent_task() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/agent-task-smoke-test.sh'"
 }
 
+smoke_test_cli() {
+  sync_repo
+  echo "Building and testing the complete agentctl workflow in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/cli-smoke-test.sh'"
+}
+
 control_plane_service() {
   action="$1"
   sync_repo
@@ -474,6 +487,9 @@ case "${command}" in
     ;;
   agent-task-smoke-test)
     smoke_test_agent_task
+    ;;
+  cli-smoke-test)
+    smoke_test_cli
     ;;
   control-plane-start)
     control_plane_service start

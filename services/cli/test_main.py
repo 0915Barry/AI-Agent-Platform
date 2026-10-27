@@ -9,6 +9,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -112,6 +113,20 @@ class AgentCtlTests(unittest.TestCase):
         )
         self.assertEqual(payload["user"]["username"], "demo")
         self.assertEqual(cli.extract_cookie(headers), "aap_session=test-token")
+
+    def test_login_can_read_password_from_standard_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = cli.SessionStore(Path(directory) / "state.json")
+            output = io.StringIO()
+            args = SimpleNamespace(
+                username="demo",
+                password_stdin=True,
+                base_url=self.base_url,
+            )
+            with patch("sys.stdin", io.StringIO("automation-password\n")):
+                cli.command_login(args, store, cli.Console(False, output))
+            self.assertEqual(store.load()["username"], "demo")
+            self.assertIn("已登录：demo", output.getvalue())
 
     def test_help_explains_required_identifiers_and_examples(self) -> None:
         help_text = cli.build_parser().format_help()

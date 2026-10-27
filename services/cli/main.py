@@ -216,7 +216,12 @@ def command_login(args: argparse.Namespace, store: SessionStore, console: Consol
     username = args.username or input("用户名：").strip()
     if not username:
         raise CliError("用户名不能为空")
-    password = getpass.getpass("密码：")
+    if args.password_stdin:
+        password = sys.stdin.readline().rstrip("\r\n")
+        if not password:
+            raise CliError("标准输入中没有密码")
+    else:
+        password = getpass.getpass("密码：")
     client = ApiClient(args.base_url)
     payload, headers = client.json(
         "POST", "/api/auth/login", {"username": username, "password": password}
@@ -531,6 +536,11 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="示例：./agentctl login barry-dev",
     )
     login.add_argument("username", nargs="?", metavar="USERNAME", help="平台用户名；省略时交互输入")
+    login.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="从标准输入读取一行密码，仅供自动化测试使用",
+    )
     commands.add_parser(
         "logout",
         help="退出平台：logout",
