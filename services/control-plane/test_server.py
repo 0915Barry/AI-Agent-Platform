@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M10-M13 控制面、任务队列与多轮会话的纯本地单元测试。
+"""控制面、任务队列与多轮会话的纯本地单元测试。
 
 测试使用 :class:`FakeRuntime` 替代真正的 Firecracker 运行时，因此不要求
 ``/dev/kvm``、root 权限或 Linux 虚拟机。这里主要验证控制面的业务规则：
@@ -300,47 +300,6 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertIn(("busy_on", "agent-gateway"), self.runtime.calls)
         self.assertIn(("busy_off", "agent-gateway"), self.runtime.calls)
 
-    def test_agent_config_is_validated_and_snapshotted_into_task(self) -> None:
-        """配置修改后新任务应携带独立快照，且只允许两种安全工具集合。"""
-
-        self.control.create({"id": "agent-config"})
-        configured = self.control.update_agent_config(
-            "agent-config",
-            {
-                "agentName": "只读审查员",
-                "systemPrompt": "只分析文件内容，不要修改任何文件。",
-                "toolMode": "read_only",
-                "skillIds": ["code-review"],
-                "mcpIds": ["platform-records"],
-            },
-        )
-        self.assertEqual(configured["agentName"], "只读审查员")
-        self.control.start("agent-config")
-        task = self.control.create_task("agent-config", {"prompt": "检查 README"})
-        claimed = self.tasks.claim_next("agent-config")
-        assert claimed is not None
-        self.assertEqual(claimed["id"], task["id"])
-        self.assertEqual(claimed["systemPrompt"], "只分析文件内容，不要修改任何文件。")
-        self.assertEqual(claimed["toolMode"], "read_only")
-        self.assertEqual(claimed["skills"][0]["id"], "code-review")
-        self.assertIn("# Code review", claimed["skills"][0]["content"])
-        self.assertEqual(claimed["mcps"][0]["id"], "platform-records")
-        self.assertEqual(claimed["mcps"][0]["serverName"], "platform_records")
-
-        with self.assertRaises(SERVER.ApiError) as invalid_tools:
-            self.control.update_agent_config(
-                "agent-config",
-                {"agentName": "危险配置", "systemPrompt": "test", "toolMode": "bash"},
-            )
-        self.assertEqual(invalid_tools.exception.code, "invalid_tool_mode")
-
-        with self.assertRaises(SERVER.ApiError) as invalid_mcp:
-            self.control.update_agent_config(
-                "agent-config",
-                {"agentName": "危险配置", "systemPrompt": "test", "mcpIds": ["user-url"]},
-            )
-        self.assertEqual(invalid_mcp.exception.code, "invalid_mcps")
-
     def test_sse_replays_incremental_events_and_closes_at_terminal_state(self) -> None:
         """SSE 应按序重放增量事件，并在 completed 后结束 HTTP 响应。"""
 
@@ -450,8 +409,8 @@ class ControlPlaneTests(unittest.TestCase):
         self.control.destroy("agent-one")
         self.assertEqual(self.tasks.list_conversations("agent-one"), [])
 
-    def test_existing_m11_task_database_is_migrated(self) -> None:
-        """旧任务表升级 M13 时应保留数据并增加 conversation_id。"""
+    def test_existing_task_database_is_migrated(self) -> None:
+        """旧任务表升级时应保留数据并增加 conversation_id。"""
 
         legacy_path = Path(self.temporary.name) / "legacy-tasks.db"
         with closing(sqlite3.connect(legacy_path)) as connection:
@@ -473,52 +432,6 @@ class ControlPlaneTests(unittest.TestCase):
         task = migrated.get("agent-old", "task-0000000000000000")
         self.assertEqual(task["output"], "ok")
         self.assertIsNone(task["conversationId"])
-
-    def test_workspace_operation_is_scoped_and_returns_guest_result(self) -> None:
-        """文件请求只能被目标实例领取，控制面应等待并返回 guest 结果。"""
-
-        self.control.create({"id": "agent-files"})
-        self.control.create({"id": "agent-other"})
-        self.control.start("agent-files")
-
-        def guest() -> None:
-            operation = None
-            for _ in range(50):
-                operation = self.tasks.claim_next_workspace_operation("agent-files")
-                if operation:
-                    break
-                time.sleep(0.01)
-            assert operation is not None
-            self.assertEqual(operation["path"], "docs/readme.txt")
-            self.tasks.finish_workspace_operation(
-                "agent-files", operation["id"], "completed", {"path": operation["path"], "size": 5}
-            )
-
-        worker = threading.Thread(target=guest)
-        worker.start()
-        result = self.control.workspace_operation(
-            "agent-files", "write", {"path": "docs/readme.txt", "contentBase64": "aGVsbG8="}
-        )
-        worker.join()
-        self.assertEqual(result, {"path": "docs/readme.txt", "size": 5})
-        self.assertIsNone(self.tasks.claim_next_workspace_operation("agent-other"))
-
-    def test_workspace_rejects_traversal_and_large_files(self) -> None:
-        """控制面在请求进入 guest 前拒绝目录穿越与超过 5 MiB 的内容。"""
-
-        self.control.create({"id": "agent-files"})
-        self.control.start("agent-files")
-        for unsafe in ("../secret", "folder/../secret", "/etc/shadow", "folder\\secret"):
-            with self.assertRaises(SERVER.ApiError) as rejected:
-                self.control.workspace_operation("agent-files", "read", {"path": unsafe})
-            self.assertEqual(rejected.exception.status, 400)
-        oversized = "A" * (((5 * 1024 * 1024 + 1) * 4 + 2) // 3)
-        with self.assertRaises(SERVER.ApiError) as too_large:
-            self.control.workspace_operation(
-                "agent-files", "write", {"path": "large.bin", "contentBase64": oversized}
-            )
-        self.assertIn(too_large.exception.status, {400, 413})
-
 
 if __name__ == "__main__":
     unittest.main()

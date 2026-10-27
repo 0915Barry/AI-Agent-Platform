@@ -11,7 +11,7 @@ Run this entry point inside the Ubuntu KVM host VM.
 
 Commands:
   bootstrap             One-command install/build after the Ubuntu VM exists
-  verify                Run the current M19, M16, and workspace checks
+  verify                Run authentication, network lease, and Pi Gateway checks
   start                 Start the long-running loopback control plane
   stop                  Stop the control plane; preserve instance data
   status                Show whether the control plane is running
@@ -34,19 +34,13 @@ Commands:
   gateway-smoke-test    Verify host-side credential injection
   lifecycle-smoke-test  Verify idle reaping and restart persistence
   configure-deepseek    Securely save a DeepSeek API key outside the repo
-  configure-user        Create an M16 login user and claim legacy instances
-  auth-smoke-test       Verify M16 sessions, ownership, and quotas
+  configure-user        Create a local login user and claim legacy instances
+  auth-smoke-test       Verify sessions, ownership, and quotas
   deepseek-e2e-test     Run Pi Agent against DeepSeek through Tool Gateway
   control-plane-smoke-test
-                        Control a real microVM through the M10 HTTP API
+                        Control a real microVM through the HTTP API
   agent-task-smoke-test Verify host Pi Gateway with a real DeepSeek task
-  streaming-smoke-test  Verify M15 Pi JSONL, Gateway streaming, and SSE
-  agent-config-smoke-test
-                        Verify M17 custom prompt and tool permissions
-  skills-smoke-test     Verify M18 reviewed Skill injection into Pi
-  mcp-smoke-test        Verify M19 allowlisted host-side MCP integration
-  workspace-smoke-test  Verify M14 file operations and restart persistence
-  control-plane-start   Start the loopback-only M10 HTTP API
+  control-plane-start   Start the loopback-only HTTP API
   control-plane-stop    Stop the API; running instances remain managed
   control-plane-status  Show whether the API service is running
   setup                 Run doctor and install Firecracker
@@ -73,8 +67,8 @@ case "${command}" in
   verify)
     "${repo_dir}/scripts/linux/auth-smoke-test.sh"
     build_rootfs
+    sudo "${repo_dir}/scripts/linux/network-lease-smoke-test.sh"
     sudo "${repo_dir}/scripts/linux/agent-task-smoke-test.sh"
-    sudo "${repo_dir}/scripts/linux/workspace-smoke-test.sh"
     ;;
   start)
     build_rootfs
@@ -164,26 +158,6 @@ case "${command}" in
   agent-task-smoke-test)
     build_rootfs
     sudo "${repo_dir}/scripts/linux/agent-task-smoke-test.sh"
-    ;;
-  streaming-smoke-test)
-    build_rootfs
-    sudo "${repo_dir}/scripts/linux/agent-task-smoke-test.sh"
-    ;;
-  agent-config-smoke-test)
-    build_rootfs
-    sudo "${repo_dir}/scripts/linux/agent-task-smoke-test.sh"
-    ;;
-  skills-smoke-test)
-    build_rootfs
-    sudo "${repo_dir}/scripts/linux/agent-task-smoke-test.sh"
-    ;;
-  mcp-smoke-test)
-    build_rootfs
-    sudo "${repo_dir}/scripts/linux/agent-task-smoke-test.sh"
-    ;;
-  workspace-smoke-test)
-    build_rootfs
-    sudo "${repo_dir}/scripts/linux/workspace-smoke-test.sh"
     ;;
   control-plane-start)
     build_rootfs

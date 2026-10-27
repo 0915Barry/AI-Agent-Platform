@@ -41,9 +41,6 @@ node_cache_path="${cache_dir}/${node_archive}"
 pi_archive="pi-coding-agent-${PI_VERSION}.tgz"
 pi_cache_path="${cache_dir}/${pi_archive}"
 guest_init="${repo_dir}/scripts/guest/agent-init.sh"
-guest_task_worker="${repo_dir}/scripts/guest/agent-task-worker.sh"
-guest_pi_event_forwarder="${repo_dir}/scripts/guest/pi-event-forwarder.mjs"
-guest_workspace_operation="${repo_dir}/scripts/guest/workspace-operation.mjs"
 guest_pi_rpc_session="${repo_dir}/scripts/guest/pi-rpc-session.sh"
 
 build_id="$(
@@ -52,9 +49,6 @@ build_id="$(
     sha256sum "${repo_dir}/config/versions.env" | awk '{print $1}'
     sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}'
     sha256sum "${guest_init}" | awk '{print $1}'
-    sha256sum "${guest_task_worker}" | awk '{print $1}'
-    sha256sum "${guest_pi_event_forwarder}" | awk '{print $1}'
-    sha256sum "${guest_workspace_operation}" | awk '{print $1}'
     sha256sum "${guest_pi_rpc_session}" | awk '{print $1}'
   } | sha256sum | awk '{print $1}'
 )"
@@ -71,17 +65,15 @@ install_project_runtime_files() {
     "${guest_init}" \
     "${root}/usr/local/sbin/agent-init"
   install -o root -g root -m 0755 \
-    "${guest_task_worker}" \
-    "${root}/usr/local/sbin/agent-task-worker"
-  install -o root -g root -m 0755 \
-    "${guest_pi_event_forwarder}" \
-    "${root}/usr/local/sbin/pi-event-forwarder.mjs"
-  install -o root -g root -m 0755 \
-    "${guest_workspace_operation}" \
-    "${root}/usr/local/sbin/workspace-operation.mjs"
-  install -o root -g root -m 0755 \
     "${guest_pi_rpc_session}" \
     "${root}/usr/local/sbin/pi-rpc-session"
+
+  # 旧 Agent Bridge/JSON Worker/Workspace Worker 已退出正式架构。离线刷新旧镜像时
+  # 同步移除残留文件，确保系统盘只保留 Pi RPC 会话入口。
+  rm -f \
+    "${root}/usr/local/sbin/agent-task-worker" \
+    "${root}/usr/local/sbin/pi-event-forwarder.mjs" \
+    "${root}/usr/local/sbin/workspace-operation.mjs"
 
   # 平台运行文件始终由 root 持有；只有工作区与 Pi 状态目录允许 pi 写入。
   chown -R 0:0 "${root}/usr/local"
@@ -273,8 +265,7 @@ mount --make-rslave "${mount_dir}/dev"
 
 chroot "${mount_dir}" apt-get update
 chroot "${mount_dir}" apt-get install -y --no-install-recommends \
-  bash ca-certificates curl git iproute2 iputils-ping jq openssh-client \
-  procps ripgrep socat tini util-linux
+  bash ca-certificates curl iproute2 iputils-ping jq procps socat tini util-linux
 chroot "${mount_dir}" apt-get clean
 rm -rf "${mount_dir}/var/lib/apt/lists/"*
 

@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""M10-M16 控制面、认证、Agent 任务、会话与工作区文件 HTTP API。
+"""实例控制面、认证、Agent 任务与会话 HTTP API。
 
 该服务把前端将来需要的“创建、启动、查询、心跳、停止、销毁”操作转换为
 InstanceRuntime 调用。产品状态保存在 SQLite；Firecracker 的实时进程状态仍以
 lifecycle.py 元数据和 /proc 为准，查询时会自动对两者进行校准。
 
-M11 在同一控制面增加任务队列；M13 继续增加会话、消息和受限多轮上下文。宿主机
+任务队列保存一次执行的状态与事件；会话和消息提供受限的多轮上下文。宿主机
 Pi Gateway 通过实例独立 TAP 主动连接 Pi RPC，并把原生事件写回任务存储。
-M16 可启用本地账户、HttpOnly 会话和实例所有权。即便启用认证，服务仍强制只允许
-loopback 监听；macOS 开发者应通过 SSH 隧道访问。
+服务可启用本地账户、HttpOnly 会话和实例所有权。即便启用认证，服务仍强制只允许
+loopback 监听；开发者应通过 SSH 隧道访问。
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
-import binascii
 import json
 import os
 import re
@@ -50,9 +48,6 @@ INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 INSTANCE_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})(?:/(start|stop|heartbeat))?$"
 )
-INSTANCE_CONFIG_ROUTE_RE = re.compile(
-    r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/config$"
-)
 TASK_COLLECTION_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/tasks$"
 )
@@ -67,66 +62,9 @@ CONVERSATION_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/conversations/"
     r"(conversation-[0-9a-f]{16})(/messages)?$"
 )
-WORKSPACE_ROUTE_RE = re.compile(
-    r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/workspace/(list|read|write|mkdir|delete)$"
-)
-MAX_WORKSPACE_FILE_BYTES = 5 * 1024 * 1024
 MAX_INSTANCES_PER_USER = 5
 MAX_RUNNING_INSTANCES_PER_USER = 2
 SESSION_COOKIE_NAME = "aap_session"
-DEFAULT_AGENT_NAME = "Pi Agent"
-DEFAULT_SYSTEM_PROMPT = "You are a helpful coding agent working inside an isolated workspace."
-AGENT_TOOL_MODES = {"read_only", "read_write"}
-SKILL_CATALOG = {
-    "code-review": {
-        "name": "代码审查",
-        "description": "检查正确性、安全性、可靠性与可维护性",
-    },
-    "document-summary": {
-        "name": "文档总结",
-        "description": "提取文档要点、决策、风险和行动项",
-    },
-    "m18-verifier": {
-        "name": "M18 internal verifier",
-        "description": "internal acceptance only",
-        "internal": True,
-    },
-}
-SKILL_CATALOG_ROOT = REPO_ROOT / "skills" / "catalog"
-MCP_CATALOG = {
-    "platform-records": {
-        "name": "平台验收记录",
-        "description": "只读访问宿主侧审核数据；用于验证 MCP 安全链路",
-        "serverName": "platform_records",
-    },
-}
-
-
-def resolve_skill_snapshot(skill_ids: list[str]) -> list[dict[str, str]]:
-    """只从仓库审核目录读取纯 SKILL.md，任务创建后内容不再随仓库变化。"""
-
-    snapshots = []
-    for skill_id in skill_ids:
-        if skill_id not in SKILL_CATALOG:
-            raise ApiError(400, "invalid_skill", f"未知 Skill：{skill_id}")
-        content = (SKILL_CATALOG_ROOT / skill_id / "SKILL.md").read_text(encoding="utf-8")
-        if len(content.encode("utf-8")) > 32768:
-            raise ApiError(500, "invalid_skill_catalog", f"Skill 过大：{skill_id}")
-        snapshots.append({"id": skill_id, "content": content})
-    return snapshots
-
-
-def resolve_mcp_snapshot(mcp_ids: list[str]) -> list[dict[str, str]]:
-    """把审核目录中的 MCP 元数据固化到任务，拒绝用户自定义 URL 或命令。"""
-
-    return [
-        {
-            "id": mcp_id,
-            "serverName": MCP_CATALOG[mcp_id]["serverName"],
-            "description": MCP_CATALOG[mcp_id]["description"],
-        }
-        for mcp_id in mcp_ids
-    ]
 
 
 class ApiError(Exception):
@@ -186,27 +124,6 @@ class InstanceStore:
             }
             if "owner_id" not in columns:
                 connection.execute("ALTER TABLE instances ADD COLUMN owner_id TEXT")
-            if "agent_name" not in columns:
-                connection.execute(
-                    "ALTER TABLE instances ADD COLUMN agent_name TEXT NOT NULL DEFAULT 'Pi Agent'"
-                )
-            if "system_prompt" not in columns:
-                connection.execute(
-                    "ALTER TABLE instances ADD COLUMN system_prompt TEXT NOT NULL DEFAULT "
-                    "'You are a helpful coding agent working inside an isolated workspace.'"
-                )
-            if "tool_mode" not in columns:
-                connection.execute(
-                    "ALTER TABLE instances ADD COLUMN tool_mode TEXT NOT NULL DEFAULT 'read_write'"
-                )
-            if "skills_json" not in columns:
-                connection.execute(
-                    "ALTER TABLE instances ADD COLUMN skills_json TEXT NOT NULL DEFAULT '[]'"
-                )
-            if "mcp_ids_json" not in columns:
-                connection.execute(
-                    "ALTER TABLE instances ADD COLUMN mcp_ids_json TEXT NOT NULL DEFAULT '[]'"
-                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS instances_owner_created "
                 "ON instances(owner_id,created_at,id)"
@@ -222,11 +139,6 @@ class InstanceStore:
             "updatedAt": row["updated_at"],
             "lastError": row["last_error"],
             "ownerId": row["owner_id"],
-            "agentName": row["agent_name"],
-            "systemPrompt": row["system_prompt"],
-            "toolMode": row["tool_mode"],
-            "skillIds": json.loads(row["skills_json"] or "[]"),
-            "mcpIds": json.loads(row["mcp_ids_json"] or "[]"),
         }
 
     def create(self, instance_id: str, owner_id: str | None = None) -> dict[str, Any]:
@@ -235,11 +147,9 @@ class InstanceStore:
         try:
             with self.connect() as connection:
                 connection.execute(
-                    "INSERT INTO instances(id,status,created_at,updated_at,last_error,owner_id,"
-                    "agent_name,system_prompt,tool_mode,skills_json,mcp_ids_json) "
-                    "VALUES(?,?,?,?,NULL,?,?,?,?,?,?)",
-                    (instance_id, "created", now, now, owner_id, DEFAULT_AGENT_NAME,
-                     DEFAULT_SYSTEM_PROMPT, "read_write", "[]", "[]"),
+                    "INSERT INTO instances(id,status,created_at,updated_at,last_error,owner_id) "
+                    "VALUES(?,?,?,?,NULL,?)",
+                    (instance_id, "created", now, now, owner_id),
                 )
         except sqlite3.IntegrityError as error:
             raise ApiError(409, "instance_exists", f"instance already exists: {instance_id}") from error
@@ -293,22 +203,6 @@ class InstanceStore:
                     "SELECT COUNT(*) AS count FROM instances WHERE owner_id=?", (owner_id,)
                 ).fetchone()
         return int(row["count"])
-
-    def update_config(
-        self, instance_id: str, agent_name: str, system_prompt: str, tool_mode: str,
-        skill_ids: list[str], mcp_ids: list[str],
-    ) -> dict[str, Any]:
-        with self.connect() as connection:
-            cursor = connection.execute(
-                "UPDATE instances SET agent_name=?,system_prompt=?,tool_mode=?,skills_json=?,mcp_ids_json=?,"
-                "updated_at=? WHERE id=?",
-                (agent_name, system_prompt, tool_mode,
-                 json.dumps(skill_ids, separators=(",", ":")),
-                 json.dumps(mcp_ids, separators=(",", ":")), int(time.time()), instance_id),
-            )
-        if cursor.rowcount != 1:
-            raise ApiError(404, "instance_not_found", f"instance not found: {instance_id}")
-        return self.get(instance_id)
 
     def update(self, instance_id: str, status: str, last_error: str | None = None) -> dict[str, Any]:
         """更新状态和最后错误，供状态机每个阶段使用。"""
@@ -508,11 +402,7 @@ class ControlPlane:
             raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
         try:
             self.runtime.heartbeat(instance_id)
-            task = self.tasks.create(
-                instance_id, prompt, record["systemPrompt"], record["toolMode"],
-                resolve_skill_snapshot(record["skillIds"]),
-                resolve_mcp_snapshot(record["mcpIds"]),
-            )
+            task = self.tasks.create(instance_id, prompt)
             self.schedule_tasks(instance_id)
             return task
         except (RuntimeFailure, TaskStoreError, OSError, sqlite3.Error) as error:
@@ -597,10 +487,6 @@ class ControlPlane:
                 instance_id,
                 conversation_id,
                 content,
-                record["systemPrompt"],
-                record["toolMode"],
-                resolve_skill_snapshot(record["skillIds"]),
-                resolve_mcp_snapshot(record["mcpIds"]),
             )
             self.schedule_tasks(instance_id)
             return task
@@ -700,105 +586,6 @@ class ControlPlane:
                     self.runtime.busy(instance_id, False)
                 except (RuntimeFailure, OSError):
                     pass
-
-    def update_agent_config(self, instance_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """校验并保存实例 Agent 配置；运行中的下一项任务会使用新快照。"""
-
-        current = self.store.get(self.validate_requested_id(instance_id))
-        agent_name = payload.get("agentName", current["agentName"])
-        system_prompt = payload.get("systemPrompt", current["systemPrompt"])
-        tool_mode = payload.get("toolMode", current["toolMode"])
-        skill_ids = payload.get("skillIds", current["skillIds"])
-        mcp_ids = payload.get("mcpIds", current["mcpIds"])
-        if not isinstance(agent_name, str) or not agent_name.strip():
-            raise ApiError(400, "invalid_agent_name", "Agent 名称不能为空")
-        if len(agent_name.strip().encode("utf-8")) > 80:
-            raise ApiError(413, "agent_name_too_large", "Agent 名称不能超过 80 字节")
-        if not isinstance(system_prompt, str) or not system_prompt.strip():
-            raise ApiError(400, "invalid_system_prompt", "System Prompt 不能为空")
-        if len(system_prompt.strip().encode("utf-8")) > 8192:
-            raise ApiError(413, "system_prompt_too_large", "System Prompt 不能超过 8 KiB")
-        if tool_mode not in AGENT_TOOL_MODES:
-            raise ApiError(400, "invalid_tool_mode", "工具权限必须是只读或读写")
-        if not isinstance(skill_ids, list) or len(skill_ids) > 5 or any(
-            not isinstance(skill_id, str) or skill_id not in SKILL_CATALOG
-            for skill_id in skill_ids
-        ):
-            raise ApiError(400, "invalid_skills", "Skill 列表包含未知或过多项目")
-        if len(set(skill_ids)) != len(skill_ids):
-            raise ApiError(400, "invalid_skills", "Skill 列表不能重复")
-        if not isinstance(mcp_ids, list) or len(mcp_ids) > 3 or any(
-            not isinstance(mcp_id, str) or mcp_id not in MCP_CATALOG for mcp_id in mcp_ids
-        ):
-            raise ApiError(400, "invalid_mcps", "MCP 列表包含未知或过多项目")
-        if len(set(mcp_ids)) != len(mcp_ids):
-            raise ApiError(400, "invalid_mcps", "MCP 列表不能重复")
-        return self.store.update_config(
-            instance_id, agent_name.strip(), system_prompt.strip(), tool_mode, skill_ids, mcp_ids
-        )
-
-    @staticmethod
-    def validate_workspace_path(value: Any, *, allow_root: bool) -> str:
-        """把 API 路径限制为 /workspace 下的 POSIX 相对路径。"""
-
-        if not isinstance(value, str):
-            raise ApiError(400, "invalid_workspace_path", "workspace path must be a string")
-        if value.startswith("/"):
-            raise ApiError(400, "invalid_workspace_path", "workspace path must be relative")
-        value = value.strip("/")
-        if not value:
-            if allow_root:
-                return ""
-            raise ApiError(400, "invalid_workspace_path", "workspace path must not be empty")
-        if len(value.encode("utf-8")) > 1024 or "\\" in value or "\x00" in value:
-            raise ApiError(400, "invalid_workspace_path", "workspace path is invalid or too long")
-        parts = value.split("/")
-        if any(part in {"", ".", ".."} or len(part.encode("utf-8")) > 255 for part in parts):
-            raise ApiError(400, "invalid_workspace_path", "workspace path contains an invalid segment")
-        return "/".join(parts)
-
-    def workspace_operation(
-        self, instance_id: str, action: str, payload: dict[str, Any]
-    ) -> dict[str, Any]:
-        """排队文件操作并等待 guest 回传，避免宿主并发挂载运行中的 ext4。"""
-
-        instance_id = self.validate_requested_id(instance_id)
-        if action not in {"list", "read", "write", "mkdir", "delete"}:
-            raise ApiError(404, "workspace_action_not_found", "workspace action not found")
-        path = self.validate_workspace_path(payload.get("path", ""), allow_root=action == "list")
-        request: dict[str, Any] = {}
-        if action == "write":
-            encoded = payload.get("contentBase64")
-            if not isinstance(encoded, str):
-                raise ApiError(400, "invalid_file_content", "contentBase64 must be a string")
-            try:
-                decoded = base64.b64decode(encoded, validate=True)
-            except (binascii.Error, ValueError) as error:
-                raise ApiError(400, "invalid_file_content", "contentBase64 is invalid") from error
-            if len(decoded) > MAX_WORKSPACE_FILE_BYTES:
-                raise ApiError(413, "workspace_file_too_large", "workspace file exceeds 5 MiB")
-            request["contentBase64"] = encoded
-
-        record = self.get(instance_id)
-        if record["status"] != "running":
-            raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
-        try:
-            self.runtime.heartbeat(instance_id)
-            operation = self.tasks.create_workspace_operation(instance_id, action, path, request)
-            deadline = time.monotonic() + 20
-            while time.monotonic() < deadline:
-                operation = self.tasks.get_workspace_operation(instance_id, operation["id"])
-                if operation["status"] == "completed":
-                    return operation["result"]
-                if operation["status"] == "failed":
-                    raise ApiError(409, "workspace_operation_failed", operation["error"] or "operation failed")
-                time.sleep(0.1)
-            raise ApiError(504, "workspace_operation_timeout", "microVM did not finish the file operation")
-        except ApiError:
-            raise
-        except (RuntimeFailure, TaskStoreError, OSError, sqlite3.Error) as error:
-            raise ApiError(500, "workspace_operation_failed", str(error)) from error
-
 
 class ControlPlaneHandler(BaseHTTPRequestHandler):
     """只接受固定路由和 JSON 对象的小型 HTTP 适配层。"""
@@ -947,27 +734,6 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 self.send_payload(200, {"authenticated": user is not None, "user": user})
                 return
             user = self.require_user()
-            if request_path == "/api/skills":
-                self.send_payload(
-                    200,
-                    {"skills": [
-                        {"id": skill_id, "name": details["name"],
-                         "description": details["description"]}
-                        for skill_id, details in SKILL_CATALOG.items()
-                        if not details.get("internal")
-                    ]},
-                )
-                return
-            if request_path == "/api/mcps":
-                self.send_payload(
-                    200,
-                    {"mcps": [
-                        {"id": mcp_id, "name": details["name"],
-                         "description": details["description"]}
-                        for mcp_id, details in MCP_CATALOG.items()
-                    ]},
-                )
-                return
             if request_path == "/api/instances":
                 self.send_payload(
                     200,
@@ -1069,24 +835,6 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 self.send_payload(
                     201,
                     self.control.create(self.read_json(), user["id"] if user is not None else None),
-                )
-                return
-            config_match = INSTANCE_CONFIG_ROUTE_RE.fullmatch(request_path)
-            if config_match:
-                instance_id = config_match.group(1)
-                self.authorize_instance(instance_id, user)
-                self.send_payload(
-                    200, self.control.update_agent_config(instance_id, self.read_json(12288))
-                )
-                return
-            workspace_match = WORKSPACE_ROUTE_RE.fullmatch(request_path)
-            if workspace_match:
-                instance_id, action = workspace_match.groups()
-                self.authorize_instance(instance_id, user)
-                limit = 8 * 1024 * 1024 if action == "write" else 65536
-                self.send_payload(
-                    200,
-                    self.control.workspace_operation(instance_id, action, self.read_json(limit)),
                 )
                 return
             conversation_collection = CONVERSATION_COLLECTION_ROUTE_RE.fullmatch(request_path)

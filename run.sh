@@ -21,7 +21,7 @@ Usage: ./run.sh <command>
 Commands:
   bootstrap [vm-ip] [vm-user]
                          One-command install/build after the Ubuntu VM exists
-  verify                 Run the current M19, M16, and workspace checks
+  verify                 Run authentication, network lease, and Pi Gateway checks
   start                  Start the long-running loopback control plane
   stop                   Stop the control plane; preserve instance data
   status                 Show whether the control plane is running
@@ -49,21 +49,15 @@ Commands:
   gateway-smoke-test     Verify host-side credential injection and audit logs
   lifecycle-smoke-test   Verify heartbeat, idle reaping, restart, and destroy
   configure-deepseek     Securely save a DeepSeek API key in the Linux VM
-  configure-user         Create an M16 login user and claim legacy instances
-  auth-smoke-test        Verify M16 sessions, ownership, and quotas
+  configure-user         Create a local login user and claim legacy instances
+  auth-smoke-test        Verify sessions, ownership, and quotas
   deepseek-e2e-test      Run Pi Agent against DeepSeek through Tool Gateway
   control-plane-smoke-test
-                         Control a real microVM through the M10 HTTP API
+                         Control a real microVM through the HTTP API
   agent-task-smoke-test  Verify host Pi Gateway with a real DeepSeek task
-  streaming-smoke-test   Verify M15 Pi JSONL, Gateway streaming, and SSE
-  agent-config-smoke-test
-                         Verify M17 custom prompt and tool permissions
-  skills-smoke-test      Verify M18 reviewed Skill injection into Pi
-  mcp-smoke-test         Verify M19 allowlisted host-side MCP integration
-  workspace-smoke-test   Verify M14 file operations and restart persistence
-  control-plane-start    Start the loopback-only M10 API in the Linux VM
-  control-plane-stop     Stop the M10 API; running instances remain managed
-  control-plane-status   Show whether the M10 API service is running
+  control-plane-start    Start the loopback-only API in the Linux VM
+  control-plane-stop     Stop the API; running instances remain managed
+  control-plane-status   Show whether the API service is running
   setup <vm-ip> [vm-user]
                          Configure, check, sync, and install Firecracker
 EOF
@@ -136,7 +130,7 @@ sync_repo() {
   echo "Connecting to ${target} to prepare ${REMOTE_DIR}..."
   ssh "${ssh_options[@]}" -t "${target}" "sudo install -d -o '${VM_USER}' -g '${VM_USER}' '${REMOTE_DIR}'"
   echo "Synchronizing repository to ${target}:${REMOTE_DIR}..."
-  rsync -az --checksum \
+  rsync -az --checksum --delete-delay \
     -e 'ssh -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=2' \
     --exclude '.git/' \
     --exclude '.env' \
@@ -303,7 +297,7 @@ configure_deepseek() {
 configure_user() {
   require_vm_host
   sync_repo
-  echo "Validating M16 before creating the login user in ${VM_USER}@${VM_HOST}..."
+  echo "Validating authentication before creating the login user in ${VM_USER}@${VM_HOST}..."
   ssh \
     -o ConnectTimeout=10 \
     -o ConnectionAttempts=1 \
@@ -315,7 +309,7 @@ configure_user() {
 
 smoke_test_auth() {
   sync_repo
-  echo "Testing M16 authentication and instance ownership in ${VM_USER}@${VM_HOST}..."
+  echo "Testing authentication and instance ownership in ${VM_USER}@${VM_HOST}..."
   ssh \
     -o ConnectTimeout=10 \
     -o ConnectionAttempts=1 \
@@ -339,7 +333,7 @@ test_deepseek_e2e() {
 
 smoke_test_control_plane() {
   sync_repo
-  echo "Building and testing the M10 control plane in ${VM_USER}@${VM_HOST}..."
+  echo "Building and testing the control plane in ${VM_USER}@${VM_HOST}..."
   ssh \
     -o ConnectTimeout=10 \
     -o ConnectionAttempts=1 \
@@ -363,7 +357,7 @@ smoke_test_network_lease() {
 
 smoke_test_agent_task() {
   sync_repo
-  echo "Building and testing the M19 managed Pi Agent task path in ${VM_USER}@${VM_HOST}..."
+  echo "Building and testing the host Pi Gateway task path in ${VM_USER}@${VM_HOST}..."
   ssh \
     -o ConnectTimeout=10 \
     -o ConnectionAttempts=1 \
@@ -371,16 +365,6 @@ smoke_test_agent_task() {
     -o ServerAliveCountMax=2 \
     -t "${VM_USER}@${VM_HOST}" \
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/agent-task-smoke-test.sh'"
-}
-
-smoke_test_workspace() {
-  sync_repo
-  echo "Building and testing the M14 persistent workspace in ${VM_USER}@${VM_HOST}..."
-  ssh \
-    -o ConnectTimeout=10 -o ConnectionAttempts=1 \
-    -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
-    -t "${VM_USER}@${VM_HOST}" \
-    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/workspace-smoke-test.sh'"
 }
 
 control_plane_service() {
@@ -434,8 +418,8 @@ case "${command}" in
     ;;
   verify)
     smoke_test_auth
+    smoke_test_network_lease
     smoke_test_agent_task
-    smoke_test_workspace
     ;;
   start)
     control_plane_service start
@@ -523,21 +507,6 @@ case "${command}" in
     ;;
   agent-task-smoke-test)
     smoke_test_agent_task
-    ;;
-  streaming-smoke-test)
-    smoke_test_agent_task
-    ;;
-  agent-config-smoke-test)
-    smoke_test_agent_task
-    ;;
-  skills-smoke-test)
-    smoke_test_agent_task
-    ;;
-  mcp-smoke-test)
-    smoke_test_agent_task
-    ;;
-  workspace-smoke-test)
-    smoke_test_workspace
     ;;
   control-plane-start)
     control_plane_service start
