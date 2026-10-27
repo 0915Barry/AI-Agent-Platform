@@ -24,6 +24,8 @@ import sys
 import time
 from pathlib import Path
 
+from network_manager import FileLeaseStore, NetworkFailure, NetworkManager
+
 
 DEFAULT_STATE_ROOT = Path("/var/lib/fc")
 INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -186,17 +188,34 @@ def stop_process(metadata: dict) -> str:
     return "sigkill"
 
 
-def cleanup_ephemeral(metadata: dict) -> None:
+def cleanup_ephemeral(metadata: dict, state_root: Path) -> None:
     """清理 TAP、nftables 与 jail；持久化数据盘不在此函数删除。"""
     tap_name = metadata.get("tapName", "")
-    if tap_name:
+    lease_path = metadata.get("networkLeasePath", "")
+    if lease_path:
+        expected_lease_path = (state_root / "network-leases.json").resolve()
+        if Path(lease_path).resolve() != expected_lease_path:
+            raise SystemExit(f"refusing to use unexpected network lease path: {lease_path}")
+        network = {
+            "instance_id": metadata["id"],
+            "tap": tap_name,
+            "nft_family": metadata.get("nftFamily", "inet"),
+            "nft_table": metadata.get("nftTable", ""),
+        }
+        try:
+            manager = NetworkManager(FileLeaseStore(expected_lease_path))
+            manager.release(metadata["id"], lease=network)
+        except NetworkFailure as error:
+            raise SystemExit(str(error)) from error
+    elif tap_name:
+        # 兼容升级前登记的实例元数据；新实例统一通过 NetworkManager 清理。
         if not RESOURCE_RE.fullmatch(tap_name) or len(tap_name) > 15:
             raise SystemExit("refusing to clean invalid TAP name")
         run_cleanup_command(["ip", "link", "delete", tap_name])
 
     nft_family = metadata.get("nftFamily", "")
     nft_table = metadata.get("nftTable", "")
-    if nft_table:
+    if nft_table and not lease_path:
         if nft_family not in {"ip", "ip6", "inet"}:
             raise SystemExit("refusing to clean invalid nftables family")
         if not RESOURCE_RE.fullmatch(nft_table):
@@ -216,7 +235,7 @@ def stop_instance(state_root: Path, instance_id: str, reason: str) -> dict:
     metadata_path, metadata = load_metadata(state_root, instance_id)
     stop_method = stop_process(metadata)
     stop_sidecars(metadata)
-    cleanup_ephemeral(metadata)
+    cleanup_ephemeral(metadata, state_root)
     metadata.update(
         {
             "status": "stopped",
@@ -256,6 +275,10 @@ def command_register(args: argparse.Namespace) -> None:
     volume_root = Path("/srv/fc/volumes").resolve()
     if volume_root not in volume_path.parents:
         raise SystemExit("volume path must be below /srv/fc/volumes")
+    if args.network_lease_path is not None:
+        expected_lease_path = (state_root / "network-leases.json").resolve()
+        if args.network_lease_path.resolve() != expected_lease_path:
+            raise SystemExit(f"network lease path must be {expected_lease_path}")
 
     now = int(time.time())
     sidecars = []
@@ -272,6 +295,11 @@ def command_register(args: argparse.Namespace) -> None:
         "jailPath": str(expected_jail),
         "nftFamily": args.nft_family,
         "nftTable": args.nft_table,
+        "networkLeasePath": str(args.network_lease_path.resolve()) if args.network_lease_path else "",
+        "networkSubnet": args.network_subnet,
+        "hostIp": args.host_ip,
+        "guestIp": args.guest_ip,
+        "rpcPort": args.rpc_port,
         "pid": args.pid,
         "processStartTicks": start_ticks,
         "status": "running",
@@ -339,7 +367,7 @@ def command_watch(args: argparse.Namespace) -> None:
             return
         if not process_matches(metadata):
             stop_sidecars(metadata)
-            cleanup_ephemeral(metadata)
+            cleanup_ephemeral(metadata, args.state_root)
             metadata_path, _ = load_metadata(args.state_root, instance_id)
             metadata.update(
                 {
@@ -414,6 +442,11 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--tap-name", default="")
     register.add_argument("--nft-family", default="inet")
     register.add_argument("--nft-table", default="")
+    register.add_argument("--network-lease-path", type=Path)
+    register.add_argument("--network-subnet", default="")
+    register.add_argument("--host-ip", default="")
+    register.add_argument("--guest-ip", default="")
+    register.add_argument("--rpc-port", default=0, type=int)
     register.add_argument("--activity-uid", default=0, type=int)
     register.add_argument("--sidecar-pid", action="append", default=[], type=int)
     register.set_defaults(handler=command_register)

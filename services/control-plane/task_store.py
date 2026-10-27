@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""控制面与 guest bridge 共享的 SQLite 任务、会话与消息存储。
+"""控制面与宿主机 Pi Gateway 共用的 SQLite 任务、会话与消息存储。
 
-控制面负责创建和查询任务；每个实例的 bridge 只领取属于自己的排队任务并追加
-事件。两边使用同一个 WAL 数据库，从而避免把用户提示词塞进内核命令行或临时
-网络协议。数据库只位于 Ubuntu 宿主机，不会进入 microVM。
+控制面负责创建和查询任务；Pi Gateway 原子领取排队任务，经 Pi RPC 下发后追加
+标准化事件。两者使用同一个 WAL 数据库，从而避免把用户提示词塞进内核命令行。
+数据库只位于 Ubuntu 宿主机，不会进入 microVM。
 """
 
 import json

@@ -5,8 +5,8 @@
 InstanceRuntime 调用。产品状态保存在 SQLite；Firecracker 的实时进程状态仍以
 lifecycle.py 元数据和 /proc 为准，查询时会自动对两者进行校准。
 
-M11 在同一控制面增加任务队列；M13 继续增加会话、消息和受限多轮上下文。guest
-通过独立 TAP bridge 领取任务并回传事件。
+M11 在同一控制面增加任务队列；M13 继续增加会话、消息和受限多轮上下文。宿主机
+Pi Gateway 通过实例独立 TAP 主动连接 Pi RPC，并把原生事件写回任务存储。
 M16 可启用本地账户、HttpOnly 会话和实例所有权。即便启用认证，服务仍强制只允许
 loopback 监听；macOS 开发者应通过 SSH 隧道访问。
 """
@@ -35,11 +35,14 @@ from urllib.parse import parse_qs, urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTANCE_MANAGER_DIR = REPO_ROOT / "services" / "instance-manager"
+PI_GATEWAY_DIR = REPO_ROOT / "services" / "pi-gateway"
 sys.path.insert(0, str(INSTANCE_MANAGER_DIR))
+sys.path.insert(0, str(PI_GATEWAY_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from runtime import InstanceRuntime, RuntimeFailure  # noqa: E402
 from auth import AuthStore  # noqa: E402
+from gateway import PiGateway, PiGatewayError  # noqa: E402
 from task_store import TaskStore, TaskStoreError  # noqa: E402
 
 
@@ -333,15 +336,25 @@ class ControlPlane:
     不同实例仍可由 ThreadingHTTPServer 并行处理。
     """
 
-    def __init__(self, store: InstanceStore, runtime: InstanceRuntime, tasks: TaskStore) -> None:
+    def __init__(
+        self,
+        store: InstanceStore,
+        runtime: InstanceRuntime,
+        tasks: TaskStore,
+        pi_gateway: PiGateway | None = None,
+    ) -> None:
         self.store = store
         self.runtime = runtime
         self.tasks = tasks
+        self.pi_gateway = pi_gateway
         self._locks_guard = threading.Lock()
         self._locks: dict[str, threading.Lock] = {}
         # 配额检查和状态写入必须形成一个临界区，否则两个不同实例的并发请求可能
         # 同时通过检查，使总实例数或运行实例数短暂突破上限。
         self._quota_guard = threading.Lock()
+        # 每个实例最多只有一个后台分发线程，从而保持 Pi RPC 与工作区修改串行。
+        self._dispatch_guard = threading.Lock()
+        self._dispatching: set[str] = set()
 
     def lock_for(self, instance_id: str) -> threading.Lock:
         """惰性创建每实例锁，锁表本身由 guard 保护。"""
@@ -495,11 +508,13 @@ class ControlPlane:
             raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
         try:
             self.runtime.heartbeat(instance_id)
-            return self.tasks.create(
+            task = self.tasks.create(
                 instance_id, prompt, record["systemPrompt"], record["toolMode"],
                 resolve_skill_snapshot(record["skillIds"]),
                 resolve_mcp_snapshot(record["mcpIds"]),
             )
+            self.schedule_tasks(instance_id)
+            return task
         except (RuntimeFailure, TaskStoreError, OSError, sqlite3.Error) as error:
             raise ApiError(500, "task_create_failed", str(error)) from error
 
@@ -578,7 +593,7 @@ class ControlPlane:
         try:
             self.tasks.get_conversation(instance_id, conversation_id)
             self.runtime.heartbeat(instance_id)
-            return self.tasks.create_conversation_task(
+            task = self.tasks.create_conversation_task(
                 instance_id,
                 conversation_id,
                 content,
@@ -587,12 +602,104 @@ class ControlPlane:
                 resolve_skill_snapshot(record["skillIds"]),
                 resolve_mcp_snapshot(record["mcpIds"]),
             )
+            self.schedule_tasks(instance_id)
+            return task
         except TaskStoreError as error:
             if "conversation not found" in str(error):
                 raise ApiError(404, "conversation_not_found", str(error)) from error
             raise ApiError(400, "conversation_context_invalid", str(error)) from error
         except (RuntimeFailure, OSError, sqlite3.Error) as error:
             raise ApiError(500, "conversation_task_create_failed", str(error)) from error
+
+    def schedule_tasks(self, instance_id: str) -> None:
+        """确保该实例存在一个宿主机后台线程，把 queued 任务发给 Pi RPC。"""
+
+        if self.pi_gateway is None:
+            # 单元测试和旧 smoke test 可以显式领取任务；正式服务总会注入 Gateway。
+            return
+        with self._dispatch_guard:
+            if instance_id in self._dispatching:
+                return
+            self._dispatching.add(instance_id)
+            thread = threading.Thread(
+                target=self._dispatch_tasks,
+                args=(instance_id,),
+                name=f"pi-gateway-{instance_id}",
+                daemon=True,
+            )
+            thread.start()
+
+    def _dispatch_tasks(self, instance_id: str) -> None:
+        """按创建顺序执行同一实例的任务，直到队列为空。"""
+
+        try:
+            while True:
+                task = self.tasks.claim_next(instance_id)
+                if task is None:
+                    # 在 guard 内再查一次，封住“刚判断为空又创建任务”的竞态窗口。
+                    with self._dispatch_guard:
+                        task = self.tasks.claim_next(instance_id)
+                        if task is None:
+                            self._dispatching.discard(instance_id)
+                            return
+                self._run_pi_task(instance_id, task)
+        except Exception as error:
+            # 后台线程不能让控制面退出。未执行的任务仍保持 queued，下一次提交可重启分发。
+            print(f"PI_GATEWAY_DISPATCH_ERROR instance={instance_id} error={error}", file=sys.stderr)
+            with self._dispatch_guard:
+                self._dispatching.discard(instance_id)
+
+    def _run_pi_task(self, instance_id: str, task: dict[str, Any]) -> None:
+        """解析实例端点、执行一次 Pi RPC，并把事件写回 TaskStore。"""
+
+        assert self.pi_gateway is not None
+        task_id = task["id"]
+        last_heartbeat = 0.0
+
+        def save_event(event_type: str, payload: dict[str, Any]) -> None:
+            nonlocal last_heartbeat
+            self.tasks.append_event(instance_id, task_id, event_type, payload)
+            now = time.monotonic()
+            if now - last_heartbeat >= 10:
+                self.runtime.heartbeat(instance_id)
+                last_heartbeat = now
+
+        try:
+            runtime_status = self.runtime.status(instance_id)
+            if runtime_status is None or not runtime_status.get("processAlive", False):
+                raise PiGatewayError("instance runtime is not alive")
+            guest_ip = runtime_status.get("guestIp")
+            rpc_port = runtime_status.get("rpcPort")
+            if not isinstance(guest_ip, str) or not isinstance(rpc_port, int):
+                raise PiGatewayError("instance runtime has no Pi RPC endpoint")
+            if hasattr(self.runtime, "busy"):
+                self.runtime.busy(instance_id, True)
+            self.runtime.heartbeat(instance_id)
+            output = self.pi_gateway.execute(
+                guest_ip,
+                rpc_port,
+                task["prompt"],
+                save_event,
+            )
+            self.tasks.append_event(instance_id, task_id, "completed", {"output": output})
+            self.runtime.heartbeat(instance_id)
+        except Exception as error:
+            try:
+                self.tasks.append_event(
+                    instance_id,
+                    task_id,
+                    "failed",
+                    {"error": str(error)[:4000]},
+                )
+            except TaskStoreError:
+                # stop() 可能已经把运行中任务标为失败，不重复覆盖终态。
+                pass
+        finally:
+            if hasattr(self.runtime, "busy"):
+                try:
+                    self.runtime.busy(instance_id, False)
+                except (RuntimeFailure, OSError):
+                    pass
 
     def update_agent_config(self, instance_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """校验并保存实例 Agent 配置；运行中的下一项任务会使用新快照。"""
@@ -1078,7 +1185,7 @@ def main() -> None:
         deepseek_credential=args.deepseek_credential,
         task_database=args.task_database,
     )
-    control = ControlPlane(store, runtime, tasks)
+    control = ControlPlane(store, runtime, tasks, PiGateway())
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), ControlPlaneHandler)
     server.control = control  # type: ignore[attr-defined]
     server.auth_store = auth_store  # type: ignore[attr-defined]

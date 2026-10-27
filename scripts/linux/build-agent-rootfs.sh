@@ -44,6 +44,7 @@ guest_init="${repo_dir}/scripts/guest/agent-init.sh"
 guest_task_worker="${repo_dir}/scripts/guest/agent-task-worker.sh"
 guest_pi_event_forwarder="${repo_dir}/scripts/guest/pi-event-forwarder.mjs"
 guest_workspace_operation="${repo_dir}/scripts/guest/workspace-operation.mjs"
+guest_pi_rpc_session="${repo_dir}/scripts/guest/pi-rpc-session.sh"
 
 build_id="$(
   {
@@ -54,14 +55,110 @@ build_id="$(
     sha256sum "${guest_task_worker}" | awk '{print $1}'
     sha256sum "${guest_pi_event_forwarder}" | awk '{print $1}'
     sha256sum "${guest_workspace_operation}" | awk '{print $1}'
+    sha256sum "${guest_pi_rpc_session}" | awk '{print $1}'
   } | sha256sum | awk '{print $1}'
 )"
+
+install_project_runtime_files() {
+  root="$1"
+  install -d -o "${AGENT_UID}" -g "${AGENT_GID}" -m 0750 \
+    "${root}/home/pi/.pi/agent"
+  install -d -o "${AGENT_UID}" -g "${AGENT_GID}" -m 0755 \
+    "${root}/workspace"
+  install -d -o root -g root -m 0755 \
+    "${root}/mnt/agent-data"
+  install -o root -g root -m 0755 \
+    "${guest_init}" \
+    "${root}/usr/local/sbin/agent-init"
+  install -o root -g root -m 0755 \
+    "${guest_task_worker}" \
+    "${root}/usr/local/sbin/agent-task-worker"
+  install -o root -g root -m 0755 \
+    "${guest_pi_event_forwarder}" \
+    "${root}/usr/local/sbin/pi-event-forwarder.mjs"
+  install -o root -g root -m 0755 \
+    "${guest_workspace_operation}" \
+    "${root}/usr/local/sbin/workspace-operation.mjs"
+  install -o root -g root -m 0755 \
+    "${guest_pi_rpc_session}" \
+    "${root}/usr/local/sbin/pi-rpc-session"
+
+  # 平台运行文件始终由 root 持有；只有工作区与 Pi 状态目录允许 pi 写入。
+  chown -R 0:0 "${root}/usr/local"
+  chmod -R go-w "${root}/usr/local"
+}
+
+write_build_metadata() {
+  root="$1"
+  cat > "${root}/etc/ai-agent-platform-build" <<EOF
+BUILD_ID=${build_id}
+UBUNTU_RELEASE=${UBUNTU_RELEASE}
+UBUNTU_SNAPSHOT=${UBUNTU_SNAPSHOT}
+NODE_VERSION=${NODE_VERSION}
+PI_PACKAGE=${PI_PACKAGE}
+PI_VERSION=${PI_VERSION}
+AGENT_UID=${AGENT_UID}
+ARCHITECTURE=${arch}
+EOF
+}
 
 if [[ -f "${rootfs_path}" && -f "${build_id_path}" && -f "${runtime_dir}/config.json" ]] \
   && [[ "$(<"${build_id_path}")" == "${build_id}" ]]; then
   echo "Verified existing runtime rootfs: ${rootfs_path}"
   echo "Build ID: ${build_id}"
   exit 0
+fi
+
+# Guest脚本变化不应强制重新下载Ubuntu。只要基础系统、Node、Pi和UID仍与
+# 当前固定版本一致，就离线更新现有rootfs中的项目文件。基础版本发生变化时
+# 才继续执行下面的完整debootstrap流程。
+if [[ -f "${rootfs_path}" && -f "${manifest_path}" && -f "${runtime_dir}/config.json" ]] \
+  && [[ "$(stat -c '%h' "${rootfs_path}")" == "1" ]]; then
+  refresh_mount="$(mktemp -d /var/tmp/agent-rootfs-refresh.XXXXXX)"
+  refresh_mounted=false
+  cleanup_refresh() {
+    if [[ "${refresh_mounted}" == true ]]; then
+      umount "${refresh_mount}" 2>/dev/null || true
+    fi
+    rmdir "${refresh_mount}" 2>/dev/null || true
+  }
+  trap cleanup_refresh EXIT
+
+  set +e
+  e2fsck -f -y "${rootfs_path}" >/dev/null
+  refresh_check_status=$?
+  set -e
+  if [[ "${refresh_check_status}" -le 1 ]]; then
+    mount -o loop,rw "${rootfs_path}" "${refresh_mount}"
+    refresh_mounted=true
+    build_metadata="${refresh_mount}/etc/ai-agent-platform-build"
+    if [[ -f "${build_metadata}" ]] \
+      && grep -Fxq "UBUNTU_RELEASE=${UBUNTU_RELEASE}" "${build_metadata}" \
+      && grep -Fxq "UBUNTU_SNAPSHOT=${UBUNTU_SNAPSHOT}" "${build_metadata}" \
+      && grep -Fxq "NODE_VERSION=${NODE_VERSION}" "${build_metadata}" \
+      && grep -Fxq "PI_PACKAGE=${PI_PACKAGE}" "${build_metadata}" \
+      && grep -Fxq "PI_VERSION=${PI_VERSION}" "${build_metadata}" \
+      && grep -Fxq "AGENT_UID=${AGENT_UID}" "${build_metadata}" \
+      && grep -Fxq "ARCHITECTURE=${arch}" "${build_metadata}" \
+      && [[ -x "${refresh_mount}/usr/bin/socat" ]]; then
+      install_project_runtime_files "${refresh_mount}"
+      write_build_metadata "${refresh_mount}"
+      sync
+      umount "${refresh_mount}"
+      refresh_mounted=false
+      rmdir "${refresh_mount}"
+      trap - EXIT
+      printf '%s\n' "${build_id}" > "${build_id_path}"
+      chmod 0644 "${rootfs_path}" "${build_id_path}" "${manifest_path}"
+      echo "Updated project runtime files in existing rootfs: ${rootfs_path}"
+      echo "Build ID: ${build_id}"
+      exit 0
+    fi
+    umount "${refresh_mount}"
+    refresh_mounted=false
+  fi
+  rmdir "${refresh_mount}"
+  trap - EXIT
 fi
 
 export DEBIAN_FRONTEND=noninteractive
@@ -177,7 +274,7 @@ mount --make-rslave "${mount_dir}/dev"
 chroot "${mount_dir}" apt-get update
 chroot "${mount_dir}" apt-get install -y --no-install-recommends \
   bash ca-certificates curl git iproute2 iputils-ping jq openssh-client \
-  procps ripgrep tini util-linux
+  procps ripgrep socat tini util-linux
 chroot "${mount_dir}" apt-get clean
 rm -rf "${mount_dir}/var/lib/apt/lists/"*
 
@@ -202,29 +299,7 @@ chroot "${mount_dir}" useradd \
   --shell /bin/bash \
   pi
 
-install -d -o "${AGENT_UID}" -g "${AGENT_GID}" -m 0750 \
-  "${mount_dir}/home/pi/.pi/agent"
-install -d -o "${AGENT_UID}" -g "${AGENT_GID}" -m 0755 \
-  "${mount_dir}/workspace"
-install -d -o root -g root -m 0755 \
-  "${mount_dir}/mnt/agent-data"
-install -o root -g root -m 0755 \
-  "${guest_init}" \
-  "${mount_dir}/usr/local/sbin/agent-init"
-install -o root -g root -m 0755 \
-  "${guest_task_worker}" \
-  "${mount_dir}/usr/local/sbin/agent-task-worker"
-install -o root -g root -m 0755 \
-  "${guest_pi_event_forwarder}" \
-  "${mount_dir}/usr/local/sbin/pi-event-forwarder.mjs"
-install -o root -g root -m 0755 \
-  "${guest_workspace_operation}" \
-  "${mount_dir}/usr/local/sbin/workspace-operation.mjs"
-
-# Archive metadata must never make the unprivileged Agent user the owner of
-# platform runtime files. Only workspace and Pi state are writable by pi.
-chown -R 0:0 "${mount_dir}/usr/local"
-chmod -R go-w "${mount_dir}/usr/local"
+install_project_runtime_files "${mount_dir}"
 
 node_actual="$(chroot "${mount_dir}" node --version)"
 pi_actual="$(chroot "${mount_dir}" env PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 pi --version)"
@@ -243,16 +318,7 @@ if [[ "${uid_actual}" != "${AGENT_UID}" ]]; then
   exit 1
 fi
 
-cat > "${mount_dir}/etc/ai-agent-platform-build" <<EOF
-BUILD_ID=${build_id}
-UBUNTU_RELEASE=${UBUNTU_RELEASE}
-UBUNTU_SNAPSHOT=${UBUNTU_SNAPSHOT}
-NODE_VERSION=${NODE_VERSION}
-PI_PACKAGE=${PI_PACKAGE}
-PI_VERSION=${PI_VERSION}
-AGENT_UID=${AGENT_UID}
-ARCHITECTURE=${arch}
-EOF
+write_build_metadata "${mount_dir}"
 
 chroot "${mount_dir}" dpkg-query -W -f='${Package}\t${Version}\n' \
   | sort > "${manifest_path}.building"

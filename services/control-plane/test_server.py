@@ -50,6 +50,8 @@ class FakeRuntime:
             "status": "running",
             "processAlive": True,
             "idleSeconds": 0,
+            "guestIp": "172.29.0.2",
+            "rpcPort": 8080,
         }
         self.instances[instance_id] = status
         return status
@@ -79,6 +81,24 @@ class FakeRuntime:
 
         self.calls.append(("destroy", instance_id))
         self.instances.pop(instance_id, None)
+
+    def busy(self, instance_id: str, enabled: bool) -> None:
+        """记录任务执行保护开关，行为与真实生命周期管理器保持一致。"""
+
+        self.calls.append(("busy_on" if enabled else "busy_off", instance_id))
+
+
+class FakePiGateway:
+    """不连接网络，模拟一次带文本增量的 Pi RPC 执行。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int, str]] = []
+
+    def execute(self, host: str, port: int, prompt: str, on_event) -> str:
+        self.calls.append((host, port, prompt))
+        on_event("progress", {"stage": "model_started"})
+        on_event("text", {"delta": "自动"})
+        return "自动完成"
 
 
 class ControlPlaneTests(unittest.TestCase):
@@ -110,6 +130,8 @@ class ControlPlaneTests(unittest.TestCase):
         running = self.control.start("agent-test")
         self.assertEqual(running["status"], "running")
         self.assertTrue(running["runtime"]["processAlive"])
+        self.assertEqual(running["runtime"]["guestIp"], "172.29.0.2")
+        self.assertEqual(running["runtime"]["rpcPort"], 8080)
 
         heartbeat = self.control.heartbeat("agent-test")
         self.assertEqual(heartbeat["runtime"]["idleSeconds"], 0)
@@ -251,6 +273,32 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(completed["output"], "M11_OK")
         event_types = [event["type"] for event in self.control.task_events("agent-task", claimed["id"])]
         self.assertEqual(event_types, ["queued", "started", "completed"])
+
+    def test_pi_gateway_automatically_dispatches_queued_task(self) -> None:
+        """正式控制面应把任务主动发给 Guest Pi RPC，不再等待 Agent Bridge 领取。"""
+
+        gateway = FakePiGateway()
+        self.control.pi_gateway = gateway
+        self.control.create({"id": "agent-gateway"})
+        self.control.start("agent-gateway")
+        queued = self.control.create_task("agent-gateway", {"prompt": "执行任务"})
+
+        deadline = time.monotonic() + 2
+        task = self.control.get_task("agent-gateway", queued["id"])
+        while task["status"] not in {"completed", "failed"} and time.monotonic() < deadline:
+            time.sleep(0.01)
+            task = self.control.get_task("agent-gateway", queued["id"])
+
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(task["output"], "自动完成")
+        self.assertEqual(gateway.calls, [("172.29.0.2", 8080, "执行任务")])
+        event_types = [
+            event["type"]
+            for event in self.control.task_events("agent-gateway", queued["id"])
+        ]
+        self.assertEqual(event_types, ["queued", "started", "progress", "text", "completed"])
+        self.assertIn(("busy_on", "agent-gateway"), self.runtime.calls)
+        self.assertIn(("busy_off", "agent-gateway"), self.runtime.calls)
 
     def test_agent_config_is_validated_and_snapshotted_into_task(self) -> None:
         """配置修改后新任务应携带独立快照，且只允许两种安全工具集合。"""

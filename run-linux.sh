@@ -15,6 +15,10 @@ Commands:
   start                 Start the long-running loopback control plane
   stop                  Stop the control plane; preserve instance data
   status                Show whether the control plane is running
+  lab-start             Start a long-running two-disk learning microVM
+  lab-status            Show the laboratory process, paths, and drives
+  lab-inspect           Show disk and process data reported by the Guest
+  lab-stop              Stop the laboratory microVM; preserve its data disk
   doctor                Check Linux, architecture, and /dev/kvm
   install-firecracker   Install the pinned Firecracker version
   prepare-microvm       Download verified artifacts for this CPU architecture
@@ -23,6 +27,8 @@ Commands:
   runtime-smoke-test    Verify Node.js, Pi Agent, and non-root UID
   security-smoke-test   Verify guest permissions and jailer hardening
   network-smoke-test    Verify governed HTTPS egress
+  network-lease-smoke-test
+                        Verify managed /30 allocation and release without model use
   persistence-smoke-test
                          Verify read-only rootfs and persistent data
   gateway-smoke-test    Verify host-side credential injection
@@ -33,7 +39,7 @@ Commands:
   deepseek-e2e-test     Run Pi Agent against DeepSeek through Tool Gateway
   control-plane-smoke-test
                         Control a real microVM through the M10 HTTP API
-  agent-task-smoke-test Run the managed Pi task path (legacy command alias)
+  agent-task-smoke-test Verify host Pi Gateway with a real DeepSeek task
   streaming-smoke-test  Verify M15 Pi JSONL, Gateway streaming, and SSE
   agent-config-smoke-test
                         Verify M17 custom prompt and tool permissions
@@ -80,6 +86,19 @@ case "${command}" in
   status)
     sudo "${repo_dir}/scripts/linux/control-plane-service.sh" status
     ;;
+  lab-start)
+    build_rootfs
+    sudo "${repo_dir}/scripts/linux/microvm-lab.sh" start
+    ;;
+  lab-status)
+    sudo "${repo_dir}/scripts/linux/microvm-lab.sh" status
+    ;;
+  lab-inspect)
+    sudo "${repo_dir}/scripts/linux/microvm-lab.sh" inspect
+    ;;
+  lab-stop)
+    sudo "${repo_dir}/scripts/linux/microvm-lab.sh" stop
+    ;;
   doctor)
     "${repo_dir}/scripts/linux/doctor.sh"
     ;;
@@ -107,6 +126,10 @@ case "${command}" in
   network-smoke-test)
     build_rootfs
     sudo "${repo_dir}/scripts/linux/network-smoke-test.sh"
+    ;;
+  network-lease-smoke-test)
+    build_rootfs
+    sudo "${repo_dir}/scripts/linux/network-lease-smoke-test.sh"
     ;;
   persistence-smoke-test)
     build_rootfs

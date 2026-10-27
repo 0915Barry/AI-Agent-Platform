@@ -25,6 +25,10 @@ Commands:
   start                  Start the long-running loopback control plane
   stop                   Stop the control plane; preserve instance data
   status                 Show whether the control plane is running
+  lab-start              Start a long-running two-disk learning microVM
+  lab-status             Show the laboratory process, paths, and drives
+  lab-inspect            Show disk and process data reported by the Guest
+  lab-stop               Stop the laboratory microVM; preserve its data disk
   tunnel                Forward local port 18090 to the VM control plane
   doctor                Check the macOS host
   configure <vm-ip> [vm-user]
@@ -38,6 +42,8 @@ Commands:
   runtime-smoke-test    Boot the runtime rootfs and verify Node, Pi, and UID
   security-smoke-test   Verify guest permissions and jailer hardening
   network-smoke-test    Verify TAP, HTTPS egress, and private-network denial
+  network-lease-smoke-test
+                         Verify managed /30 allocation and release without model use
   persistence-smoke-test
                          Verify read-only rootfs and persistent data volume
   gateway-smoke-test     Verify host-side credential injection and audit logs
@@ -48,7 +54,7 @@ Commands:
   deepseek-e2e-test      Run Pi Agent against DeepSeek through Tool Gateway
   control-plane-smoke-test
                          Control a real microVM through the M10 HTTP API
-  agent-task-smoke-test  Run the managed Pi task path (legacy command alias)
+  agent-task-smoke-test  Verify host Pi Gateway with a real DeepSeek task
   streaming-smoke-test   Verify M15 Pi JSONL, Gateway streaming, and SSE
   agent-config-smoke-test
                          Verify M17 custom prompt and tool permissions
@@ -343,6 +349,18 @@ smoke_test_control_plane() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/control-plane-smoke-test.sh'"
 }
 
+smoke_test_network_lease() {
+  sync_repo
+  echo "Building and testing managed network leases in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/network-lease-smoke-test.sh'"
+}
+
 smoke_test_agent_task() {
   sync_repo
   echo "Building and testing the M19 managed Pi Agent task path in ${VM_USER}@${VM_HOST}..."
@@ -392,6 +410,23 @@ control_plane_tunnel() {
     "${VM_USER}@${VM_HOST}"
 }
 
+microvm_lab() {
+  action="$1"
+  require_vm_host
+  if [[ "${action}" == "start" ]]; then
+    sync_repo
+    remote_command="sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/microvm-lab.sh' start"
+  else
+    remote_command="sudo '${REMOTE_DIR}/scripts/linux/microvm-lab.sh' '${action}'"
+  fi
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" "${remote_command}"
+}
+
 command="${1:-}"
 case "${command}" in
   bootstrap)
@@ -410,6 +445,18 @@ case "${command}" in
     ;;
   status)
     control_plane_service status
+    ;;
+  lab-start)
+    microvm_lab start
+    ;;
+  lab-status)
+    microvm_lab status
+    ;;
+  lab-inspect)
+    microvm_lab inspect
+    ;;
+  lab-stop)
+    microvm_lab stop
     ;;
   tunnel)
     control_plane_tunnel
@@ -446,6 +493,9 @@ case "${command}" in
     ;;
   network-smoke-test)
     smoke_test_network
+    ;;
+  network-lease-smoke-test)
+    smoke_test_network_lease
     ;;
   persistence-smoke-test)
     smoke_test_persistence

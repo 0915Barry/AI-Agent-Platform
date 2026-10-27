@@ -10,11 +10,8 @@ rootfs 始终只读；用户工作区位于独立 ext4 数据盘。停止实例�
 """
 
 import json
-import hashlib
-import ipaddress
 import os
 import pwd
-import secrets
 import shutil
 import socket
 import subprocess
@@ -25,6 +22,7 @@ import time
 from pathlib import Path
 
 from lifecycle import process_matches, validate_instance_id
+from network_manager import FileLeaseStore, NetworkFailure, NetworkManager
 
 
 DEFAULT_STATE_ROOT = Path("/var/lib/fc")
@@ -37,8 +35,7 @@ FIRECRACKER_GROUP = "firecracker"
 GATEWAY_USER = "agent-gateway"
 GATEWAY_GROUP = "agent-gateway"
 GATEWAY_PORT = 18082
-BRIDGE_PORT = 18083
-MCP_PORT = 18084
+PI_RPC_PORT = 8080
 
 
 class RuntimeFailure(RuntimeError):
@@ -88,10 +85,15 @@ class InstanceRuntime:
         self.idle_timeout_seconds = idle_timeout_seconds
         self.deepseek_credential = deepseek_credential.resolve() if deepseek_credential else None
         self.task_database = task_database.resolve() if task_database else None
+        self.network_lease_path = self.state_root / "network-leases.json"
+        # 正式受管实例需要由宿主机主动连接 Guest 的 Pi RPC 端口，因此允许
+        # 已建立的 host -> Guest TCP 连接响应通过实例 nftables 规则。
+        self.network_manager = NetworkManager(
+            FileLeaseStore(self.network_lease_path),
+            allow_host_connections=True,
+        )
         self.manager = Path(__file__).resolve().with_name("lifecycle.py")
         self.gateway = Path(__file__).resolve().parents[1] / "tool-gateway" / "gateway.py"
-        self.bridge = Path(__file__).resolve().parents[1] / "agent-bridge" / "bridge.py"
-        self.mcp_gateway = Path(__file__).resolve().parents[1] / "mcp-gateway" / "server.py"
         kernel_version = load_version("SMOKE_KERNEL_VERSION")
         self.agent_uid = int(load_version("AGENT_UID"))
         self.agent_gid = int(load_version("AGENT_GID"))
@@ -168,8 +170,6 @@ class InstanceRuntime:
         if self.deepseek_credential is not None:
             if not self.deepseek_credential.is_file():
                 raise RuntimeFailure(f"DeepSeek credential is missing: {self.deepseek_credential}")
-            if self.task_database is None:
-                raise RuntimeFailure("task database is required when managed Agent networking is enabled")
         return account.pw_uid, account.pw_gid, gateway_account.pw_uid, gateway_account.pw_gid
 
     def paths(self, instance_id: str) -> dict[str, Path]:
@@ -193,14 +193,7 @@ class InstanceRuntime:
             "sidecars": state_dir / "sidecars",
             "gateway_log": state_dir / "sidecars" / "gateway.log",
             "gateway_audit": state_dir / "sidecars" / "gateway.audit.jsonl",
-            "bridge_log": state_dir / "sidecars" / "bridge.log",
-            "bridge_audit": state_dir / "sidecars" / "bridge.audit.jsonl",
-            "mcp_log": state_dir / "sidecars" / "mcp.log",
-            "mcp_audit": state_dir / "sidecars" / "mcp.audit.jsonl",
             "credential": state_dir / "sidecars" / "deepseek-api-key",
-            "bridge_token": state_dir / "sidecars" / "bridge-token",
-            "mcp_token": state_dir / "sidecars" / "mcp-token",
-            "mcp_data": state_dir / "sidecars" / "mcp-verification-record",
         }
 
     def create_volume(self, volume_path: Path, uid: int, gid: int) -> None:
@@ -239,27 +232,6 @@ class InstanceRuntime:
                 run(["umount", str(mount_path)], check=False)
             shutil.rmtree(mount_path, ignore_errors=True)
             building_path.unlink(missing_ok=True)
-
-    def network_identity(self, instance_id: str) -> dict[str, str]:
-        """从实例 ID 稳定派生 /30 子网、TAP、MAC 和 nftables 表名。"""
-
-        digest = hashlib.sha256(instance_id.encode("utf-8")).digest()
-        slot = int.from_bytes(digest[:2], "big") % 16384
-        network = ipaddress.ip_network(f"172.29.0.0/16")[slot * 4]
-        subnet = ipaddress.ip_network(f"{network}/30")
-        host_ip = str(subnet.network_address + 1)
-        guest_ip = str(subnet.network_address + 2)
-        suffix = digest.hex()[:10]
-        return {
-            "tap": f"fc{suffix}",
-            "nft_table": f"aap_{digest.hex()[:12]}",
-            "subnet": str(subnet),
-            "host_ip": host_ip,
-            "host_cidr": f"{host_ip}/30",
-            "guest_ip": guest_ip,
-            "guest_cidr": f"{guest_ip}/30",
-            "guest_mac": f"06:00:{digest[2]:02x}:{digest[3]:02x}:{digest[4]:02x}:{digest[5]:02x}",
-        }
 
     def configure_agent_volume(self, volume_path: Path, host_ip: str) -> None:
         """离线挂载数据盘并写入只含占位凭据的 Pi provider 配置。"""
@@ -301,40 +273,6 @@ class InstanceRuntime:
                 run(["umount", str(mount_path)], check=False)
             shutil.rmtree(mount_path, ignore_errors=True)
 
-    def setup_network(self, network: dict[str, str], firecracker_uid: int) -> None:
-        """创建实例专用 TAP，仅放行模型、任务桥和 MCP Gateway 三个端口。"""
-
-        if run(["ip", "-4", "route", "show", "exact", network["subnet"]], check=False).stdout.strip():
-            raise RuntimeFailure(f"instance subnet conflicts with an existing route: {network['subnet']}")
-        run(["ip", "tuntap", "add", "dev", network["tap"], "mode", "tap", "user", str(firecracker_uid)])
-        try:
-            run(["ip", "address", "add", network["host_cidr"], "dev", network["tap"]])
-            run(["ip", "link", "set", "dev", network["tap"], "up"])
-            rules = f"""table inet {network['nft_table']} {{
-  chain input {{
-    type filter hook input priority -10; policy accept;
-    iifname \"{network['tap']}\" ip saddr {network['guest_ip']} ip daddr {network['host_ip']} tcp dport {{ {GATEWAY_PORT}, {BRIDGE_PORT}, {MCP_PORT} }} counter accept
-    iifname \"{network['tap']}\" ip saddr {network['guest_ip']} counter drop
-  }}
-  chain forward {{
-    type filter hook forward priority -10; policy accept;
-    iifname \"{network['tap']}\" counter drop
-    oifname \"{network['tap']}\" counter drop
-  }}
-}}
-"""
-            with tempfile.NamedTemporaryFile("w", prefix="agent-network.", suffix=".nft", delete=False) as handle:
-                handle.write(rules)
-                rules_path = Path(handle.name)
-            try:
-                run(["nft", "-f", str(rules_path)])
-            finally:
-                rules_path.unlink(missing_ok=True)
-        except Exception:
-            run(["nft", "delete", "table", "inet", network["nft_table"]], check=False)
-            run(["ip", "link", "delete", network["tap"]], check=False)
-            raise
-
     @staticmethod
     def terminate_process(process: subprocess.Popen[bytes] | subprocess.Popen[str]) -> None:
         """尽力终止尚未交给生命周期管理器的启动阶段进程。"""
@@ -348,7 +286,7 @@ class InstanceRuntime:
             process.kill()
             process.wait(timeout=1)
 
-    def start_sidecars(
+    def start_model_gateway(
         self,
         instance_id: str,
         paths: dict[str, Path],
@@ -356,41 +294,19 @@ class InstanceRuntime:
         gateway_uid: int,
         gateway_gid: int,
     ) -> list[subprocess.Popen[bytes]]:
-        """以专用低权限用户启动模型 Gateway、任务桥与 MCP Gateway。"""
+        """以专用低权限用户启动当前实例的模型代理。"""
 
-        if self.deepseek_credential is None or self.task_database is None:
-            raise RuntimeFailure("managed Agent sidecars are not configured")
+        if self.deepseek_credential is None:
+            raise RuntimeFailure("managed model gateway is not configured")
         paths["sidecars"].mkdir(parents=True, exist_ok=True, mode=0o750)
         os.chown(paths["sidecars"], gateway_uid, gateway_gid)
-        for log_path in (
-            paths["gateway_log"], paths["gateway_audit"], paths["bridge_log"],
-            paths["bridge_audit"], paths["mcp_log"], paths["mcp_audit"],
-        ):
+        for log_path in (paths["gateway_log"], paths["gateway_audit"]):
             log_path.write_text("", encoding="utf-8")
             os.chown(log_path, gateway_uid, gateway_gid)
             os.chmod(log_path, 0o600)
         shutil.copyfile(self.deepseek_credential, paths["credential"])
         os.chown(paths["credential"], gateway_uid, gateway_gid)
         os.chmod(paths["credential"], 0o400)
-        paths["bridge_token"].write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
-        os.chown(paths["bridge_token"], gateway_uid, gateway_gid)
-        os.chmod(paths["bridge_token"], 0o400)
-        # mcp-token 只是 guest 到本实例 Gateway 的短期访问令牌。真正的外部凭据或
-        # 业务数据不进入 microVM；验收记录每次启动重新生成，避免模型从 prompt 猜值。
-        paths["mcp_token"].write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
-        paths["mcp_data"].write_text(secrets.token_hex(12) + "\n", encoding="utf-8")
-        for protected_path in (paths["mcp_token"], paths["mcp_data"]):
-            os.chown(protected_path, gateway_uid, gateway_gid)
-            os.chmod(protected_path, 0o400)
-
-        task_parent = self.task_database.parent
-        task_parent.mkdir(parents=True, exist_ok=True, mode=0o2770)
-        os.chown(task_parent, 0, gateway_gid)
-        os.chmod(task_parent, 0o2770)
-        for database_file in task_parent.glob(f"{self.task_database.name}*"):
-            os.chown(database_file, 0, gateway_gid)
-            os.chmod(database_file, 0o660)
-
         base = [
             "setpriv",
             "--reuid",
@@ -400,8 +316,6 @@ class InstanceRuntime:
             "--clear-groups",
         ]
         gateway_handle = paths["gateway_log"].open("ab", buffering=0)
-        bridge_handle = paths["bridge_log"].open("ab", buffering=0)
-        mcp_handle = paths["mcp_log"].open("ab", buffering=0)
         gateway_process = subprocess.Popen(
             [
                 *base,
@@ -427,80 +341,27 @@ class InstanceRuntime:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        bridge_process = subprocess.Popen(
-            [
-                *base,
-                sys.executable,
-                str(self.bridge),
-                "--listen-host",
-                network["host_ip"],
-                "--listen-port",
-                str(BRIDGE_PORT),
-                "--database",
-                str(self.task_database),
-                "--instance-id",
-                instance_id,
-                "--token-file",
-                str(paths["bridge_token"]),
-                "--activity-file",
-                str(paths["activity"]),
-                "--audit-file",
-                str(paths["bridge_audit"]),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=bridge_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        mcp_process = subprocess.Popen(
-            [
-                *base,
-                sys.executable,
-                str(self.mcp_gateway),
-                "--listen-host",
-                network["host_ip"],
-                "--listen-port",
-                str(MCP_PORT),
-                "--token-file",
-                str(paths["mcp_token"]),
-                "--data-file",
-                str(paths["mcp_data"]),
-                "--audit-file",
-                str(paths["mcp_audit"]),
-                "--instance-id",
-                instance_id,
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=mcp_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
         gateway_handle.close()
-        bridge_handle.close()
-        mcp_handle.close()
-        processes = [gateway_process, bridge_process, mcp_process]
+        processes = [gateway_process]
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if any(process.poll() is not None for process in processes):
                 break
-            ready = True
-            for port in (GATEWAY_PORT, BRIDGE_PORT, MCP_PORT):
-                try:
-                    with socket.create_connection((network["host_ip"], port), timeout=0.2):
-                        pass
-                except OSError:
-                    ready = False
-            if ready:
+            try:
+                with socket.create_connection(
+                    (network["host_ip"], GATEWAY_PORT), timeout=0.2
+                ):
+                    pass
                 return processes
+            except OSError:
+                pass
             time.sleep(0.2)
         for process in processes:
             self.terminate_process(process)
         gateway_tail = paths["gateway_log"].read_text(encoding="utf-8", errors="replace")[-2000:]
-        bridge_tail = paths["bridge_log"].read_text(encoding="utf-8", errors="replace")[-2000:]
-        mcp_tail = paths["mcp_log"].read_text(encoding="utf-8", errors="replace")[-2000:]
         raise RuntimeFailure(
-            "managed sidecars did not become ready"
-            f"\ngateway={gateway_tail}\nbridge={bridge_tail}\nmcp={mcp_tail}"
+            "managed model gateway did not become ready"
+            f"\ngateway={gateway_tail}"
         )
 
     def prepare_jail(
@@ -508,8 +369,6 @@ class InstanceRuntime:
         instance_id: str,
         paths: dict[str, Path],
         network: dict[str, str] | None = None,
-        bridge_token: str | None = None,
-        mcp_token: str | None = None,
     ) -> None:
         """建立 jail hard link，并生成只读 rootfs + 可写数据盘配置。"""
         shutil.rmtree(paths["jail"], ignore_errors=True)
@@ -530,8 +389,6 @@ class InstanceRuntime:
         )
         network_interfaces: list[dict[str, str]] = []
         if network is not None:
-            if bridge_token is None or mcp_token is None:
-                raise RuntimeFailure("bridge and MCP tokens are required for managed networking")
             boot_args += (
                 " agent_managed_runtime=1"
                 f" agent_ip={network['guest_cidr']}"
@@ -539,12 +396,9 @@ class InstanceRuntime:
                 f" agent_dns={network['host_ip']}"
                 f" agent_gateway_host={network['host_ip']}"
                 f" agent_gateway_port={GATEWAY_PORT}"
-                f" agent_bridge_host={network['host_ip']}"
-                f" agent_bridge_port={BRIDGE_PORT}"
-                f" agent_bridge_token={bridge_token}"
-                f" agent_mcp_host={network['host_ip']}"
-                f" agent_mcp_port={MCP_PORT}"
-                f" agent_mcp_token={mcp_token}"
+                f" agent_rpc_port={PI_RPC_PORT}"
+                " agent_rpc_provider=deepseek-gateway"
+                " agent_rpc_model=deepseek-flash"
             )
             network_interfaces = [
                 {
@@ -636,29 +490,36 @@ class InstanceRuntime:
         network: dict[str, str] | None = None
         sidecars: list[subprocess.Popen[bytes]] = []
         if self.deepseek_credential is not None:
-            network = self.network_identity(instance_id)
-            self.configure_agent_volume(paths["volume"], network["host_ip"])
-            paths["activity"].parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-            paths["activity"].touch()
-            os.chown(paths["activity"], gateway_uid, gateway_gid)
-            os.chmod(paths["activity"], 0o600)
-            self.setup_network(network, uid)
             try:
-                sidecars = self.start_sidecars(
+                network = self.network_manager.allocate(instance_id)
+                self.configure_agent_volume(paths["volume"], str(network["host_ip"]))
+                paths["activity"].parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+                paths["activity"].touch()
+                os.chown(paths["activity"], gateway_uid, gateway_gid)
+                os.chmod(paths["activity"], 0o600)
+                self.network_manager.setup(
+                    network,
+                    uid,
+                    (GATEWAY_PORT,),
+                )
+                sidecars = self.start_model_gateway(
                     instance_id,
                     paths,
                     network,
                     gateway_uid,
                     gateway_gid,
                 )
-                bridge_token = paths["bridge_token"].read_text(encoding="utf-8").strip()
-                mcp_token = paths["mcp_token"].read_text(encoding="utf-8").strip()
-                self.prepare_jail(instance_id, paths, network, bridge_token, mcp_token)
-            except Exception:
+                self.prepare_jail(instance_id, paths, network)
+            except Exception as error:
                 for sidecar in sidecars:
                     self.terminate_process(sidecar)
-                run(["nft", "delete", "table", "inet", network["nft_table"]], check=False)
-                run(["ip", "link", "delete", network["tap"]], check=False)
+                if network is not None:
+                    try:
+                        self.network_manager.release(instance_id)
+                    except NetworkFailure:
+                        pass
+                if isinstance(error, NetworkFailure):
+                    raise RuntimeFailure(str(error)) from error
                 raise
         else:
             self.prepare_jail(instance_id, paths)
@@ -706,8 +567,8 @@ class InstanceRuntime:
             while time.monotonic() < deadline:
                 console = paths["console"].read_text(encoding="utf-8", errors="replace")
                 runtime_ready = "\nAGENT_RUNTIME_READY " in f"\n{console}"
-                worker_ready = network is None or "\nAGENT_TASK_WORKER_READY " in f"\n{console}"
-                if runtime_ready and worker_ready:
+                rpc_ready = network is None or "\nPI_RPC_READY " in f"\n{console}"
+                if runtime_ready and rpc_ready:
                     ready = True
                     break
                 if process.poll() is not None:
@@ -738,14 +599,25 @@ class InstanceRuntime:
                 str(paths["volume"]),
             ]
             if network is not None:
+                self.network_manager.activate(instance_id)
                 register_arguments.extend(
                     [
                         "--tap-name",
-                        network["tap"],
+                        str(network["tap"]),
                         "--nft-family",
                         "inet",
                         "--nft-table",
-                        network["nft_table"],
+                        str(network["nft_table"]),
+                        "--network-lease-path",
+                        str(self.network_lease_path),
+                        "--network-subnet",
+                        str(network["subnet"]),
+                        "--host-ip",
+                        str(network["host_ip"]),
+                        "--guest-ip",
+                        str(network["guest_ip"]),
+                        "--rpc-port",
+                        str(PI_RPC_PORT),
                         "--activity-uid",
                         str(gateway_uid),
                     ]
@@ -780,7 +652,7 @@ class InstanceRuntime:
             if status is None:
                 raise RuntimeFailure("lifecycle registration did not create instance metadata")
             return status
-        except Exception:
+        except Exception as error:
             if process.poll() is None:
                 process.kill()
             try:
@@ -790,9 +662,13 @@ class InstanceRuntime:
             for sidecar in sidecars:
                 self.terminate_process(sidecar)
             if network is not None:
-                run(["nft", "delete", "table", "inet", network["nft_table"]], check=False)
-                run(["ip", "link", "delete", network["tap"]], check=False)
+                try:
+                    self.network_manager.release(instance_id)
+                except NetworkFailure:
+                    pass
             shutil.rmtree(paths["jail"], ignore_errors=True)
+            if isinstance(error, NetworkFailure):
+                raise RuntimeFailure(str(error)) from error
             raise
 
     def status(self, instance_id: str) -> dict | None:
@@ -817,6 +693,11 @@ class InstanceRuntime:
         if status is None:
             raise RuntimeFailure(f"instance is not registered: {instance_id}")
         return status
+
+    def busy(self, instance_id: str, enabled: bool) -> None:
+        """执行任务期间设置 busy 标记，防止空闲回收器中途关闭实例。"""
+
+        self.lifecycle("busy", validate_instance_id(instance_id), "on" if enabled else "off")
 
     def stop(self, instance_id: str, reason: str = "api") -> dict:
         """停止计算资源但保留实例记录和持久化数据盘。"""

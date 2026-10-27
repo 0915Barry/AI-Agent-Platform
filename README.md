@@ -16,7 +16,7 @@
 
 当前分支正在将原有网页MVP收缩为无页面的底层运行平台原型。React/Vite展示层已移除，后续使用终端CLI分别验证实例管理、状态管理和Pi RPC通信。完整网页MVP保留在Git标签`mvp-web-m19`中。
 
-在新的终端CLI完成前，仓库仍保留原HTTP控制面和旧Agent Bridge链路，用于底层回归测试；它们不代表最新架构的最终通信方案。
+在新的终端CLI完成前，实例操作仍复用仅监听loopback的HTTP控制面。旧Agent Bridge源码暂时保留用于对照，但正式受管实例已不再启动它；任务由宿主机Pi Gateway主动连接Guest Pi RPC。
 
 ## 环境准备
 
@@ -48,6 +48,32 @@ chmod +x run-linux.sh scripts/linux/*.sh scripts/guest/*.sh
 `bootstrap`会分阶段完成检查、安装、下载和rootfs构建。新机器首次需要本地构建；构建指纹不变时会复用`/srv/fc/artifacts/agent-rootfs.ext4`。
 
 ## 当前进度
+
+### microVM 架构实验分支
+
+`codex/microvm-lab`用于从终端观察最基础的Firecracker运行结构，不依赖网页、
+数据库、会话或模型调用。实验实例使用只读`rootfs.ext4`和可写`data.ext4`，并通过
+一条仅Ubuntu宿主机可访问的TAP网络开放Pi RPC实验端口。
+
+在macOS项目目录运行：
+
+```bash
+./run.sh lab-start
+./run.sh lab-status
+./run.sh lab-inspect
+./run.sh lab-stop
+```
+
+`lab-start`第一次会因Guest运行代码变化并新增`socat`而重建rootfs。启动成功后，
+先SSH进入Ubuntu VM，再按照终端给出的地址运行`nc <Guest-IP> 8080`。连接后可以
+手动发送一行Pi RPC JSONL，例如`{"id":"demo-1","type":"get_state"}`或
+`{"id":"prompt-1","type":"prompt","message":"请只回复 RPC_MODEL_OK"}`。
+Pi通过仅Guest可访问的宿主机模型代理调用DeepSeek；真实API Key继续保存在Ubuntu
+宿主机的受限文件中，不会写入rootfs或用户数据盘。Pi RPC实验端口没有经过NAT或
+端口转发，只能从Ubuntu宿主机访问。`lab-inspect`继续读取Guest通过串口输出的
+`lsblk`、`findmnt`和`ps`结果。`lab-stop`会删除Jailer临时目录、TAP、nftables规则
+及临时代理凭据，但保留
+`/srv/fc/volumes/lab/data.ext4`，便于后续学习持久化。
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
@@ -337,7 +363,7 @@ Linux/KVM checks passed
 | 认证与归属 | `./run.sh auth-smoke-test` | `./run-linux.sh auth-smoke-test` |
 | DeepSeek 端到端 | `./run.sh deepseek-e2e-test` | `./run-linux.sh deepseek-e2e-test` |
 | HTTP 控制面 | `./run.sh control-plane-smoke-test` | `./run-linux.sh control-plane-smoke-test` |
-| Agent 任务通道 | `./run.sh agent-task-smoke-test` | `./run-linux.sh agent-task-smoke-test` |
+| 宿主机 Pi Gateway | `./run.sh agent-task-smoke-test` | `./run-linux.sh agent-task-smoke-test` |
 | Agent 自定义配置 | `./run.sh agent-config-smoke-test` | `./run-linux.sh agent-config-smoke-test` |
 | Skill 动态注入 | `./run.sh skills-smoke-test` | `./run-linux.sh skills-smoke-test` |
 | MCP 安全接入 | `./run.sh mcp-smoke-test` | `./run-linux.sh mcp-smoke-test` |
@@ -371,7 +397,7 @@ Linux/KVM checks passed
 | `auth-smoke-test` | 验证密码派生、会话、跨用户隔离和每用户实例配额；不会重建 rootfs |
 | `deepseek-e2e-test` | 让 Pi Agent 经 Tool Gateway 调用 DeepSeek 并执行 `read` 工具 |
 | `control-plane-smoke-test` | 通过 HTTP API 创建、启动、查询、心跳、停止并销毁真实 microVM |
-| `agent-task-smoke-test` | 通过控制面向 microVM 内 Pi 下发真实任务，并验证 DeepSeek、工具读取和事件结果 |
+| `agent-task-smoke-test` | 验证宿主机 Pi Gateway 主动连接 Guest Pi RPC、调用 DeepSeek 并回传事件 |
 | `agent-config-smoke-test` | 验证自定义 System Prompt、只读工具权限和任务配置快照进入真实 Pi |
 | `skills-smoke-test` | 验证审核目录中的 Skill 经任务快照动态注入真实 Pi |
 | `mcp-smoke-test` | 验证 Pi 通过实例专属认证调用宿主 MCP Gateway，且审计不泄露返回值 |
@@ -694,6 +720,49 @@ DELETE /api/instances/{id}
 GET    /healthz
 ```
 
+受管实例的网络不再直接根据实例 ID 哈希地址。`NetworkManager`从
+`172.29.0.0/16`地址池按 `/30` 槽位分配 Host IP、Guest IP、TAP、MAC 和
+nftables 表名，并把租约状态写入 Ubuntu 宿主机的
+`/var/lib/fc/network-leases.json`。租约依次经过 `reserved → active → releasing`；
+实例停止、空闲回收或启动失败时会统一清理 TAP 与 nftables 后释放槽位。当前
+`FileLeaseStore`使用文件锁支持单宿主机并发启动，并保留与未来数据库实现相同的
+`LeaseStore`接口。`microvm-lab`也通过同一个 `NetworkManager` 分配地址，并以
+`microvm-lab` 为实例 ID 保存在同一份默认租约文件中。lab 就绪后租约为 `active`，
+`lab-stop` 清理网络后删除该条记录。lab 额外允许宿主机主动连接 Guest RPC 的响应，
+其他受管实例的默认规则保持不变。
+
+在 Ubuntu 宿主机上查看学习实例租约（启动后查看，停止后该记录会移除）：
+
+```bash
+sudo cat /var/lib/fc/network-leases.json
+# 格式化查看租约文件，其中 microvm-lab 是学习实例
+sudo python3 -m json.tool /var/lib/fc/network-leases.json
+```
+
+`lab-start` 和运行中的 `lab-status` 会显示实际分配的 Guest IP；使用输出的
+`nc <Guest IP> 8080` 连接 RPC，不再使用固定教学地址。
+
+可以单独验收网络租约，不会向 DeepSeek 发起请求：
+
+```bash
+# macOS
+./run.sh network-lease-smoke-test
+
+# Windows 的 Ubuntu VM
+./run-linux.sh network-lease-smoke-test
+```
+
+成功标志为 `NETWORK_LEASE_READY`。测试会启动一台真实受管 microVM，确认租约为
+`active`且 TAP、Host IP 和 nftables 规则真实存在；随后停止实例，确认租约、TAP
+与规则已经释放，而持久化数据盘仍然保留到显式销毁。
+
+当前 ARM64 嵌套 KVM 环境已完成真实验收：
+
+```text
+PASS: network slot allocation and cleanup completed without a model request
+NETWORK_LEASE_READY pool=172.29.0.0/16 subnet=172.29.0.0/30 host=172.29.0.1 guest=172.29.0.2 tap=fc00000000 state=released
+```
+
 出于安全考虑，M10 尚未实现用户认证，因此服务拒绝监听 `0.0.0.0`，只能绑定 `127.0.0.1`/`::1`。在认证和授权完成前，不得将这个 root 权限控制接口暴露到局域网或互联网。
 
 运行真实验收：
@@ -761,17 +830,23 @@ curl -X DELETE http://127.0.0.1:18090/api/instances/demo-agent
 
 完成开发后运行 `./run.sh control-plane-stop`；Windows 的 Ubuntu VM 使用 `./run-linux.sh control-plane-stop`。停止控制面不会直接删除数据盘，只有实例的 `DELETE` 接口会执行显式销毁。
 
-## M11 Agent 任务通道
+## 宿主机 Pi Gateway 与任务通道
 
-M11 把此前分别验证的控制面、受控 TAP 网络、Tool Gateway、DeepSeek 和 Pi Agent
-整合为正式实例路径。启用 DeepSeek 凭据的控制面启动实例时会自动完成：
+正式实例使用宿主机侧 `services/pi-gateway/gateway.py` 主动连接 Guest 的
+`guestIp:8080`。上层调用方只与控制面交互，不需要直接操作 TCP 或拼接 Pi RPC
+JSONL。一次任务的当前路径为：
 
-- 为每个实例稳定派生独立 `/30` 子网、TAP 名和 nftables 表；
-- 只允许 guest 访问宿主 TAP 地址上的 Tool Gateway 与任务桥；
-- 以低权限 `agent-gateway` 用户运行两个 sidecar，并由生命周期管理器统一回收；
-- 将真实 DeepSeek Key 保留在宿主受限文件，数据盘只保存占位凭据；
-- 在 guest 中运行单任务串行 Worker，领取任务、调用 Pi，并回传有序事件；
-- 任务活动会刷新 5 分钟空闲计时，停止实例仍保留工作区数据。
+```text
+终端或其他客户端 → 控制面任务 API → SQLite queued 任务
+→ 宿主机 Pi Gateway → Guest IP:8080 → socat → pi --mode rpc
+→ Pi 原生 JSONL 事件 → Pi Gateway 标准化 → SQLite / SSE
+```
+
+Pi Gateway 从实例运行元数据读取 `guestIp` 和 `rpcPort`，每个实例串行执行任务，
+并在执行期间设置生命周期 `busy` 标记。它等待 `agent_settled` 后才把任务标记为
+完成；`prompt` 的响应只代表 Pi 已接收任务。文本增量、工具调用和工具结果分别保存为
+`text`、`tool_call` 和 `tool_result` 事件。模型密钥仍保留在宿主机 Tool Gateway，
+不会进入 microVM。
 
 新增接口：
 
@@ -782,9 +857,8 @@ GET  /api/instances/{id}/tasks/{task_id}/events
 GET  /api/instances/{id}/tasks/{task_id}/stream
 ```
 
-`/events` 保留为诊断用 JSON 查询；M15 新增的 `/stream` 使用 SSE，并用 SQLite
-事件序号作为 `id` 支持 `Last-Event-ID` 断线续传。Tool Gateway 也已改为逐块转发
-上游 SSE，不再缓冲完整模型回答。
+`/events` 是诊断用 JSON 查询；`/stream` 使用 SSE，并用 SQLite 事件序号作为 `id`
+支持 `Last-Event-ID` 断线续传。未来的终端客户端与页面可以复用同一套接口。
 
 在已经完成 `configure-deepseek` 的环境执行：
 
@@ -796,31 +870,17 @@ GET  /api/instances/{id}/tasks/{task_id}/stream
 ./run-linux.sh agent-task-smoke-test
 ```
 
-测试会先由宿主向工作区写入模型未知的随机标记，重启同一实例，再让 Pi 必须使用
-`read` 工具取得内容；随后检查任务事件顺序、Gateway 审计、数据盘持久化以及显式
-销毁。因为 token 不出现在 prompt 中，模型无法靠复述指令绕过工具调用。首次执行
-可能因 guest Worker 文件变更而重建 rootfs。预期成功标志：
+测试会创建并启动一个正式受管实例，通过任务 API 提交包含随机验收值的真实
+DeepSeek 请求，然后检查 `queued → started → progress/text → completed` 事件链，
+最后停止并销毁测试实例。预期成功标志：
 
 ```text
-PASS: control plane completed a real Pi Agent task through DeepSeek
-AGENT_TASK_READY transport=http-poll events=ordered gateway=isolated persistence=preserved idle_timeout=300s
+PASS: host Pi Gateway dispatched a real task to microVM Pi RPC
+PI_GATEWAY_READY guest=172.29.0.2:8080 transport=tcp protocol=jsonl dispatch=host events=streamed bridge=absent
 ```
 
-### M11 验收结果
-
-已在当前 Apple M4、UTM Ubuntu ARM64 与嵌套 KVM 环境中完成真实验收：
-
-```text
-Starting managed Pi Agent microVM with isolated Gateway and task bridge...
-Restarting the managed instance with a host-seeded persistent marker...
-PASS: control plane completed a real Pi Agent task through DeepSeek
-AGENT_TASK_READY transport=http-poll events=ordered gateway=isolated persistence=preserved idle_timeout=300s
-```
-
-这证明控制面能够向真实 microVM 内的 Pi Agent 下发任务；Pi 只能通过宿主 Tool
-Gateway 使用 DeepSeek，并能读取 prompt 中未知的工作区随机标记。停止并重启计算
-实例后，同一数据盘内容仍然保留，任务事件按 `queued → started → completed` 顺序
-记录，正式空闲回收阈值保持为 5 分钟。
+当前阶段只接通基础任务、流式文本与 Pi 原生工具事件。System Prompt、显式 Skill
+参数以及 MCP 不在本阶段动态下发范围内；MCP 仍为延期模块。
 
 ## 已归档：M12 Web管理页面
 
@@ -914,15 +974,15 @@ microVM，宿主也没有在实例运行时并发挂载数据盘。Pi Agent能�
 M15 把此前“等待完整答案后一次显示”的任务路径改成端到端增量链路：
 
 ```text
-DeepSeek SSE
-  → 宿主 Tool Gateway（chunked 转发、凭据仍只在宿主）
-  → Pi Agent 1.0.0 --mode json（JSONL）
-  → microVM 事件适配器（文本短批次、工具阶段；不外发 thinking）
-  → Agent Bridge / SQLite 有序事件
-  → 控制面 SSE（Last-Event-ID 断线续传）
+控制面 queued 任务
+  → 宿主机 Pi Gateway（TCP 客户端）
+  → Guest socat → Pi Agent --mode rpc（JSONL）
+  → 宿主 Tool Gateway → DeepSeek SSE
+  → Pi RPC 原生事件 → Pi Gateway 标准化事件
+  → SQLite 有序事件 → 控制面 SSE（Last-Event-ID 断线续传）
 ```
 
-调试客户端可按顺序观察排队、领取、模型生成、重试和工具执行事件。最终回答仍只在`completed`后写入M13消息表，宿主SQLite中的记录为权威结果。
+调试客户端可按顺序观察排队、领取、模型生成、重试和工具执行事件。最终回答仍只在`completed`后写入消息表，宿主SQLite中的记录为权威结果。
 
 安全边界没有改变：控制面仍仅通过loopback/SSH隧道访问；真实 DeepSeek
 Key 仍是权限 `0400` 的 Ubuntu 宿主文件；microVM 只持有占位值。`thinking_delta`

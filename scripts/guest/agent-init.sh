@@ -58,8 +58,10 @@ network_test="$(cmdline_value agent_network_test || true)"
 gateway_test="$(cmdline_value agent_gateway_test || true)"
 deepseek_e2e_test="$(cmdline_value agent_deepseek_e2e_test || true)"
 managed_runtime="$(cmdline_value agent_managed_runtime || true)"
+lab_mode="$(cmdline_value agent_lab || true)"
 if [[ "${network_test}" == "1" || "${gateway_test}" == "1" \
-  || "${deepseek_e2e_test}" == "1" || "${managed_runtime}" == "1" ]]; then
+  || "${deepseek_e2e_test}" == "1" || "${managed_runtime}" == "1" \
+  || "${lab_mode}" == "1" ]]; then
   guest_ip_cidr="$(cmdline_value agent_ip)"
   guest_gateway="$(cmdline_value agent_gateway)"
   guest_dns="$(cmdline_value agent_dns)"
@@ -182,6 +184,69 @@ runuser -u pi -- sh -c \
 echo "AGENT_RUNTIME_READY node=${node_version} pi=${pi_version} uid=${pi_uid}"
 echo "AGENT_SECURITY_READY runtime_owner=${node_owner} shadow=denied runtime_write=denied workspace_write=allowed"
 
+# 实验分支只额外输出 Guest 诊断信息。Pi RPC 监听器已经是正式受管实例和
+# 教学实例共同使用的 Guest 能力，不再依赖 agent_lab 标志。
+if [[ "${lab_mode}" == "1" ]]; then
+  echo "MICROVM_LAB_READY hostname=$(hostname) pid=$$"
+  echo "--- LAB: kernel command line ---"
+  cat /proc/cmdline
+  echo "--- LAB: block devices ---"
+  lsblk -o NAME,MAJ:MIN,SIZE,RO,TYPE,FSTYPE,MOUNTPOINTS
+  echo "--- LAB: mounted filesystems ---"
+  findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS
+  echo "--- LAB: processes ---"
+  ps -eo pid,ppid,user,comm,args
+  echo "--- LAB: identity ---"
+  id pi
+  echo "MICROVM_LAB_INSPECTION_READY"
+fi
+
+if [[ "${lab_mode}" == "1" || "${managed_runtime}" == "1" ]]; then
+  rpc_port="$(cmdline_value agent_rpc_port)"
+  rpc_bind_ip="${guest_ip_cidr%/*}"
+  rpc_provider="$(cmdline_value agent_rpc_provider || true)"
+  rpc_model="$(cmdline_value agent_rpc_model || true)"
+
+  # 每个实例一次只允许一个 TCP 客户端。连接建立后 socat 以 pi 用户启动
+  # 一个长期运行的 Pi RPC 进程；连接结束后进程退出，监听器重新等待下一次
+  # 连接。这样 Guest 内无需额外部署 Agent Bridge 或协议管理器。
+  (
+    while true; do
+      if runuser -u pi -- env \
+          HOME=/home/pi \
+          PATH="${runtime_path}" \
+          PI_OFFLINE=1 \
+          PI_SKIP_VERSION_CHECK=1 \
+          PI_TELEMETRY=0 \
+          PI_RPC_PROVIDER="${rpc_provider}" \
+          PI_RPC_MODEL="${rpc_model}" \
+          socat \
+            "TCP-LISTEN:${rpc_port},bind=${rpc_bind_ip},reuseaddr" \
+            EXEC:/usr/local/sbin/pi-rpc-session; then
+        exit_status=0
+      else
+        exit_status="$?"
+      fi
+      echo "PI_RPC_CONNECTION_CLOSED status=${exit_status}"
+      sleep 1
+    done
+  ) &
+
+  rpc_ready=false
+  for _ in $(seq 1 50); do
+    if ss -lntH | awk -v port=":${rpc_port}" '$4 ~ port "$" { found=1 } END { exit !found }'; then
+      rpc_ready=true
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ "${rpc_ready}" != true ]]; then
+    echo "PI_RPC_FAILURE listener_not_ready" >&2
+    exit 1
+  fi
+  echo "PI_RPC_READY address=${rpc_bind_ip}:${rpc_port} transport=tcp protocol=jsonl provider=${rpc_provider:-unconfigured} model=${rpc_model:-unconfigured}"
+fi
+
 if [[ "${persistence_test}" == "1" ]]; then
   root_options="$(findmnt -n -o OPTIONS /)"
   case ",${root_options}," in
@@ -241,22 +306,6 @@ elif [[ "${gateway_test}" == "1" || "${deepseek_e2e_test}" == "1" || "${managed_
   echo "Networking is restricted to the host Tool Gateway; model credentials remain outside the microVM."
 else
   echo "The runtime image contains no model credentials and networking is not configured yet."
-fi
-
-if [[ "${managed_runtime}" == "1" ]]; then
-  bridge_host="$(cmdline_value agent_bridge_host)"
-  bridge_port="$(cmdline_value agent_bridge_port)"
-  bridge_token="$(cmdline_value agent_bridge_token)"
-  mcp_host="$(cmdline_value agent_mcp_host)"
-  mcp_port="$(cmdline_value agent_mcp_port)"
-  mcp_token="$(cmdline_value agent_mcp_token)"
-  echo "AGENT_TASK_WORKER_READY bridge=${bridge_host}:${bridge_port} credential=instance-token"
-  exec env \
-    AGENT_BRIDGE_URL="http://${bridge_host}:${bridge_port}" \
-    AGENT_BRIDGE_TOKEN="${bridge_token}" \
-    AGENT_MCP_URL="http://${mcp_host}:${mcp_port}/mcp" \
-    AGENT_MCP_TOKEN="${mcp_token}" \
-    /usr/local/sbin/agent-task-worker
 fi
 
 trap 'poweroff -f' TERM INT
