@@ -134,6 +134,11 @@ class AgentCtlTests(unittest.TestCase):
         self.assertIn("CONVERSATION_ID 可通过 conversations 命令查询", help_text)
         self.assertIn("./agentctl chat cli-demo", help_text)
 
+    def test_dark_background_colors_use_bright_blue_and_red(self) -> None:
+        console = cli.Console(True, io.StringIO())
+        self.assertEqual(console.paint("系统", "blue"), "\033[94m系统\033[0m")
+        self.assertEqual(console.paint("错误", "red"), "\033[91m错误\033[0m")
+
     def test_sse_events_are_decoded(self) -> None:
         events = list(cli.ApiClient(self.base_url, "aap_session=test-token").events("/stream"))
         self.assertEqual(events[0]["data"]["delta"], "你好")
