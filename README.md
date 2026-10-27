@@ -163,6 +163,8 @@ Windows 在 VMware Ubuntu 的仓库目录执行：
 
 `start` 启动仅监听 Ubuntu loopback 的 Control Plane；`stop` 停止控制面，但不会删除
 实例持久化数据盘。实例计算资源由空闲回收策略管理，默认空闲阈值为 300 秒。
+每个账户最多保留 5 条实例记录，但同一时间只允许 1 台实例处于 `starting` 或
+`running` 状态；停止当前实例后才能启动该账户的另一台实例。
 
 macOS 如需从本机访问 HTTP 控制面，另开一个终端保持 SSH 隧道运行：
 

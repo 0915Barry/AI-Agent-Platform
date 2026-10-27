@@ -63,7 +63,7 @@ CONVERSATION_ROUTE_RE = re.compile(
     r"(conversation-[0-9a-f]{16})(/messages)?$"
 )
 MAX_INSTANCES_PER_USER = 5
-MAX_RUNNING_INSTANCES_PER_USER = 2
+MAX_RUNNING_INSTANCES_PER_USER = 1
 SESSION_COOKIE_NAME = "aap_session"
 
 

@@ -11,4 +11,4 @@ python3 -m unittest discover \
   -p 'test_*.py'
 
 echo "PASS: local authentication, session, ownership, and quota checks passed"
-echo "M16_AUTH_READY password=pbkdf2-sha256 session=httponly:12h ownership=isolated quota=5:2 bind=loopback"
+echo "M16_AUTH_READY password=pbkdf2-sha256 session=httponly:12h ownership=isolated quota=5:1 bind=loopback"

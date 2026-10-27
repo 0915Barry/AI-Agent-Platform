@@ -182,10 +182,43 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(total_quota.exception.code, "instance_quota_exceeded")
 
         self.control.start("alice-one", alice)
-        self.control.start("alice-2", alice)
         with self.assertRaises(SERVER.ApiError) as running_quota:
-            self.control.start("alice-3", alice)
+            self.control.start("alice-2", alice)
         self.assertEqual(running_quota.exception.code, "running_quota_exceeded")
+        self.control.stop("alice-one")
+        self.assertEqual(self.control.start("alice-2", alice)["status"], "running")
+
+    def test_concurrent_starts_preserve_single_running_instance(self) -> None:
+        """同一用户的并发启动请求中只能有一个成功预留运行配额。"""
+
+        owner = "user-concurrent"
+        self.control.create({"id": "concurrent-one"}, owner)
+        self.control.create({"id": "concurrent-two"}, owner)
+        barrier = threading.Barrier(2)
+        results: list[str] = []
+        results_guard = threading.Lock()
+
+        def start(instance_id: str) -> None:
+            barrier.wait()
+            try:
+                self.control.start(instance_id, owner)
+                result = "running"
+            except SERVER.ApiError as error:
+                result = error.code
+            with results_guard:
+                results.append(result)
+
+        threads = [
+            threading.Thread(target=start, args=("concurrent-one",)),
+            threading.Thread(target=start, args=("concurrent-two",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertCountEqual(results, ["running", "running_quota_exceeded"])
+        self.assertEqual(self.store.count_for_owner(owner, ("running",)), 1)
 
     def test_http_login_cookie_and_cross_user_access_denial(self) -> None:
         """登录 Cookie 应只看到本人实例，跨用户 ID 查询统一返回 404。"""
