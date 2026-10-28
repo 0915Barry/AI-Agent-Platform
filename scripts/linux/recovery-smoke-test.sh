@@ -49,7 +49,6 @@ task_database_path="${state_root}/tasks/tasks.db"
 log_path="${state_root}/server.log"
 suffix="$(tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-10)"
 instance_id="recovery-${suffix}"
-metadata_path="${state_root}/instances/${instance_id}.json"
 volume_path="/srv/fc/volumes/instances/${instance_id}.ext4"
 jail_path="/srv/jailer/firecracker/${instance_id}"
 server_pid=""
@@ -100,10 +99,9 @@ cleanup() {
       "${base_url}/api/instances/${instance_id}" >/dev/null 2>&1 || true
   fi
   stop_server
-  if [[ -f "${metadata_path}" ]]; then
-    python3 "${repo_dir}/services/instance-manager/lifecycle.py" \
-      --state-root "${state_root}" destroy "${instance_id}" >/dev/null 2>&1 || true
-  fi
+  python3 "${repo_dir}/services/instance-manager/lifecycle.py" \
+    --state-root "${state_root}" --database "${database_path}" \
+    destroy "${instance_id}" >/dev/null 2>&1 || true
   rm -f "${volume_path}"
   rm -rf --one-file-system "${jail_path}"
 }
@@ -153,13 +151,28 @@ echo "Simulating an unexpected Firecracker process exit..."
 kill -KILL "${firecracker_pid}"
 reaped=false
 for _ in $(seq 1 60); do
-  metadata_state="$(jq -r '.status // ""' "${metadata_path}" 2>/dev/null || true)"
-  lease_present=false
-  if [[ -f "${state_root}/network-leases.json" ]] \
-    && jq -e --arg id "${instance_id}" '.leases[$id] != null' \
-      "${state_root}/network-leases.json" >/dev/null 2>&1; then
-    lease_present=true
-  fi
+  metadata_state="$(python3 - "${database_path}" "${instance_id}" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    row = connection.execute(
+        "SELECT status FROM runtime_instances WHERE instance_id=?", (sys.argv[2],)
+    ).fetchone()
+print(row[0] if row else "")
+PY
+)"
+  lease_present="$(python3 - "${database_path}" "${instance_id}" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    count = connection.execute(
+        "SELECT COUNT(*) FROM network_leases WHERE instance_id=?", (sys.argv[2],)
+    ).fetchone()[0]
+print("true" if count else "false")
+PY
+)"
   if [[ "${metadata_state}" == "stopped" && "${lease_present}" == false \
     && ! -e "${jail_path}" ]]; then
     reaped=true
@@ -191,7 +204,18 @@ reconciled_response="$(
     "${base_url}/api/instances/${instance_id}"
 )"
 printf '%s' "${reconciled_response}" | jq -e '.status == "stopped"' >/dev/null
-if [[ "$(jq -r '.stopReason' "${metadata_path}")" != "process_exited" ]]; then
+stop_reason="$(python3 - "${database_path}" "${instance_id}" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    row = connection.execute(
+        "SELECT stop_reason FROM runtime_instances WHERE instance_id=?", (sys.argv[2],)
+    ).fetchone()
+print(row[0] if row else "")
+PY
+)"
+if [[ "${stop_reason}" != "process_exited" ]]; then
   echo "FAIL: lifecycle metadata did not record process_exited" >&2
   exit 1
 fi
@@ -215,16 +239,24 @@ curl --fail --silent --show-error --max-time 30 \
   --request DELETE "${base_url}/api/instances/${instance_id}" >/dev/null
 instance_created=false
 
-if [[ -e "${volume_path}" || -e "${jail_path}" || -e "${metadata_path}" ]]; then
+if [[ -e "${volume_path}" || -e "${jail_path}" ]]; then
   echo "FAIL: resources remained after final destroy" >&2
   exit 1
 fi
-if [[ -f "${state_root}/network-leases.json" ]] \
-  && ! jq -e '.version == 1 and (.leases | length == 0)' \
-    "${state_root}/network-leases.json" >/dev/null; then
-  echo "FAIL: network lease remained after final destroy" >&2
-  exit 1
-fi
+python3 - "${database_path}" "${instance_id}" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    lease_count = connection.execute(
+        "SELECT COUNT(*) FROM network_leases WHERE instance_id=?", (sys.argv[2],)
+    ).fetchone()[0]
+    runtime_count = connection.execute(
+        "SELECT COUNT(*) FROM runtime_instances WHERE instance_id=?", (sys.argv[2],)
+    ).fetchone()[0]
+assert lease_count == 0, "network lease remained after final destroy"
+assert runtime_count == 0, "runtime metadata remained after final destroy"
+PY
 
 stop_server
 rm -rf --one-file-system "${state_root}"

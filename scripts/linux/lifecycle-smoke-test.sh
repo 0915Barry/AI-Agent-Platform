@@ -28,7 +28,7 @@ volume_dir="/srv/fc/volumes/smoke"
 volume_path="${volume_dir}/lifecycle.ext4"
 state_root="/var/lib/fc"
 state_dir="${state_root}/lifecycle-smoke"
-metadata_path="${state_root}/instances/${instance_id}.json"
+database_path="${state_root}/control-plane.db"
 activity_path="${state_root}/activity/${instance_id}"
 busy_path="${state_root}/instances/${instance_id}.busy"
 manager="${repo_dir}/services/instance-manager/lifecycle.py"
@@ -112,13 +112,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ -f "${metadata_path}" ]]; then
-  existing_status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "${metadata_path}")"
-  if [[ "${existing_status}" == "running" ]]; then
-    python3 "${manager}" --state-root "${state_root}" stop "${instance_id}" --reason replaced-by-smoke-test
-  fi
-fi
-rm -f "${metadata_path}" "${activity_path}" "${busy_path}"
+python3 "${manager}" --state-root "${state_root}" --database "${database_path}" \
+  destroy "${instance_id}" >/dev/null 2>&1 || true
+rm -f "${activity_path}" "${busy_path}"
 nft delete table "${nft_family}" "${nft_table}" 2>/dev/null || true
 ip link delete "${tap_name}" 2>/dev/null || true
 rm -rf --one-file-system "${instance_dir}"
@@ -341,10 +337,20 @@ fi
 echo "INSTANCE_RESTART_READY id=${instance_id} data=preserved stop=clean"
 
 python3 "${manager}" --state-root "${state_root}" destroy "${instance_id}"
-if [[ -e "${volume_path}" || -e "${metadata_path}" || -e "${activity_path}" ]]; then
+if [[ -e "${volume_path}" || -e "${activity_path}" ]]; then
   echo "FAIL: explicit destroy did not remove lifecycle test data" >&2
   exit 1
 fi
+python3 - "${database_path}" "${instance_id}" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    count = connection.execute(
+        "SELECT COUNT(*) FROM runtime_instances WHERE instance_id=?", (sys.argv[2],)
+    ).fetchone()[0]
+assert count == 0, "runtime metadata remained after destroy"
+PY
 
 echo "PASS: lifecycle manager extended active sessions, reaped idle compute, and preserved restart data"
 echo "LIFECYCLE_POLICY_READY default_idle=${INSTANCE_IDLE_TIMEOUT_SECONDS}s smoke_idle=${smoke_timeout}s busy=protected heartbeat=extended ephemeral=cleaned restart_data=preserved explicit_destroy=verified"

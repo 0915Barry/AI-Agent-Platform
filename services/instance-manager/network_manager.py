@@ -4,13 +4,13 @@
 这个文件故意按职责分成五个部分：
 
 1. LeaseStore：定义租约存储需要提供哪些操作；
-2. FileLeaseStore：只负责把租约保存到 JSON 文件；
+2. SQLiteLeaseStore：把正式受管实例的租约保存到控制面数据库；
 3. NetworkAddressPool：只负责计算 /30 地址槽位；
 4. LinuxNetworkDriver：只负责执行 ip 和 nft 命令；
 5. NetworkManager：按正确顺序组织上面几个组件。
 
-当前使用 JSON 文件保存租约。将来换成数据库时，只需要增加新的 LeaseStore
-实现，不需要改地址计算和 Linux 网络配置代码。
+旧版 FileLeaseStore 仅用于兼容已登记的 JSON 租约；新实例统一使用
+SQLiteLeaseStore，地址计算和 Linux 网络配置代码不感知存储变化。
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import ipaddress
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -52,8 +53,8 @@ class NetworkRollbackFailure(NetworkFailure):
 class LeaseStore:
     """租约存储的最小接口。
 
-    这里使用普通 Python 基类，不依赖抽象类或 Protocol。数据库版本只要实现
-    下面五个方法，就可以替换 FileLeaseStore。
+    这里使用普通 Python 基类，不依赖抽象类或 Protocol。任何存储实现只要
+    提供下面五个方法，网络编排流程就无需修改。
     """
 
     def list(self) -> list[dict]:
@@ -73,15 +74,15 @@ class LeaseStore:
 
 
 # ---------------------------------------------------------------------------
-# 2. JSON 文件租约存储
+# 2. 租约存储实现
 # ---------------------------------------------------------------------------
 
 
 class FileLeaseStore(LeaseStore):
-    """使用 JSON 文件保存租约，并用 flock 防止并发写坏文件。"""
+    """兼容旧实例的 JSON 租约存储，新受管实例不再使用。"""
 
     def __init__(self, path: Path) -> None:
-        # 目前网络租约没有存进数据库，是用 JSON 文件保存
+        # 仅供升级前已登记实例完成网络资源清理。
         self.path = path.resolve()
         # 用 suffix 加个 .lock 的后缀
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
@@ -212,6 +213,143 @@ class FileLeaseStore(LeaseStore):
             if instance_id in payload["leases"]:
                 del payload["leases"][instance_id]
                 self._write_file(payload)
+
+
+class SQLiteLeaseStore(LeaseStore):
+    """使用控制面 SQLite 数据库保存网络租约。"""
+
+    def __init__(self, database_path: Path) -> None:
+        self.database_path = database_path.resolve()
+        self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+        self.initialize()
+
+    @contextmanager
+    def connect(self):
+        connection = sqlite3.connect(self.database_path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+        except Exception:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+        finally:
+            connection.close()
+
+    def initialize(self) -> None:
+        """幂等创建租约表，并启用适合并发查询的 WAL 日志。"""
+        with self.connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS network_leases (
+                    instance_id TEXT PRIMARY KEY,
+                    slot INTEGER NOT NULL UNIQUE CHECK(slot >= 0),
+                    subnet TEXT NOT NULL UNIQUE,
+                    host_ip TEXT NOT NULL,
+                    host_cidr TEXT NOT NULL,
+                    guest_ip TEXT NOT NULL,
+                    guest_cidr TEXT NOT NULL,
+                    guest_mac TEXT NOT NULL UNIQUE,
+                    tap TEXT NOT NULL UNIQUE,
+                    nft_table TEXT NOT NULL UNIQUE,
+                    nft_family TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('reserved','active','releasing','error')),
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS network_leases_status_slot "
+                "ON network_leases(status,slot)"
+            )
+        os.chmod(self.database_path, 0o600)
+
+    @staticmethod
+    def _row_to_dict(row: sqlite3.Row) -> dict:
+        return dict(row)
+
+    def list(self) -> list[dict]:
+        """按槽位顺序返回全部租约。"""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM network_leases ORDER BY slot"
+            ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def get(self, instance_id: str) -> dict | None:
+        """按实例 ID 查询一条租约。"""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM network_leases WHERE instance_id=?", (instance_id,)
+            ).fetchone()
+        return self._row_to_dict(row) if row is not None else None
+
+    def reserve(self, lease: dict) -> dict:
+        """在一个写事务中预留槽位，唯一约束阻止并发重复分配。"""
+        now = int(time.time())
+        values = (
+            str(lease["instance_id"]),
+            int(lease["slot"]),
+            str(lease["subnet"]),
+            str(lease["host_ip"]),
+            str(lease["host_cidr"]),
+            str(lease["guest_ip"]),
+            str(lease["guest_cidr"]),
+            str(lease["guest_mac"]),
+            str(lease["tap"]),
+            str(lease["nft_table"]),
+            str(lease.get("nft_family", "inet")),
+            "reserved",
+            now,
+            now,
+        )
+        try:
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO network_leases(
+                        instance_id,slot,subnet,host_ip,host_cidr,guest_ip,guest_cidr,
+                        guest_mac,tap,nft_table,nft_family,status,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    values,
+                )
+        except sqlite3.IntegrityError as error:
+            raise LeaseConflict(
+                f"instance or network slot is already leased: {lease['instance_id']}"
+            ) from error
+        stored = self.get(str(lease["instance_id"]))
+        if stored is None:
+            raise NetworkFailure("network lease disappeared after reservation")
+        return stored
+
+    def set_status(self, instance_id: str, status: str) -> dict:
+        """更新租约状态和最后变更时间。"""
+        allowed_statuses = {"reserved", "active", "releasing", "error"}
+        if status not in allowed_statuses:
+            raise NetworkFailure(f"invalid network lease status: {status}")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE network_leases SET status=?,updated_at=? WHERE instance_id=?",
+                (status, int(time.time()), instance_id),
+            )
+        if cursor.rowcount != 1:
+            raise NetworkFailure(f"network lease does not exist: {instance_id}")
+        stored = self.get(instance_id)
+        if stored is None:
+            raise NetworkFailure(f"network lease does not exist: {instance_id}")
+        return stored
+
+    def release(self, instance_id: str) -> None:
+        """删除已完成 Linux 网络清理的租约。"""
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM network_leases WHERE instance_id=?", (instance_id,)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -572,5 +710,5 @@ class NetworkManager:
                 self.store.set_status(instance_id, "error")
             message = "network cleanup failed: " + ", ".join(leftovers)
             raise NetworkFailure(message)
-        # 执行到这里，说明没有残留，就从 JSON 中删掉这个实例的租约。
+        # 执行到这里，说明没有残留，再从租约存储中删除记录。
         self.store.release(instance_id)

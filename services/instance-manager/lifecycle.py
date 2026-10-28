@@ -24,7 +24,8 @@ import sys
 import time
 from pathlib import Path
 
-from network_manager import FileLeaseStore, NetworkFailure, NetworkManager
+from network_manager import FileLeaseStore, NetworkFailure, NetworkManager, SQLiteLeaseStore
+from runtime_store import RuntimeStore, RuntimeStoreError
 
 
 DEFAULT_STATE_ROOT = Path("/var/lib/fc")
@@ -40,32 +41,23 @@ def validate_instance_id(instance_id: str) -> str:
 
 
 def paths(state_root: Path, instance_id: str) -> tuple[Path, Path, Path]:
-    """返回实例元数据、busy 标记和最后活动时间文件的固定路径。"""
+    """返回旧元数据、busy 标记和最后活动时间文件的固定路径。"""
     return (
         state_root / "instances" / f"{instance_id}.json",
         state_root / "instances" / f"{instance_id}.busy",
         state_root / "activity" / instance_id,
     )
 
-
-def atomic_write_json(path: Path, payload: dict) -> None:
-    """先写临时文件再原子替换，避免进程中断留下半截 JSON。"""
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
-
-
-def load_metadata(state_root: Path, instance_id: str) -> tuple[Path, dict]:
-    """读取已登记实例；不存在时以 CLI 错误终止当前操作。"""
-    metadata_path, _, _ = paths(state_root, instance_id)
+def load_metadata(store: RuntimeStore, state_root: Path, instance_id: str) -> dict:
+    """从 SQLite 读取运行元数据，并在首次升级时兼容导入旧 JSON。"""
+    legacy_path, _, _ = paths(state_root, instance_id)
     try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except FileNotFoundError as error:
-        raise SystemExit(f"instance is not registered: {instance_id}") from error
-    return metadata_path, metadata
+        metadata = store.load_legacy(legacy_path, instance_id)
+    except RuntimeStoreError as error:
+        raise SystemExit(str(error)) from error
+    if metadata is None:
+        raise SystemExit(f"instance is not registered: {instance_id}")
+    return metadata
 
 
 def process_start_ticks(pid: int) -> int | None:
@@ -191,8 +183,25 @@ def stop_process(metadata: dict) -> str:
 def cleanup_ephemeral(metadata: dict, state_root: Path) -> None:
     """清理 TAP、nftables 与 jail；持久化数据盘不在此函数删除。"""
     tap_name = metadata.get("tapName", "")
+    network_database = metadata.get("networkDatabasePath", "")
     lease_path = metadata.get("networkLeasePath", "")
-    if lease_path:
+    if network_database:
+        database_path = Path(network_database).resolve()
+        if state_root.resolve() not in database_path.parents:
+            raise SystemExit(f"refusing to use network database outside state root: {database_path}")
+        network = {
+            "instance_id": metadata["id"],
+            "tap": tap_name,
+            "nft_family": metadata.get("nftFamily", "inet"),
+            "nft_table": metadata.get("nftTable", ""),
+        }
+        try:
+            manager = NetworkManager(SQLiteLeaseStore(database_path))
+            manager.release(metadata["id"], lease=network)
+        except NetworkFailure as error:
+            raise SystemExit(str(error)) from error
+    elif lease_path:
+        # 兼容升级前仍在运行的 JSON 租约实例。
         expected_lease_path = (state_root / "network-leases.json").resolve()
         if Path(lease_path).resolve() != expected_lease_path:
             raise SystemExit(f"refusing to use unexpected network lease path: {lease_path}")
@@ -215,7 +224,7 @@ def cleanup_ephemeral(metadata: dict, state_root: Path) -> None:
 
     nft_family = metadata.get("nftFamily", "")
     nft_table = metadata.get("nftTable", "")
-    if nft_table and not lease_path:
+    if nft_table and not network_database and not lease_path:
         if nft_family not in {"ip", "ip6", "inet"}:
             raise SystemExit("refusing to clean invalid nftables family")
         if not RESOURCE_RE.fullmatch(nft_table):
@@ -230,9 +239,9 @@ def cleanup_ephemeral(metadata: dict, state_root: Path) -> None:
     shutil.rmtree(jail_path, ignore_errors=True)
 
 
-def stop_instance(state_root: Path, instance_id: str, reason: str) -> dict:
+def stop_instance(store: RuntimeStore, state_root: Path, instance_id: str, reason: str) -> dict:
     """停止实例、清理临时资源，并保留可供重启的数据盘和元数据。"""
-    metadata_path, metadata = load_metadata(state_root, instance_id)
+    metadata = load_metadata(store, state_root, instance_id)
     stop_method = stop_process(metadata)
     stop_sidecars(metadata)
     cleanup_ephemeral(metadata, state_root)
@@ -244,8 +253,7 @@ def stop_instance(state_root: Path, instance_id: str, reason: str) -> dict:
             "stoppedAt": int(time.time()),
         }
     )
-    atomic_write_json(metadata_path, metadata)
-    return metadata
+    return store.save(metadata)
 
 
 def command_register(args: argparse.Namespace) -> None:
@@ -254,8 +262,9 @@ def command_register(args: argparse.Namespace) -> None:
         raise SystemExit("register must run as root")
     instance_id = validate_instance_id(args.instance_id)
     state_root = args.state_root
-    metadata_path, busy_path, activity_path = paths(state_root, instance_id)
-    metadata_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    store = RuntimeStore(args.database)
+    legacy_path, busy_path, activity_path = paths(state_root, instance_id)
+    legacy_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
     activity_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
 
     start_ticks = process_start_ticks(args.pid)
@@ -275,10 +284,10 @@ def command_register(args: argparse.Namespace) -> None:
     volume_root = Path("/srv/fc/volumes").resolve()
     if volume_root not in volume_path.parents:
         raise SystemExit("volume path must be below /srv/fc/volumes")
-    if args.network_lease_path is not None:
-        expected_lease_path = (state_root / "network-leases.json").resolve()
-        if args.network_lease_path.resolve() != expected_lease_path:
-            raise SystemExit(f"network lease path must be {expected_lease_path}")
+    if args.network_database is not None:
+        database_path = args.network_database.resolve()
+        if state_root.resolve() not in database_path.parents:
+            raise SystemExit("network database must be below state root")
 
     now = int(time.time())
     sidecars = []
@@ -295,7 +304,8 @@ def command_register(args: argparse.Namespace) -> None:
         "jailPath": str(expected_jail),
         "nftFamily": args.nft_family,
         "nftTable": args.nft_table,
-        "networkLeasePath": str(args.network_lease_path.resolve()) if args.network_lease_path else "",
+        "networkDatabasePath": str(args.network_database.resolve()) if args.network_database else "",
+        "networkLeasePath": "",
         "networkSubnet": args.network_subnet,
         "hostIp": args.host_ip,
         "guestIp": args.guest_ip,
@@ -307,7 +317,8 @@ def command_register(args: argparse.Namespace) -> None:
         "tapName": args.tap_name,
         "volumePath": str(volume_path),
     }
-    atomic_write_json(metadata_path, metadata)
+    store.save(metadata)
+    legacy_path.unlink(missing_ok=True)
     busy_path.unlink(missing_ok=True)
     activity_path.touch()
     os.chown(activity_path, args.activity_uid, -1)
@@ -321,7 +332,7 @@ def command_register(args: argparse.Namespace) -> None:
 def command_heartbeat(args: argparse.Namespace) -> None:
     """刷新活动文件 mtime；空闲回收器以此计算 idleSeconds。"""
     instance_id = validate_instance_id(args.instance_id)
-    _, metadata = load_metadata(args.state_root, instance_id)
+    metadata = load_metadata(RuntimeStore(args.database), args.state_root, instance_id)
     _, _, activity_path = paths(args.state_root, instance_id)
     activity_path.touch()
     print(f"INSTANCE_ACTIVITY id={instance_id} status={metadata['status']}")
@@ -330,7 +341,7 @@ def command_heartbeat(args: argparse.Namespace) -> None:
 def command_busy(args: argparse.Namespace) -> None:
     """设置长任务保护标记；busy 期间回收器不会因空闲时间停止实例。"""
     instance_id = validate_instance_id(args.instance_id)
-    load_metadata(args.state_root, instance_id)
+    load_metadata(RuntimeStore(args.database), args.state_root, instance_id)
     _, busy_path, _ = paths(args.state_root, instance_id)
     if args.busy_state == "on":
         busy_path.touch()
@@ -343,7 +354,7 @@ def command_busy(args: argparse.Namespace) -> None:
 def command_status(args: argparse.Namespace) -> None:
     """输出机器可读的实例状态，并实时补充进程存活和空闲秒数。"""
     instance_id = validate_instance_id(args.instance_id)
-    _, metadata = load_metadata(args.state_root, instance_id)
+    metadata = load_metadata(RuntimeStore(args.database), args.state_root, instance_id)
     _, busy_path, activity_path = paths(args.state_root, instance_id)
     last_activity = int(activity_path.stat().st_mtime) if activity_path.exists() else 0
     payload = {
@@ -360,15 +371,15 @@ def command_watch(args: argparse.Namespace) -> None:
     if os.geteuid() != 0:
         raise SystemExit("watch must run as root")
     instance_id = validate_instance_id(args.instance_id)
+    store = RuntimeStore(args.database)
     while True:
-        _, metadata = load_metadata(args.state_root, instance_id)
+        metadata = load_metadata(store, args.state_root, instance_id)
         _, busy_path, activity_path = paths(args.state_root, instance_id)
         if metadata.get("status") != "running":
             return
         if not process_matches(metadata):
             stop_sidecars(metadata)
             cleanup_ephemeral(metadata, args.state_root)
-            metadata_path, _ = load_metadata(args.state_root, instance_id)
             metadata.update(
                 {
                     "status": "stopped",
@@ -377,7 +388,7 @@ def command_watch(args: argparse.Namespace) -> None:
                     "stoppedAt": int(time.time()),
                 }
             )
-            atomic_write_json(metadata_path, metadata)
+            store.save(metadata)
             print(f"INSTANCE_REAPED id={instance_id} reason=process_exited volume=preserved")
             return
         if busy_path.exists():
@@ -385,7 +396,7 @@ def command_watch(args: argparse.Namespace) -> None:
             continue
         idle_seconds = time.time() - activity_path.stat().st_mtime
         if idle_seconds >= int(metadata["idleTimeoutSeconds"]):
-            stopped = stop_instance(args.state_root, instance_id, "idle_timeout")
+            stopped = stop_instance(store, args.state_root, instance_id, "idle_timeout")
             print(
                 f"INSTANCE_REAPED id={instance_id} reason=idle_timeout "
                 f"idle_seconds={int(idle_seconds)} stop={stopped['stopMethod']} volume=preserved"
@@ -399,7 +410,7 @@ def command_stop(args: argparse.Namespace) -> None:
     if os.geteuid() != 0:
         raise SystemExit("stop must run as root")
     instance_id = validate_instance_id(args.instance_id)
-    stopped = stop_instance(args.state_root, instance_id, args.reason)
+    stopped = stop_instance(RuntimeStore(args.database), args.state_root, instance_id, args.reason)
     print(
         f"INSTANCE_STOPPED id={instance_id} reason={args.reason} "
         f"stop={stopped['stopMethod']} volume=preserved"
@@ -411,18 +422,20 @@ def command_destroy(args: argparse.Namespace) -> None:
     if os.geteuid() != 0:
         raise SystemExit("destroy must run as root")
     instance_id = validate_instance_id(args.instance_id)
-    metadata_path, metadata = load_metadata(args.state_root, instance_id)
+    store = RuntimeStore(args.database)
+    metadata = load_metadata(store, args.state_root, instance_id)
     if metadata.get("status") == "running":
-        metadata = stop_instance(args.state_root, instance_id, "destroyed")
+        metadata = stop_instance(store, args.state_root, instance_id, "destroyed")
     volume_path = Path(metadata["volumePath"]).resolve()
     volume_root = Path("/srv/fc/volumes").resolve()
     if volume_root not in volume_path.parents:
         raise SystemExit("refusing to delete volume outside /srv/fc/volumes")
     volume_path.unlink(missing_ok=True)
-    _, busy_path, activity_path = paths(args.state_root, instance_id)
+    legacy_path, busy_path, activity_path = paths(args.state_root, instance_id)
     busy_path.unlink(missing_ok=True)
     activity_path.unlink(missing_ok=True)
-    metadata_path.unlink(missing_ok=True)
+    store.delete(instance_id)
+    legacy_path.unlink(missing_ok=True)
     print(f"INSTANCE_DESTROYED id={instance_id} volume=deleted")
 
 
@@ -430,6 +443,7 @@ def build_parser() -> argparse.ArgumentParser:
     """构造供 Shell 脚本和控制面共同调用的命令行接口。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--database", type=Path)
     commands = parser.add_subparsers(dest="command", required=True)
 
     register = commands.add_parser("register")
@@ -442,7 +456,7 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--tap-name", default="")
     register.add_argument("--nft-family", default="inet")
     register.add_argument("--nft-table", default="")
-    register.add_argument("--network-lease-path", type=Path)
+    register.add_argument("--network-database", type=Path)
     register.add_argument("--network-subnet", default="")
     register.add_argument("--host-ip", default="")
     register.add_argument("--guest-ip", default="")
@@ -485,6 +499,8 @@ def main() -> None:
 
     parser = build_parser()
     args = parser.parse_args()
+    if args.database is None:
+        args.database = args.state_root / "control-plane.db"
     args.handler(args)
 
 

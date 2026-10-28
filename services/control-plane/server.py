@@ -968,6 +968,7 @@ def main() -> None:
         idle_timeout_seconds=args.idle_timeout,
         deepseek_credential=args.deepseek_credential,
         task_database=args.task_database,
+        state_database=args.database,
     )
     control = ControlPlane(store, runtime, tasks, PiGateway())
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), ControlPlaneHandler)

@@ -31,7 +31,6 @@ state_root="/var/lib/fc/pi-gateway-smoke"
 database_path="${state_root}/control-plane.db"
 task_database_path="${state_root}/tasks/tasks.db"
 log_path="${state_root}/server.log"
-metadata_path="${state_root}/instances/${instance_id}.json"
 volume_path="/srv/fc/volumes/instances/${instance_id}.ext4"
 jail_path="/srv/jailer/firecracker/${instance_id}"
 server_pid=""
@@ -47,10 +46,9 @@ cleanup() {
     kill "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
   fi
-  if [[ -f "${metadata_path}" ]]; then
-    python3 "${repo_dir}/services/instance-manager/lifecycle.py" \
-      --state-root "${state_root}" destroy "${instance_id}" >/dev/null 2>&1 || true
-  fi
+  python3 "${repo_dir}/services/instance-manager/lifecycle.py" \
+    --state-root "${state_root}" --database "${database_path}" \
+    destroy "${instance_id}" >/dev/null 2>&1 || true
   rm -f "${volume_path}"
   rm -rf --one-file-system "${jail_path}"
 }
@@ -70,10 +68,9 @@ if [[ "${state_root}" != "/var/lib/fc/pi-gateway-smoke" ]]; then
   echo "Refusing to reset unexpected state root: ${state_root}" >&2
   exit 1
 fi
-if [[ -f "${metadata_path}" ]]; then
-  python3 "${repo_dir}/services/instance-manager/lifecycle.py" \
-    --state-root "${state_root}" destroy "${instance_id}" >/dev/null 2>&1 || true
-fi
+python3 "${repo_dir}/services/instance-manager/lifecycle.py" \
+  --state-root "${state_root}" --database "${database_path}" \
+  destroy "${instance_id}" >/dev/null 2>&1 || true
 rm -rf --one-file-system "${state_root}"
 rm -f "${volume_path}"
 install -d -o root -g root -m 0755 "${state_root}"

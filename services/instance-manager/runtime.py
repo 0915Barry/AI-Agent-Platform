@@ -22,7 +22,8 @@ import time
 from pathlib import Path
 
 from lifecycle import process_matches, validate_instance_id
-from network_manager import FileLeaseStore, NetworkFailure, NetworkManager
+from network_manager import NetworkFailure, NetworkManager, SQLiteLeaseStore
+from runtime_store import RuntimeStore, RuntimeStoreError
 
 
 DEFAULT_STATE_ROOT = Path("/var/lib/fc")
@@ -79,19 +80,23 @@ class InstanceRuntime:
         idle_timeout_seconds: int = 300,
         deepseek_credential: Path | None = None,
         task_database: Path | None = None,
+        state_database: Path | None = None,
     ) -> None:
         self.state_root = state_root.resolve()
         self.volume_root = volume_root.resolve()
         self.idle_timeout_seconds = idle_timeout_seconds
         self.deepseek_credential = deepseek_credential.resolve() if deepseek_credential else None
         self.task_database = task_database.resolve() if task_database else None
-        self.network_lease_path = self.state_root / "network-leases.json"
+        self.state_database = (
+            state_database.resolve() if state_database else self.state_root / "control-plane.db"
+        )
         # 正式受管实例需要由宿主机主动连接 Guest 的 Pi RPC 端口，因此允许
         # 已建立的 host -> Guest TCP 连接响应通过实例 nftables 规则。
         self.network_manager = NetworkManager(
-            FileLeaseStore(self.network_lease_path),
+            SQLiteLeaseStore(self.state_database),
             allow_host_connections=True,
         )
+        self.runtime_store = RuntimeStore(self.state_database)
         self.manager = Path(__file__).resolve().with_name("lifecycle.py")
         self.gateway = Path(__file__).resolve().parents[1] / "tool-gateway" / "gateway.py"
         kernel_version = load_version("SMOKE_KERNEL_VERSION")
@@ -456,6 +461,8 @@ class InstanceRuntime:
             str(self.manager),
             "--state-root",
             str(self.state_root),
+            "--database",
+            str(self.state_database),
             *arguments,
         ]
         if capture:
@@ -608,8 +615,8 @@ class InstanceRuntime:
                         "inet",
                         "--nft-table",
                         str(network["nft_table"]),
-                        "--network-lease-path",
-                        str(self.network_lease_path),
+                        "--network-database",
+                        str(self.state_database),
                         "--network-subnet",
                         str(network["subnet"]),
                         "--host-ip",
@@ -633,6 +640,8 @@ class InstanceRuntime:
                     str(self.manager),
                     "--state-root",
                     str(self.state_root),
+                    "--database",
+                    str(self.state_database),
                     "watch",
                     instance_id,
                     "--poll-interval",
@@ -675,12 +684,12 @@ class InstanceRuntime:
         """读取生命周期元数据，并实时计算进程存活与空闲时间。"""
         instance_id = validate_instance_id(instance_id)
         paths = self.paths(instance_id)
-        if not paths["metadata"].is_file():
-            return None
         try:
-            metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+            metadata = self.runtime_store.load_legacy(paths["metadata"], instance_id)
+        except RuntimeStoreError as error:
             raise RuntimeFailure(f"invalid lifecycle metadata for {instance_id}") from error
+        if metadata is None:
+            return None
         activity = int(paths["activity"].stat().st_mtime) if paths["activity"].exists() else 0
         metadata["processAlive"] = process_matches(metadata)
         metadata["idleSeconds"] = max(0, int(time.time()) - activity)
@@ -712,7 +721,7 @@ class InstanceRuntime:
         """显式销毁实例，包括持久化数据盘和控制面运行日志目录。"""
         instance_id = validate_instance_id(instance_id)
         paths = self.paths(instance_id)
-        if paths["metadata"].exists():
+        if self.status(instance_id) is not None:
             self.lifecycle("destroy", instance_id)
         else:
             expected_volume_parent = self.volume_root.resolve()

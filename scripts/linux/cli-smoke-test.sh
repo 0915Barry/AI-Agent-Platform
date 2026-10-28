@@ -55,7 +55,6 @@ username="cli-smoke-${suffix}"
 password="Smoke-${suffix}-$(tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-12)"
 volume_path="/srv/fc/volumes/instances/${instance_id}.ext4"
 jail_path="/srv/jailer/firecracker/${instance_id}"
-metadata_path="${state_root}/instances/${instance_id}.json"
 server_pid=""
 instance_created=false
 tap_name=""
@@ -76,10 +75,9 @@ cleanup() {
     kill "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
   fi
-  if [[ -f "${metadata_path}" ]]; then
-    python3 "${repo_dir}/services/instance-manager/lifecycle.py" \
-      --state-root "${state_root}" destroy "${instance_id}" >/dev/null 2>&1 || true
-  fi
+  python3 "${repo_dir}/services/instance-manager/lifecycle.py" \
+    --state-root "${state_root}" --database "${database_path}" \
+    destroy "${instance_id}" >/dev/null 2>&1 || true
   rm -f "${volume_path}"
   rm -rf --one-file-system "${jail_path}"
   unset password
@@ -145,7 +143,18 @@ printf '%s\n' "${start_output}"
 grep -Fq '实例启动完成' <<< "${start_output}"
 status_output="$("${cli[@]}" status "${instance_id}")"
 grep -Fq '状态=running' <<< "${status_output}"
-tap_name="$(jq -r '.tapName' "${metadata_path}")"
+tap_name="$(python3 - "${database_path}" "${instance_id}" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    row = connection.execute(
+        "SELECT tap_name FROM runtime_instances WHERE instance_id=?", (sys.argv[2],)
+    ).fetchone()
+assert row is not None, "runtime metadata was not stored"
+print(row[0])
+PY
+)"
 
 first_marker="CLI_FIRST_${suffix}"
 first_output="$(
@@ -180,18 +189,12 @@ grep -Fq "Pi > ${first_marker}" <<< "${history_output}"
 instance_created=false
 "${cli[@]}" logout >/dev/null
 
-if [[ -e "${volume_path}" || -e "${jail_path}" || -e "${metadata_path}" ]]; then
-  echo "FAIL: instance disk, jail, or metadata remained after destroy" >&2
+if [[ -e "${volume_path}" || -e "${jail_path}" ]]; then
+  echo "FAIL: instance disk or jail remained after destroy" >&2
   exit 1
 fi
 if [[ -n "${tap_name}" ]] && ip link show "${tap_name}" >/dev/null 2>&1; then
   echo "FAIL: TAP remained after destroy: ${tap_name}" >&2
-  exit 1
-fi
-if [[ -f "${state_root}/network-leases.json" ]] \
-  && ! jq -e '.version == 1 and (.leases | length == 0)' \
-    "${state_root}/network-leases.json" >/dev/null; then
-  echo "FAIL: network lease remained after destroy" >&2
   exit 1
 fi
 python3 - "${database_path}" "${task_database_path}" "${instance_id}" <<'PY'
@@ -202,6 +205,12 @@ instance_db, task_db, instance_id = sys.argv[1:]
 with sqlite3.connect(instance_db) as connection:
     assert connection.execute(
         "SELECT COUNT(*) FROM instances WHERE id=?", (instance_id,)
+    ).fetchone()[0] == 0
+    assert connection.execute(
+        "SELECT COUNT(*) FROM network_leases WHERE instance_id=?", (instance_id,)
+    ).fetchone()[0] == 0
+    assert connection.execute(
+        "SELECT COUNT(*) FROM runtime_instances WHERE instance_id=?", (instance_id,)
     ).fetchone()[0] == 0
 with sqlite3.connect(task_db) as connection:
     assert connection.execute(

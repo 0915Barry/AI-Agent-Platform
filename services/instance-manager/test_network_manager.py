@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """NetworkManager 的纯本地单元测试，不创建真实 TAP 或 nftables 规则。"""
 
-import json
+import sqlite3
 import stat
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
-from network_manager import FileLeaseStore, LinuxNetworkDriver, NetworkManager
+from network_manager import LeaseConflict, LinuxNetworkDriver, NetworkManager, SQLiteLeaseStore
 
 
 class FakeRunner:
@@ -49,8 +49,8 @@ class NetworkManagerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.lease_path = Path(self.temporary.name) / "network-leases.json"
-        self.store = FileLeaseStore(self.lease_path)
+        self.database_path = Path(self.temporary.name) / "control-plane.db"
+        self.store = SQLiteLeaseStore(self.database_path)
         self.runner = FakeRunner()
         self.manager = NetworkManager(self.store, runner=self.runner)
 
@@ -72,9 +72,10 @@ class NetworkManagerTests(unittest.TestCase):
         self.assertNotIn(lease["tap"], self.runner.links)
         self.assertNotIn(("inet", lease["nft_table"]), self.runner.tables)
 
-        payload = json.loads(self.lease_path.read_text(encoding="utf-8"))
-        self.assertEqual(payload, {"leases": {}, "version": 1})
-        self.assertEqual(stat.S_IMODE(self.lease_path.stat().st_mode), 0o600)
+        with sqlite3.connect(self.database_path) as connection:
+            count = connection.execute("SELECT COUNT(*) FROM network_leases").fetchone()[0]
+        self.assertEqual(count, 0)
+        self.assertEqual(stat.S_IMODE(self.database_path.stat().st_mode), 0o600)
 
     def test_allocation_skips_host_route_and_existing_lease(self) -> None:
         self.runner.routes.add("172.29.0.0/30")
@@ -83,6 +84,13 @@ class NetworkManagerTests(unittest.TestCase):
         self.assertEqual(first["subnet"], "172.29.0.4/30")
         self.assertEqual(second["subnet"], "172.29.0.8/30")
         self.assertNotEqual(first["tap"], second["tap"])
+
+    def test_database_rejects_duplicate_network_slot(self) -> None:
+        first = self.manager.address_pool.build_lease("agent-one", 0)
+        duplicate = self.manager.address_pool.build_lease("agent-two", 0)
+        self.store.reserve(first)
+        with self.assertRaises(LeaseConflict):
+            self.store.reserve(duplicate)
 
     def test_host_rpc_replies_are_opt_in_and_forwarding_stays_blocked(self) -> None:
         lease = self.manager.allocate("agent-rpc")
