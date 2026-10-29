@@ -710,5 +710,8 @@ class NetworkManager:
                 self.store.set_status(instance_id, "error")
             message = "network cleanup failed: " + ", ".join(leftovers)
             raise NetworkFailure(message)
-        # 执行到这里，说明没有残留，再从租约存储中删除记录。
-        self.store.release(instance_id)
+        # 执行到这里说明 Linux 资源已经清理完成。若账本记录仍存在则删除；若
+        # 调用方传入的是生命周期元数据中的兜底 lease，账本可能已被上一次清理
+        # 删除，此时保持幂等即可，不能再因“记录不存在”让停止流程失败。
+        if stored_lease is not None:
+            self.store.release(instance_id)

@@ -91,20 +91,36 @@ class FakeRuntime:
         self.calls.append(("delete_workspace_data", owner_id, directory_name))
         return True
 
+    def delete_pi_session_data(self, owner_id: str, session_id: str) -> int:
+        self.calls.append(("delete_pi_session_data", owner_id, session_id))
+        return 1
+
 
 class FakePiGateway:
     """不连接网络，模拟一次带文本增量的 Pi RPC 执行。"""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, int, str, str | None]] = []
+        self.calls: list[tuple[str, int, str, str | None, str | None]] = []
+        self.messages: list[dict] = []
 
     def execute(
-        self, host: str, port: int, prompt: str, on_event, workspace_id: str | None = None
+        self,
+        host: str,
+        port: int,
+        prompt: str,
+        on_event,
+        workspace_id: str | None = None,
+        session_id: str | None = None,
     ) -> str:
-        self.calls.append((host, port, prompt, workspace_id))
+        self.calls.append((host, port, prompt, workspace_id, session_id))
         on_event("progress", {"stage": "model_started"})
         on_event("text", {"delta": "自动"})
         return "自动完成"
+
+    def get_messages(
+        self, host: str, port: int, workspace_id: str | None, session_id: str
+    ) -> list[dict]:
+        return list(self.messages)
 
 
 class ControlPlaneTests(unittest.TestCase):
@@ -156,6 +172,7 @@ class ControlPlaneTests(unittest.TestCase):
             result = self.control.get_task("agent-workspace", task["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(gateway.calls[0][3], workspace["id"])
+        self.assertEqual(gateway.calls[0][4], conversation["piSessionId"])
 
     def test_conversation_and_workspace_deletion_respect_boundaries(self) -> None:
         owner_id = "user-delete"
@@ -168,6 +185,10 @@ class ControlPlaneTests(unittest.TestCase):
             owner_id, first["id"], conversation["id"]
         )
         self.assertEqual(deleted_conversation["status"], "deleted")
+        self.assertIn(
+            ("delete_pi_session_data", owner_id, conversation["piSessionId"]),
+            self.runtime.calls,
+        )
         self.assertEqual(self.control.list_workspace_conversations(owner_id, first["id"]), [])
 
         result = self.control.delete_workspace(owner_id, second["id"])
@@ -396,7 +417,7 @@ class ControlPlaneTests(unittest.TestCase):
 
         self.assertEqual(task["status"], "completed")
         self.assertEqual(task["output"], "自动完成")
-        self.assertEqual(gateway.calls, [("172.29.0.2", 8080, "执行任务", None)])
+        self.assertEqual(gateway.calls, [("172.29.0.2", 8080, "执行任务", None, None)])
         event_types = [
             event["type"]
             for event in self.control.task_events("agent-gateway", queued["id"])
@@ -471,12 +492,14 @@ class ControlPlaneTests(unittest.TestCase):
             self.control.create_task("agent-idle", {"prompt": "   "})
         self.assertEqual(empty_prompt.exception.status, 400)
 
-    def test_conversation_persists_messages_and_builds_context(self) -> None:
-        """第二轮任务应包含首轮问答，完成结果应写回消息历史。"""
+    def test_native_conversation_uses_pi_session_without_message_cache(self) -> None:
+        """新会话只发送本轮输入，历史展示也从 Pi Session 获取。"""
 
+        gateway = FakePiGateway()
         self.control.create({"id": "agent-chat"})
         self.control.start("agent-chat")
-        conversation = self.control.create_conversation("agent-chat", {})
+        # 实例级兼容入口不附带 workspace_id，应回落到 Guest 的 /workspace。
+        conversation = self.tasks.create_conversation("agent-chat", "新会话")
 
         first = self.control.create_conversation_message(
             "agent-chat", conversation["id"], {"content": "请记住我的代号是 Alpha"}
@@ -491,10 +514,26 @@ class ControlPlaneTests(unittest.TestCase):
             "agent-chat", conversation["id"], {"content": "我的代号是什么？"}
         )
         self.assertEqual(second["conversationId"], conversation["id"])
-        self.assertIn("Alpha", second["prompt"])
-        self.assertIn("我的代号是什么", second["prompt"])
+        self.assertEqual(second["prompt"], "我的代号是什么？")
+        self.assertEqual(second["piSessionId"], conversation["id"])
+        self.assertEqual(second["sessionBackend"], "pi-native")
         self.assertNotEqual(first["id"], second["id"])
+        claimed_second = self.tasks.claim_next("agent-chat")
+        assert claimed_second is not None
+        self.tasks.append_event(
+            "agent-chat", claimed_second["id"], "completed", {"output": "你的代号是 Alpha。"}
+        )
 
+        self.control.pi_gateway = gateway
+        gateway.messages = [
+            {"role": "user", "content": "请记住我的代号是 Alpha", "timestamp": 1000},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "好的，我会记住。"}],
+                "timestamp": 2000,
+            },
+            {"role": "user", "content": "我的代号是什么？", "timestamp": 3000},
+        ]
         messages = self.control.conversation_messages("agent-chat", conversation["id"])
         self.assertEqual([message["role"] for message in messages], ["user", "assistant", "user"])
         self.assertEqual(messages[1]["content"], "好的，我会记住。")
@@ -554,6 +593,12 @@ class ControlPlaneTests(unittest.TestCase):
         legacy_path = Path(self.temporary.name) / "old" / "tasks.db"
         legacy = SERVER.TaskStore(legacy_path)
         conversation = legacy.create_conversation("agent-old", "旧会话")
+        # 这组数据模拟旧 tasks.db；旧会话的完整消息原本就保存在 messages 表中。
+        with legacy.connect() as connection:
+            connection.execute(
+                "UPDATE conversations SET session_backend='database' WHERE id=?",
+                (conversation["id"],),
+            )
         task = legacy.create_conversation_task("agent-old", conversation["id"], "旧消息")
 
         unified_path = Path(self.temporary.name) / "control-plane-unified.db"

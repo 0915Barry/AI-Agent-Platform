@@ -57,6 +57,7 @@ jail_path="/srv/jailer/firecracker/${instance_id}"
 server_pid=""
 instance_created=false
 tap_name=""
+session_mount=""
 
 cli=(
   "${repo_dir}/agentctl"
@@ -66,6 +67,10 @@ cli=(
 )
 
 cleanup() {
+  if [[ -n "${session_mount}" ]]; then
+    umount "${session_mount}" >/dev/null 2>&1 || true
+    rmdir "${session_mount}" >/dev/null 2>&1 || true
+  fi
   if [[ "${instance_created}" == true && -n "${server_pid}" ]] \
     && kill -0 "${server_pid}" 2>/dev/null; then
     "${cli[@]}" destroy "${instance_id}" --yes >/dev/null 2>&1 || true
@@ -183,6 +188,50 @@ if [[ -z "${conversation_id}" ]]; then
 fi
 
 "${cli[@]}" stop "${instance_id}" >/dev/null
+
+# Pi 原生 Session 必须真实落在用户数据盘，而不是只存在于数据库消息缓存。
+# Firecracker 停止后 ext4 可能仍带有待确认的 journal 状态；只读挂载无法回放
+# journal，所以先离线检查并修复，再以只读方式检查 Session 文件。
+filesystem_check="$(e2fsck -f -y "${volume_path}" 2>&1)" || filesystem_status="$?"
+filesystem_status="${filesystem_status:-0}"
+if (( filesystem_status > 1 )); then
+  echo "FAIL: user data disk check failed before Session verification" >&2
+  printf '%s\n' "${filesystem_check}" >&2
+  exit 1
+fi
+session_mount="$(mktemp -d /var/tmp/cli-session-check.XXXXXX)"
+mount -o loop,ro "${volume_path}" "${session_mount}"
+session_file="$(
+  find "${session_mount}/pi-state/agent/sessions" -type f \
+    -name "*_${conversation_id}.jsonl" -print -quit 2>/dev/null || true
+)"
+if [[ -z "${session_file}" ]]; then
+  echo "FAIL: Pi native session was not persisted on the user data disk" >&2
+  exit 1
+fi
+
+session_summary="$(python3 - "${session_file}" <<'PY'
+import json
+import sys
+
+entries = []
+with open(sys.argv[1], encoding="utf-8") as session:
+    for line in session:
+        line = line.strip()
+        if line:
+            entries.append(json.loads(line))
+messages = [entry for entry in entries if entry.get("type") == "message"]
+roles = [entry.get("message", {}).get("role") for entry in messages]
+assert "user" in roles, "native Session does not contain a user message"
+assert "assistant" in roles, "native Session does not contain an assistant message"
+print(f"entries={len(entries)} messages={len(messages)} roles={','.join(str(role) for role in roles)}")
+PY
+)"
+echo "PI_NATIVE_SESSION_STORED ${session_summary}"
+umount "${session_mount}"
+rmdir "${session_mount}"
+session_mount=""
+
 "${cli[@]}" start "${instance_id}" >/dev/null
 
 second_output="$(
@@ -194,6 +243,25 @@ grep -Fq "Pi > ${first_marker}" <<< "${second_output}"
 
 history_output="$("${cli[@]}" history "${instance_id}" "${conversation_id}" --limit 20)"
 grep -Fq "Pi > ${first_marker}" <<< "${history_output}"
+
+# 新会话只在 SQLite 保存索引与预览，完整消息必须以 Pi 原生 Session 为唯一来源。
+python3 - "${database_path}" "${conversation_id}" <<'PY'
+import sqlite3
+import sys
+
+database, conversation_id = sys.argv[1:]
+with sqlite3.connect(database) as connection:
+    conversation = connection.execute(
+        "SELECT session_backend,message_count FROM conversations WHERE id=?",
+        (conversation_id,),
+    ).fetchone()
+    assert conversation is not None, "conversation metadata is missing"
+    assert conversation[0] == "pi-native", "conversation did not use Pi native Session"
+    assert conversation[1] >= 4, "conversation metadata did not count persisted messages"
+    assert connection.execute(
+        "SELECT COUNT(*) FROM messages WHERE conversation_id=?", (conversation_id,)
+    ).fetchone()[0] == 0, "native conversation messages were duplicated into SQLite"
+PY
 
 "${cli[@]}" stop "${instance_id}" >/dev/null
 "${cli[@]}" destroy "${instance_id}" --yes >/dev/null
@@ -237,4 +305,4 @@ server_pid=""
 rm -rf --one-file-system "${state_root}"
 
 echo "PASS: agentctl completed authenticated lifecycle, chat, restart, and cleanup"
-echo "CLI_SMOKE_READY auth=session lifecycle=create,start,stop,restart,destroy conversation=preserved cleanup=verified"
+echo "CLI_SMOKE_READY auth=session lifecycle=create,start,stop,restart,destroy conversation=pi-native cleanup=verified"

@@ -299,6 +299,49 @@ class InstanceRuntime:
             shutil.rmtree(mount_path, ignore_errors=True)
         return deleted
 
+    def delete_pi_session_data(self, owner_id: str, session_id: str) -> int:
+        """在 microVM 停止时删除数据盘中的指定 Pi 原生 Session 文件。"""
+
+        owner_id = validate_instance_id(owner_id)
+        session_id = validate_instance_id(session_id)
+        binding = self.user_volume_store.get(owner_id)
+        if binding is None:
+            return 0
+        volume_path = Path(binding["volume_path"]).resolve()
+        if volume_path.parent != self.volume_root.resolve():
+            raise RuntimeFailure("refusing to mount a user volume outside the configured root")
+        if not volume_path.exists():
+            return 0
+
+        filesystem_check = run(["e2fsck", "-f", "-y", str(volume_path)], check=False)
+        if filesystem_check.returncode > 1:
+            raise RuntimeFailure(
+                f"persistent volume check failed: {filesystem_check.stderr.strip()}"
+            )
+
+        mount_path = Path(tempfile.mkdtemp(prefix="agent-session-delete.", dir="/var/tmp"))
+        mounted = False
+        deleted = 0
+        try:
+            run(["mount", "-o", "loop", str(volume_path), str(mount_path)])
+            mounted = True
+            sessions_root = mount_path / "pi-state" / "agent" / "sessions"
+            if sessions_root.is_dir():
+                for candidate in sessions_root.rglob(f"*_{session_id}.jsonl"):
+                    # rglob 结果仍做一次边界校验，避免未来目录中出现恶意符号链接。
+                    resolved = candidate.resolve()
+                    if not resolved.is_relative_to(sessions_root.resolve()):
+                        raise RuntimeFailure("Pi session path escaped the session root")
+                    if candidate.is_file() and not candidate.is_symlink():
+                        candidate.unlink()
+                        deleted += 1
+            run(["sync"])
+        finally:
+            if mounted:
+                run(["umount", str(mount_path)], check=False)
+            shutil.rmtree(mount_path, ignore_errors=True)
+        return deleted
+
     def configure_agent_volume(self, volume_path: Path, host_ip: str) -> None:
         """离线挂载数据盘并写入只含占位凭据的 Pi provider 配置。"""
 

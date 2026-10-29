@@ -209,7 +209,11 @@ if [[ "${managed_runtime}" == "1" ]]; then
         exit_status="$?"
       fi
       echo "PI_RPC_CONNECTION_CLOSED status=${exit_status}"
-      sleep 1
+      # 正常会话结束后立即恢复监听，方便 Host 先读取历史再发送新消息。
+      # 只有 socat 异常退出时才退避，避免故障状态下形成高频重启循环。
+      if [[ "${exit_status}" -ne 0 ]]; then
+        sleep 1
+      fi
     done
   ) &
 

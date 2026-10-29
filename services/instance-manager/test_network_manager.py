@@ -77,6 +77,18 @@ class NetworkManagerTests(unittest.TestCase):
         self.assertEqual(count, 0)
         self.assertEqual(stat.S_IMODE(self.database_path.stat().st_mode), 0o600)
 
+    def test_release_with_runtime_metadata_is_idempotent_after_lease_disappears(self) -> None:
+        """租约账本已清理时，生命周期元数据仍可用于兜底删除 Linux 资源。"""
+
+        lease = self.manager.allocate("agent-fallback")
+        self.manager.setup(lease, 999, (18082,))
+        self.store.release("agent-fallback")
+
+        self.manager.release("agent-fallback", lease=lease)
+
+        self.assertNotIn(lease["tap"], self.runner.links)
+        self.assertNotIn(("inet", lease["nft_table"]), self.runner.tables)
+
     def test_allocation_skips_host_route_and_existing_lease(self) -> None:
         self.runner.routes.add("172.29.0.0/30")
         first = self.manager.allocate("agent-one")

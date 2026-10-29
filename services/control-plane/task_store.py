@@ -89,7 +89,11 @@ class TaskStore:
                     id TEXT PRIMARY KEY,
                     instance_id TEXT NOT NULL,
                     workspace_id TEXT,
+                    pi_session_id TEXT,
+                    session_backend TEXT NOT NULL DEFAULT 'pi-native',
                     title TEXT NOT NULL,
+                    preview TEXT NOT NULL DEFAULT '暂无消息',
+                    message_count INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 )
@@ -101,6 +105,35 @@ class TaskStore:
             }
             if "workspace_id" not in conversation_columns:
                 connection.execute("ALTER TABLE conversations ADD COLUMN workspace_id TEXT")
+            if "pi_session_id" not in conversation_columns:
+                connection.execute("ALTER TABLE conversations ADD COLUMN pi_session_id TEXT")
+            if "session_backend" not in conversation_columns:
+                # 已存在的会话还没有 Pi 原生 Session 文件，继续使用数据库历史拼接；
+                # 新建会话则直接采用上面表定义中的 pi-native 默认值。
+                connection.execute(
+                    "ALTER TABLE conversations ADD COLUMN session_backend TEXT "
+                    "NOT NULL DEFAULT 'database'"
+                )
+            if "preview" not in conversation_columns:
+                connection.execute(
+                    "ALTER TABLE conversations ADD COLUMN preview TEXT NOT NULL DEFAULT '暂无消息'"
+                )
+                connection.execute(
+                    "UPDATE conversations SET preview=COALESCE(("
+                    "SELECT content FROM messages WHERE conversation_id=conversations.id "
+                    "ORDER BY sequence DESC LIMIT 1),'暂无消息')"
+                )
+            if "message_count" not in conversation_columns:
+                connection.execute(
+                    "ALTER TABLE conversations ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0"
+                )
+                connection.execute(
+                    "UPDATE conversations SET message_count=("
+                    "SELECT COUNT(*) FROM messages WHERE conversation_id=conversations.id)"
+                )
+            connection.execute(
+                "UPDATE conversations SET pi_session_id=id WHERE pi_session_id IS NULL"
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS messages (
@@ -164,8 +197,12 @@ class TaskStore:
                 return
             connection.execute("ATTACH DATABASE ? AS legacy_tasks", (source,))
             connection.execute(
-                "INSERT OR IGNORE INTO conversations(id,instance_id,title,created_at,updated_at) "
-                "SELECT id,instance_id,title,created_at,updated_at FROM legacy_tasks.conversations"
+                "INSERT OR IGNORE INTO conversations"
+                "(id,instance_id,workspace_id,pi_session_id,session_backend,title,preview,"
+                "message_count,created_at,updated_at) "
+                "SELECT id,instance_id,workspace_id,pi_session_id,session_backend,title,preview,"
+                "message_count,created_at,updated_at "
+                "FROM legacy_tasks.conversations"
             )
             connection.execute(
                 "INSERT OR IGNORE INTO tasks"
@@ -201,6 +238,8 @@ class TaskStore:
             "updatedAt": row["updated_at"],
             "conversationId": row["conversation_id"],
             "workspaceId": row["workspace_id"] if "workspace_id" in row.keys() else None,
+            "piSessionId": row["pi_session_id"] if "pi_session_id" in row.keys() else None,
+            "sessionBackend": row["session_backend"] if "session_backend" in row.keys() else None,
         }
 
     @staticmethod
@@ -211,7 +250,11 @@ class TaskStore:
             "id": row["id"],
             "instanceId": row["instance_id"],
             "workspaceId": row["workspace_id"],
+            "piSessionId": row["pi_session_id"],
+            "sessionBackend": row["session_backend"],
             "title": row["title"],
+            "preview": row["preview"],
+            "messageCount": row["message_count"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
@@ -243,8 +286,18 @@ class TaskStore:
         with self.connect() as connection:
             connection.execute(
                 "INSERT INTO conversations"
-                "(id,instance_id,workspace_id,title,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                (conversation_id, instance_id, workspace_id, title, now, now),
+                "(id,instance_id,workspace_id,pi_session_id,session_backend,title,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    conversation_id,
+                    instance_id,
+                    workspace_id,
+                    conversation_id,
+                    "pi-native",
+                    title,
+                    now,
+                    now,
+                ),
             )
         return self.get_conversation(instance_id, conversation_id)
 
@@ -259,21 +312,18 @@ class TaskStore:
         return self.conversation_from_row(row)
 
     def list_conversations(self, instance_id: str) -> list[dict[str, Any]]:
-        """按最近活动优先列出实例会话，并附带最后一条消息摘要。"""
+        """按最近活动优先列出实例会话，并附带元数据中的消息摘要。"""
 
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT c.*,
-                    (SELECT content FROM messages m WHERE m.conversation_id=c.id
-                     ORDER BY m.sequence DESC LIMIT 1) AS preview
-                FROM conversations c WHERE c.instance_id=?
+                SELECT c.* FROM conversations c WHERE c.instance_id=?
                 ORDER BY c.updated_at DESC,c.id DESC
                 """,
                 (instance_id,),
             ).fetchall()
         return [
-            {**self.conversation_from_row(row), "preview": row["preview"] or "尚无消息"}
+            self.conversation_from_row(row)
             for row in rows
         ]
 
@@ -283,16 +333,13 @@ class TaskStore:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT c.*,
-                    (SELECT content FROM messages m WHERE m.conversation_id=c.id
-                     ORDER BY m.sequence DESC LIMIT 1) AS preview
-                FROM conversations c WHERE c.workspace_id=?
+                SELECT c.* FROM conversations c WHERE c.workspace_id=?
                 ORDER BY c.updated_at DESC,c.id DESC
                 """,
                 (workspace_id,),
             ).fetchall()
         return [
-            {**self.conversation_from_row(row), "preview": row["preview"] or "暂无消息"}
+            self.conversation_from_row(row)
             for row in rows
         ]
 
@@ -334,6 +381,17 @@ class TaskStore:
                 "SELECT 1 FROM tasks t JOIN conversations c ON c.id=t.conversation_id "
                 "WHERE c.workspace_id=? AND t.status IN ('queued','running') LIMIT 1",
                 (workspace_id,),
+            ).fetchone()
+        return row is not None
+
+    def conversation_has_active_tasks(self, conversation_id: str) -> bool:
+        """判断会话是否仍有不能安全删除的排队或运行任务。"""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM tasks WHERE conversation_id=? "
+                "AND status IN ('queued','running') LIMIT 1",
+                (conversation_id,),
             ).fetchone()
         return row is not None
 
@@ -436,11 +494,17 @@ class TaskStore:
 
         conversation = self.get_conversation(instance_id, conversation_id)
         prior = self.list_messages(instance_id, conversation_id)
-        context_messages = [
-            {"role": message["role"], "content": message["content"]} for message in prior
-        ]
-        context_messages.append({"role": "user", "content": content})
-        prompt = self.build_context_prompt(context_messages)
+        if conversation["sessionBackend"] == "pi-native":
+            # Pi 会从数据盘中的原生 Session 恢复历史；这里只发送本轮用户输入，
+            # 避免把数据库历史再次拼入 prompt 导致上下文重复。
+            prompt = content
+        else:
+            # 升级前的会话没有原生 Session 文件，暂时沿用数据库上下文保证兼容。
+            context_messages = [
+                {"role": message["role"], "content": message["content"]} for message in prior
+            ]
+            context_messages.append({"role": "user", "content": content})
+            prompt = self.build_context_prompt(context_messages)
         now = int(time.time())
         task_id = f"task-{uuid.uuid4().hex[:16]}"
         message_id = f"message-{uuid.uuid4().hex[:16]}"
@@ -458,14 +522,16 @@ class TaskStore:
                 "INSERT INTO task_events(task_id,event_type,payload,created_at) VALUES(?,?,?,?)",
                 (task_id, "queued", "{}", now),
             )
+            if conversation["sessionBackend"] == "database":
+                connection.execute(
+                    "INSERT INTO messages(id,conversation_id,role,content,task_id,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (message_id, conversation_id, "user", content, task_id, now),
+                )
             connection.execute(
-                "INSERT INTO messages(id,conversation_id,role,content,task_id,created_at) "
-                "VALUES(?,?,?,?,?,?)",
-                (message_id, conversation_id, "user", content, task_id, now),
-            )
-            connection.execute(
-                "UPDATE conversations SET title=?,updated_at=? WHERE id=?",
-                (title, now, conversation_id),
+                "UPDATE conversations SET title=?,preview=?,message_count=message_count+1,"
+                "updated_at=? WHERE id=?",
+                (title, content, now, conversation_id),
             )
         return self.get(instance_id, task_id)
 
@@ -493,7 +559,8 @@ class TaskStore:
     def get(self, instance_id: str, task_id: str) -> dict[str, Any]:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT t.*,c.workspace_id AS workspace_id FROM tasks t "
+                "SELECT t.*,c.workspace_id AS workspace_id,c.pi_session_id AS pi_session_id,"
+                "c.session_backend AS session_backend FROM tasks t "
                 "LEFT JOIN conversations c ON c.id=t.conversation_id "
                 "WHERE t.id=? AND t.instance_id=?",
                 (task_id, instance_id),
@@ -509,7 +576,8 @@ class TaskStore:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT t.*,c.workspace_id AS workspace_id FROM tasks t "
+                "SELECT t.*,c.workspace_id AS workspace_id,c.pi_session_id AS pi_session_id,"
+                "c.session_backend AS session_backend FROM tasks t "
                 "LEFT JOIN conversations c ON c.id=t.conversation_id "
                 "WHERE t.instance_id=? AND t.status='queued' "
                 "ORDER BY t.created_at,t.id LIMIT 1",
@@ -560,24 +628,29 @@ class TaskStore:
                     (output, now, task_id),
                 )
                 row = connection.execute(
-                    "SELECT conversation_id FROM tasks WHERE id=?", (task_id,)
+                    "SELECT t.conversation_id,c.session_backend FROM tasks t "
+                    "LEFT JOIN conversations c ON c.id=t.conversation_id WHERE t.id=?",
+                    (task_id,),
                 ).fetchone()
                 if row is not None and row["conversation_id"]:
+                    if row["session_backend"] == "database":
+                        connection.execute(
+                            "INSERT OR IGNORE INTO messages"
+                            "(id,conversation_id,role,content,task_id,created_at) "
+                            "VALUES(?,?,?,?,?,?)",
+                            (
+                                f"message-{uuid.uuid4().hex[:16]}",
+                                row["conversation_id"],
+                                "assistant",
+                                output,
+                                task_id,
+                                now,
+                            ),
+                        )
                     connection.execute(
-                        "INSERT OR IGNORE INTO messages"
-                        "(id,conversation_id,role,content,task_id,created_at) VALUES(?,?,?,?,?,?)",
-                        (
-                            f"message-{uuid.uuid4().hex[:16]}",
-                            row["conversation_id"],
-                            "assistant",
-                            output,
-                            task_id,
-                            now,
-                        ),
-                    )
-                    connection.execute(
-                        "UPDATE conversations SET updated_at=? WHERE id=?",
-                        (now, row["conversation_id"]),
+                        "UPDATE conversations SET preview=?,message_count=message_count+1,"
+                        "updated_at=? WHERE id=?",
+                        (output, now, row["conversation_id"]),
                     )
             elif event_type == "failed":
                 error = payload.get("error")

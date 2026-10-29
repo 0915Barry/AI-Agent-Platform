@@ -383,17 +383,40 @@ class ControlPlane:
     def delete_workspace_conversation(
         self, owner_id: str, workspace_id: str, conversation_id: str
     ) -> dict[str, Any]:
-        """删除会话数据，不触及该工作区中其他文件。"""
+        """停止实例后删除 Pi 原生 Session 与会话元数据。"""
 
         try:
             self.require_workspace_store().get(owner_id, workspace_id)
-            deleted = self.tasks.delete_conversation(workspace_id, conversation_id)
         except WorkspaceStoreError as error:
             raise ApiError(404, "workspace_not_found", str(error)) from error
-        except TaskStoreError as error:
-            status = 409 if "正在" in str(error) else 404
-            code = "conversation_busy" if status == 409 else "conversation_not_found"
-            raise ApiError(status, code, str(error)) from error
+        instance = self.store.primary_for_owner(owner_id)
+        if instance is None:
+            raise ApiError(404, "instance_not_found", "user instance not found")
+
+        with self.lock_for(instance["id"]):
+            try:
+                conversation = self.tasks.get_conversation(instance["id"], conversation_id)
+                if conversation["workspaceId"] != workspace_id:
+                    raise TaskStoreError(f"conversation not found: {conversation_id}")
+                if self.tasks.conversation_has_active_tasks(conversation_id):
+                    raise TaskStoreError("会话仍有正在排队或执行的任务")
+                instance = self.reconcile(self.store.get(instance["id"]))
+                if instance["status"] in {"starting", "stopping"}:
+                    raise ApiError(409, "instance_busy", f"instance is {instance['status']}")
+                if instance["status"] == "running":
+                    self.stop(instance["id"])
+                if (
+                    conversation["sessionBackend"] == "pi-native"
+                    and hasattr(self.runtime, "delete_pi_session_data")
+                ):
+                    self.runtime.delete_pi_session_data(owner_id, conversation["piSessionId"])
+                deleted = self.tasks.delete_conversation(workspace_id, conversation_id)
+            except TaskStoreError as error:
+                status = 409 if "正在" in str(error) else 404
+                code = "conversation_busy" if status == 409 else "conversation_not_found"
+                raise ApiError(status, code, str(error)) from error
+            except (RuntimeFailure, OSError, subprocess.SubprocessError) as error:
+                raise ApiError(500, "conversation_cleanup_failed", str(error)) from error
         return {"id": deleted["id"], "status": "deleted"}
 
     def delete_workspace(self, owner_id: str, workspace_id: str) -> dict[str, Any]:
@@ -430,6 +453,13 @@ class ControlPlane:
         workspace_id = workspace["id"]
         store = self.require_workspace_store()
         try:
+            conversations = self.tasks.list_workspace_conversations(workspace_id)
+            if hasattr(self.runtime, "delete_pi_session_data"):
+                for conversation in conversations:
+                    if conversation["sessionBackend"] == "pi-native":
+                        self.runtime.delete_pi_session_data(
+                            owner_id, conversation["piSessionId"]
+                        )
             if hasattr(self.runtime, "delete_workspace_data"):
                 self.runtime.delete_workspace_data(owner_id, workspace["directoryName"])
             conversation_count = self.tasks.delete_workspace_conversations(workspace_id)
@@ -617,10 +647,103 @@ class ControlPlane:
         except TaskStoreError as error:
             raise ApiError(404, "conversation_not_found", str(error)) from error
 
-    def conversation_messages(self, instance_id: str, conversation_id: str) -> list[dict[str, Any]]:
+    @staticmethod
+    def _pi_message_text(message: dict[str, Any]) -> str | None:
+        """提取 Pi 原生 user/assistant 消息中可供客户端展示的文本。"""
+
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            return None
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return None
+        parts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ]
+        return "".join(parts) or None
+
+    def _native_conversation_messages(
+        self,
+        instance_id: str,
+        conversation: dict[str, Any],
+        owner_id: str | None,
+    ) -> list[dict[str, Any]]:
+        """启动必要的计算资源，并通过 Pi RPC 读取数据盘中的原生 Session。"""
+
+        if self.pi_gateway is None:
+            # 纯本地单元测试或旧服务没有 Gateway 时保留兼容查询路径。
+            return self.tasks.list_messages(instance_id, conversation["id"])
+        if self.tasks.instance_has_active_tasks(instance_id):
+            raise ApiError(409, "instance_busy", "实例正在执行任务，暂时无法读取会话历史")
+        record = self.get(instance_id)
+        if record["status"] != "running" and owner_id is not None:
+            record = self.start(instance_id, owner_id)
+        if record["status"] != "running":
+            raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
+        runtime_status = self.runtime.status(instance_id)
+        if runtime_status is None:
+            raise ApiError(500, "runtime_missing", "instance runtime metadata is missing")
+        guest_ip = runtime_status.get("guestIp")
+        rpc_port = runtime_status.get("rpcPort")
+        workspace_id = conversation.get("workspaceId")
+        session_id = conversation.get("piSessionId")
+        if not all(
+            (
+                isinstance(guest_ip, str),
+                isinstance(rpc_port, int),
+                workspace_id is None or isinstance(workspace_id, str),
+                isinstance(session_id, str),
+            )
+        ):
+            raise ApiError(500, "session_route_invalid", "Pi Session route is incomplete")
+        try:
+            self.runtime.heartbeat(instance_id)
+            source = self.pi_gateway.get_messages(
+                guest_ip, rpc_port, workspace_id, session_id
+            )
+        except (PiGatewayError, RuntimeFailure, OSError) as error:
+            raise ApiError(502, "session_read_failed", str(error)) from error
+
+        messages: list[dict[str, Any]] = []
+        for source_message in source:
+            content = self._pi_message_text(source_message)
+            if content is None:
+                continue
+            timestamp = source_message.get("timestamp")
+            created_at = (
+                int(timestamp / 1000)
+                if isinstance(timestamp, (int, float))
+                else conversation["updatedAt"]
+            )
+            sequence = len(messages) + 1
+            messages.append(
+                {
+                    "sequence": sequence,
+                    "id": f"pi-{session_id}-{sequence}",
+                    "conversationId": conversation["id"],
+                    "role": source_message["role"],
+                    "content": content,
+                    "taskId": None,
+                    "createdAt": created_at,
+                }
+            )
+        return messages
+
+    def conversation_messages(
+        self, instance_id: str, conversation_id: str, owner_id: str | None = None
+    ) -> list[dict[str, Any]]:
         instance_id = self.validate_requested_id(instance_id)
         self.store.get(instance_id)
         try:
+            conversation = self.tasks.get_conversation(instance_id, conversation_id)
+            if conversation["sessionBackend"] == "pi-native":
+                return self._native_conversation_messages(instance_id, conversation, owner_id)
             return self.tasks.list_messages(instance_id, conversation_id)
         except TaskStoreError as error:
             raise ApiError(404, "conversation_not_found", str(error)) from error
@@ -631,15 +754,27 @@ class ControlPlane:
         conversation_id: str,
         limit: int,
         before_sequence: int | None,
+        owner_id: str | None = None,
     ) -> tuple[list[dict[str, Any]], int | None]:
         """为终端和页面返回有上限的历史消息，避免长会话被一次性载入。"""
 
         instance_id = self.validate_requested_id(instance_id)
         self.store.get(instance_id)
         try:
-            return self.tasks.list_messages_page(
-                instance_id, conversation_id, limit, before_sequence
-            )
+            conversation = self.tasks.get_conversation(instance_id, conversation_id)
+            if conversation["sessionBackend"] == "database":
+                return self.tasks.list_messages_page(
+                    instance_id, conversation_id, limit, before_sequence
+                )
+            messages = self._native_conversation_messages(instance_id, conversation, owner_id)
+            eligible = [
+                message
+                for message in messages
+                if before_sequence is None or message["sequence"] < before_sequence
+            ]
+            selected = eligible[-limit:]
+            next_before = selected[0]["sequence"] if len(eligible) > limit and selected else None
+            return selected, next_before
         except TaskStoreError as error:
             raise ApiError(404, "conversation_not_found", str(error)) from error
 
@@ -773,6 +908,7 @@ class ControlPlane:
                 task["prompt"],
                 save_event,
                 task.get("workspaceId"),
+                task.get("piSessionId") if task.get("sessionBackend") == "pi-native" else None,
             )
             # PiGateway 只有收到 agent_settled 才会返回，因此这里的 completed 表示
             # 模型循环及其中的工具调用均已真正结束，而不只是收到最后一个文本块。
@@ -1005,7 +1141,11 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                             "limit must be 1-100 and before must be positive",
                         )
                     messages, next_before = self.control.conversation_messages_page(
-                        instance_id, conversation_id, limit, before
+                        instance_id,
+                        conversation_id,
+                        limit,
+                        before,
+                        user["id"] if user is not None else None,
                     )
                     self.send_payload(
                         200,

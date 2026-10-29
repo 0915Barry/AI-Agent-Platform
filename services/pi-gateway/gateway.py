@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -102,6 +103,26 @@ class PiGateway:
         writer.write(encoded + b"\n")
         writer.flush()
 
+    def _connect(self, host: str, port: int) -> socket.socket:
+        """在 Guest RPC 监听器短暂重启期间进行有界连接重试。"""
+
+        deadline = time.monotonic() + self.connect_timeout
+        last_error: OSError | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                return socket.create_connection(
+                    (host, port), timeout=min(0.5, remaining)
+                )
+            except OSError as error:
+                last_error = error
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        raise PiGatewayError(
+            f"cannot connect to Pi RPC at {host}:{port}: {last_error}"
+        ) from last_error
+
     def execute(
         self,
         host: str,
@@ -109,12 +130,13 @@ class PiGateway:
         prompt: str,
         on_event: TaskEventHandler,
         workspace_id: str | None = None,
+        session_id: str | None = None,
     ) -> str:
         """执行一个 prompt，返回最终文本，并同步上报流式与工具事件。
 
         host/port 来自 InstanceRuntime 保存的 Guest RPC 端点；prompt 与
-        workspace_id 来自任务记录；on_event 由 Control Plane 提供，用于持久化
-        流式文本、工具调用和进度事件。
+        workspace_id 与 session_id 来自会话记录；on_event 由 Control Plane 提供，
+        用于持久化流式文本、工具调用和进度事件。
 
         协议顺序为：发送 prompt 命令 -> 等待同 id 的 response 确认 -> 持续接收
         agent/message/tool 事件 -> 收到 agent_settled 后返回最终文本。仅收到
@@ -129,14 +151,12 @@ class PiGateway:
         command_id = f"gateway-{uuid.uuid4().hex}"
         final_output: str | None = None
         prompt_accepted = False
+        agent_settled = False
         # disposition 描述 Pi 如何处理命令：立即启动、进入 Pi 内部队列，或已同步
         # 处理完成。它不是平台 TaskStore 中 queued/running 状态的替代品。
         disposition: str | None = None
 
-        try:
-            connection = socket.create_connection((host, port), timeout=self.connect_timeout)
-        except OSError as error:
-            raise PiGatewayError(f"cannot connect to Pi RPC at {host}:{port}: {error}") from error
+        connection = self._connect(host, port)
 
         with connection:
             connection.settimeout(self.task_timeout)
@@ -150,6 +170,10 @@ class PiGateway:
                     # workspace 是平台传给 Guest 包装层的扩展字段，用于把 Pi 当前
                     # 工作目录限制到对应工作区；它不是模型提示词的一部分。
                     command["workspace"] = workspace_id
+                if session_id is not None:
+                    # Guest 包装层会把平台 conversation ID 转换为 Pi 的 --session-id，
+                    # Pi 因而能从用户数据盘恢复同一原生 Session。
+                    command["session"] = session_id
                 self._send(writer, command)
                 while True:
                     try:
@@ -230,7 +254,8 @@ class PiGateway:
                             raise PiGatewayError("Pi task was aborted")
                         if final_output is None:
                             raise PiGatewayError("Pi completed without an assistant message")
-                        return final_output
+                        agent_settled = True
+                        break
             except socket.timeout as error:
                 raise PiGatewayError(
                     f"Pi RPC task exceeded {self.task_timeout:g} seconds"
@@ -240,5 +265,78 @@ class PiGateway:
             finally:
                 # makefile() 创建了独立缓冲对象，需要显式关闭；外层 with 会随后关闭
                 # socket，并使 Guest socat 结束本次 Pi RPC 子进程。
+                writer.close()
+                reader.close()
+
+        if not agent_settled or final_output is None:
+            raise PiGatewayError("Pi RPC ended without a settled result")
+
+        # 连接关闭后，Guest 包装脚本会等待 Pi 退出并执行 sync，然后 socat 才重新
+        # 进入监听。这里用一次立即关闭的探测连接确认该顺序已经完成，避免上层刚
+        # 收到 completed 就停止 Firecracker，导致 Session 消息仍停留在页缓存。
+        probe = self._connect(host, port)
+        probe.close()
+        return final_output
+
+    def get_messages(
+        self,
+        host: str,
+        port: int,
+        workspace_id: str | None,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        """从数据盘中的 Pi 原生 Session 读取当前分支消息。
+
+        Guest 包装层用首条记录中的 workspace/session 字段选择工作目录和
+        ``--session-id``；Pi 启动后直接从持久化 Session 回复 get_messages。
+        """
+
+        command_id = f"gateway-{uuid.uuid4().hex}"
+        command = {
+            "id": command_id,
+            "type": "get_messages",
+            "session": session_id,
+        }
+        if workspace_id is not None:
+            # 旧式实例级会话没有 workspace_id，Guest 此时使用默认 /workspace。
+            command["workspace"] = workspace_id
+        connection = self._connect(host, port)
+
+        with connection:
+            connection.settimeout(self.task_timeout)
+            reader = connection.makefile("rb")
+            writer = connection.makefile("wb")
+            try:
+                self._send(writer, command)
+                while True:
+                    line = reader.readline(self.MAX_RECORD_BYTES + 1)
+                    if not line:
+                        raise PiGatewayError("Pi RPC connection closed before get_messages response")
+                    if len(line) > self.MAX_RECORD_BYTES:
+                        raise PiGatewayError("Pi RPC record exceeds 4 MiB")
+                    try:
+                        record = json.loads(line.rstrip(b"\r\n").decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                        raise PiGatewayError("Pi RPC returned invalid JSONL") from error
+                    if not isinstance(record, dict):
+                        continue
+                    if record.get("type") != "response" or record.get("id") != command_id:
+                        continue
+                    if not record.get("success"):
+                        raise PiGatewayError(str(record.get("error") or "Pi rejected get_messages"))
+                    data = record.get("data")
+                    messages = data.get("messages") if isinstance(data, dict) else None
+                    if not isinstance(messages, list) or not all(
+                        isinstance(message, dict) for message in messages
+                    ):
+                        raise PiGatewayError("Pi get_messages returned an invalid message list")
+                    return messages
+            except socket.timeout as error:
+                raise PiGatewayError(
+                    f"Pi RPC history request exceeded {self.task_timeout:g} seconds"
+                ) from error
+            except OSError as error:
+                raise PiGatewayError(f"Pi RPC transport failed: {error}") from error
+            finally:
                 writer.close()
                 reader.close()
