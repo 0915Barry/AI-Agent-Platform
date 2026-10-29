@@ -17,7 +17,7 @@ listen_port="18090"
 pid_path="/run/ai-agent-control-plane.pid"
 log_path="/var/log/ai-agent-control-plane.log"
 database_path="/var/lib/fc/control-plane.db"
-task_database_path="/var/lib/fc/tasks/tasks.db"
+legacy_task_database_path="/var/lib/fc/tasks/tasks.db"
 server_path="${repo_dir}/services/control-plane/server.py"
 
 read_pid() {
@@ -89,7 +89,7 @@ start_service() {
     --listen-host "${listen_host}" \
     --listen-port "${listen_port}" \
     --database "${database_path}" \
-    --task-database "${task_database_path}" \
+    --task-database "${legacy_task_database_path}" \
     --deepseek-credential "${credential_path}" \
     --state-root /var/lib/fc \
     --idle-timeout "${INSTANCE_IDLE_TIMEOUT_SECONDS}" \

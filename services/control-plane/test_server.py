@@ -476,5 +476,23 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(task["output"], "ok")
         self.assertIsNone(task["conversationId"])
 
+    def test_separate_task_database_is_imported_into_control_plane_database(self) -> None:
+        """旧 tasks.db 中的会话、消息、任务和事件应只导入一次。"""
+
+        legacy_path = Path(self.temporary.name) / "old" / "tasks.db"
+        legacy = SERVER.TaskStore(legacy_path)
+        conversation = legacy.create_conversation("agent-old", "旧会话")
+        task = legacy.create_conversation_task("agent-old", conversation["id"], "旧消息")
+
+        unified_path = Path(self.temporary.name) / "control-plane-unified.db"
+        unified = SERVER.TaskStore(unified_path, legacy_database_path=legacy_path)
+        self.assertEqual(unified.get("agent-old", task["id"])["status"], "queued")
+        self.assertEqual(unified.list_messages("agent-old", conversation["id"])[0]["content"], "旧消息")
+
+        SERVER.TaskStore(unified_path, legacy_database_path=legacy_path)
+        with sqlite3.connect(unified_path) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM task_store_migrations").fetchone()[0], 1)
+
 if __name__ == "__main__":
     unittest.main()

@@ -79,14 +79,12 @@ class InstanceRuntime:
         volume_root: Path = DEFAULT_VOLUME_ROOT,
         idle_timeout_seconds: int = 300,
         deepseek_credential: Path | None = None,
-        task_database: Path | None = None,
         state_database: Path | None = None,
     ) -> None:
         self.state_root = state_root.resolve()
         self.volume_root = volume_root.resolve()
         self.idle_timeout_seconds = idle_timeout_seconds
         self.deepseek_credential = deepseek_credential.resolve() if deepseek_credential else None
-        self.task_database = task_database.resolve() if task_database else None
         self.state_database = (
             state_database.resolve() if state_database else self.state_root / "control-plane.db"
         )

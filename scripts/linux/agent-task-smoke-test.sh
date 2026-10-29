@@ -29,7 +29,6 @@ listen_port="18091"
 base_url="http://127.0.0.1:${listen_port}"
 state_root="/var/lib/fc/pi-gateway-smoke"
 database_path="${state_root}/control-plane.db"
-task_database_path="${state_root}/tasks/tasks.db"
 log_path="${state_root}/server.log"
 volume_path="/srv/fc/volumes/instances/${instance_id}.ext4"
 jail_path="/srv/jailer/firecracker/${instance_id}"
@@ -79,7 +78,6 @@ python3 "${repo_dir}/services/control-plane/server.py" \
   --listen-host 127.0.0.1 \
   --listen-port "${listen_port}" \
   --database "${database_path}" \
-  --task-database "${task_database_path}" \
   --deepseek-credential "${credential_path}" \
   --state-root "${state_root}" \
   --idle-timeout "${INSTANCE_IDLE_TIMEOUT_SECONDS}" \

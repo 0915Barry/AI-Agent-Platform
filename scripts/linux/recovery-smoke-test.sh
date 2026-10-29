@@ -45,7 +45,6 @@ listen_port="18094"
 base_url="http://127.0.0.1:${listen_port}"
 state_root="/var/lib/fc/recovery-smoke"
 database_path="${state_root}/control-plane.db"
-task_database_path="${state_root}/tasks/tasks.db"
 log_path="${state_root}/server.log"
 suffix="$(tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-10)"
 instance_id="recovery-${suffix}"
@@ -67,7 +66,6 @@ start_server() {
     --listen-host 127.0.0.1 \
     --listen-port "${listen_port}" \
     --database "${database_path}" \
-    --task-database "${task_database_path}" \
     --deepseek-credential "${credential_path}" \
     --state-root "${state_root}" \
     --idle-timeout "${INSTANCE_IDLE_TIMEOUT_SECONDS}" \

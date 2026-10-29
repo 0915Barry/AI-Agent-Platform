@@ -937,7 +937,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--listen-port", default=18090, type=int)
     parser.add_argument("--database", type=Path, default=Path("/var/lib/fc/control-plane.db"))
     parser.add_argument("--state-root", type=Path, default=Path("/var/lib/fc"))
-    parser.add_argument("--task-database", type=Path, default=Path("/var/lib/fc/tasks/tasks.db"))
+    parser.add_argument(
+        "--task-database",
+        type=Path,
+        help="legacy tasks.db to import once into --database",
+    )
     parser.add_argument("--deepseek-credential", type=Path)
     parser.add_argument("--idle-timeout", type=int, default=300)
     parser.add_argument(
@@ -962,12 +966,11 @@ def main() -> None:
     auth_store = AuthStore(args.database) if args.require_auth else None
     if auth_store is not None and not auth_store.has_users():
         raise SystemExit("no M16 user exists; run configure-user before starting the control plane")
-    tasks = TaskStore(args.task_database)
+    tasks = TaskStore(args.database, legacy_database_path=args.task_database)
     runtime = InstanceRuntime(
         state_root=args.state_root,
         idle_timeout_seconds=args.idle_timeout,
         deepseek_credential=args.deepseek_credential,
-        task_database=args.task_database,
         state_database=args.database,
     )
     control = ControlPlane(store, runtime, tasks, PiGateway())

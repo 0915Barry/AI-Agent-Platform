@@ -25,10 +25,12 @@ class TaskStore:
     MAX_CONTEXT_MESSAGES = 20
     MAX_CONTEXT_BYTES = 24 * 1024
 
-    def __init__(self, database_path: Path) -> None:
-        self.database_path = database_path
+    def __init__(self, database_path: Path, legacy_database_path: Path | None = None) -> None:
+        self.database_path = database_path.resolve()
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
         self.initialize()
+        if legacy_database_path is not None:
+            self.import_legacy_database(legacy_database_path)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -124,6 +126,55 @@ class TaskStore:
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS messages_assistant_task "
                 "ON messages(task_id) WHERE role='assistant' AND task_id IS NOT NULL"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_store_migrations (
+                    source_path TEXT PRIMARY KEY,
+                    migrated_at INTEGER NOT NULL
+                )
+                """
+            )
+
+    def import_legacy_database(self, legacy_database_path: Path) -> None:
+        """将旧独立 tasks.db 一次性导入统一控制面数据库。"""
+        legacy_path = legacy_database_path.resolve()
+        if legacy_path == self.database_path or not legacy_path.exists():
+            return
+
+        # 先用当前 TaskStore 补齐旧库表结构，再执行跨库导入。
+        TaskStore(legacy_path)
+        source = str(legacy_path)
+        with self.connect() as connection:
+            migrated = connection.execute(
+                "SELECT 1 FROM task_store_migrations WHERE source_path=?", (source,)
+            ).fetchone()
+            if migrated is not None:
+                return
+            connection.execute("ATTACH DATABASE ? AS legacy_tasks", (source,))
+            connection.execute(
+                "INSERT OR IGNORE INTO conversations(id,instance_id,title,created_at,updated_at) "
+                "SELECT id,instance_id,title,created_at,updated_at FROM legacy_tasks.conversations"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO tasks"
+                "(id,instance_id,prompt,status,output,error,created_at,updated_at,conversation_id) "
+                "SELECT id,instance_id,prompt,status,output,error,created_at,updated_at,conversation_id "
+                "FROM legacy_tasks.tasks"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO task_events(sequence,task_id,event_type,payload,created_at) "
+                "SELECT sequence,task_id,event_type,payload,created_at FROM legacy_tasks.task_events"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO messages"
+                "(sequence,id,conversation_id,role,content,task_id,created_at) "
+                "SELECT sequence,id,conversation_id,role,content,task_id,created_at "
+                "FROM legacy_tasks.messages"
+            )
+            connection.execute(
+                "INSERT INTO task_store_migrations(source_path,migrated_at) VALUES(?,?)",
+                (source, int(time.time())),
             )
 
     @staticmethod

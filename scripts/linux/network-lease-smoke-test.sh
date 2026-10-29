@@ -17,7 +17,6 @@ listen_port="18092"
 base_url="http://127.0.0.1:${listen_port}"
 state_root="/var/lib/fc/network-lease-smoke"
 database_path="${state_root}/control-plane.db"
-task_database_path="${state_root}/tasks/tasks.db"
 credential_path="${state_root}/placeholder-api-key"
 volume_path="/srv/fc/volumes/instances/${instance_id}.ext4"
 jail_path="/srv/jailer/firecracker/${instance_id}"
@@ -72,7 +71,6 @@ python3 "${repo_dir}/services/control-plane/server.py" \
   --listen-host 127.0.0.1 \
   --listen-port "${listen_port}" \
   --database "${database_path}" \
-  --task-database "${task_database_path}" \
   --deepseek-credential "${credential_path}" \
   --state-root "${state_root}" \
   --idle-timeout "${INSTANCE_IDLE_TIMEOUT_SECONDS}" \

@@ -310,8 +310,10 @@ Pi RPC。它将 Pi 原生 JSONL 事件标准化为 `progress`、`text`、`tool_c
 `tool_result`、`completed` 或 `failed`，写入 SQLite，并通过 SSE 流输出。一个实例同一
 时间串行处理任务，任务执行期间设置生命周期 `busy` 标记。
 
-会话和消息保存在 Ubuntu 宿主 SQLite 中。每次发送消息时，控制面按顺序选取同一会话
-最近的消息组装上下文；显式销毁实例时才删除关联任务和会话记录。
+会话、消息、任务和事件与实例、运行状态和网络租约统一保存在 Ubuntu
+宿主的 `/var/lib/fc/control-plane.db` 中。每次发送消息时，控制面按顺序选取同一
+会话最近的消息组装上下文；显式销毁实例时才删除关联任务和会话记录。
+升级前的 `/var/lib/fc/tasks/tasks.db` 会在服务首次启动时自动导入，原文件暂时保留作为备份。
 
 ## 网络与数据边界
 
@@ -326,7 +328,8 @@ Network Manager 从 `172.29.0.0/16` 地址池按 `/30` 分配槽位。每个运�
 | 内核与 rootfs | `/srv/fc/artifacts/` |
 | 实例数据盘 | `/srv/fc/volumes/instances/` |
 | Jailer 临时目录 | `/srv/jailer/firecracker/<instance-id>/` |
-| 实例运行元数据 | `/var/lib/fc/instances/` |
+| 控制面数据库 | `/var/lib/fc/control-plane.db` |
+| 空闲活动与长任务标记 | `/var/lib/fc/activity/`、`/var/lib/fc/instances/*.busy` |
 | DeepSeek API Key | `~/.config/ai-agent-platform/deepseek-api-key` |
 
 Git 仓库不保存 API Key、SSH 私钥、实例磁盘、Jailer 目录或运行日志。模型密钥只由

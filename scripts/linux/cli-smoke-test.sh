@@ -46,7 +46,6 @@ listen_port="18093"
 base_url="http://127.0.0.1:${listen_port}"
 state_root="/var/lib/fc/cli-smoke"
 database_path="${state_root}/control-plane.db"
-task_database_path="${state_root}/tasks/tasks.db"
 state_file="${state_root}/agentctl-session.json"
 log_path="${state_root}/server.log"
 suffix="$(tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-10)"
@@ -108,7 +107,6 @@ python3 "${repo_dir}/services/control-plane/server.py" \
   --listen-host 127.0.0.1 \
   --listen-port "${listen_port}" \
   --database "${database_path}" \
-  --task-database "${task_database_path}" \
   --deepseek-credential "${credential_path}" \
   --state-root "${state_root}" \
   --idle-timeout "${INSTANCE_IDLE_TIMEOUT_SECONDS}" \
@@ -197,12 +195,12 @@ if [[ -n "${tap_name}" ]] && ip link show "${tap_name}" >/dev/null 2>&1; then
   echo "FAIL: TAP remained after destroy: ${tap_name}" >&2
   exit 1
 fi
-python3 - "${database_path}" "${task_database_path}" "${instance_id}" <<'PY'
+python3 - "${database_path}" "${instance_id}" <<'PY'
 import sqlite3
 import sys
 
-instance_db, task_db, instance_id = sys.argv[1:]
-with sqlite3.connect(instance_db) as connection:
+database, instance_id = sys.argv[1:]
+with sqlite3.connect(database) as connection:
     assert connection.execute(
         "SELECT COUNT(*) FROM instances WHERE id=?", (instance_id,)
     ).fetchone()[0] == 0
@@ -212,7 +210,6 @@ with sqlite3.connect(instance_db) as connection:
     assert connection.execute(
         "SELECT COUNT(*) FROM runtime_instances WHERE instance_id=?", (instance_id,)
     ).fetchone()[0] == 0
-with sqlite3.connect(task_db) as connection:
     assert connection.execute(
         "SELECT COUNT(*) FROM tasks WHERE instance_id=?", (instance_id,)
     ).fetchone()[0] == 0
