@@ -161,10 +161,11 @@ Windows 在 VMware Ubuntu 的仓库目录执行：
 ./run-linux.sh stop
 ```
 
-`start` 启动仅监听 Ubuntu loopback 的 Control Plane；`stop` 停止控制面，但不会删除
-实例持久化数据盘。实例计算资源由空闲回收策略管理，默认空闲阈值为 300 秒。
-每个账户最多保留 5 条实例记录，但同一时间只允许 1 台实例处于 `starting` 或
-`running` 状态；停止当前实例后才能启动该账户的另一台实例。
+`start` 会同步代码、检查 rootfs 并启动仅监听 Ubuntu loopback 的 Control Plane；
+`status` 和 `stop` 直接查询或停止已部署服务，不再重复同步。停止控制面不会删除
+用户持久化数据盘。实例计算资源由空闲回收策略管理，默认空闲阈值为 300 秒。
+每个账户使用 1 条后台实例记录和 1 块持久化数据盘；工作区和会话
+是该数据盘上的逻辑分组，不会为每个工作区重复创建 microVM 或数据盘。
 
 macOS 如需从本机访问 HTTP 控制面，另开一个终端保持 SSH 隧道运行：
 
@@ -177,7 +178,9 @@ macOS 如需从本机访问 HTTP 控制面，另开一个终端保持 SSH 隧道
 
 ## 终端 CLI
 
-`agentctl` 通过 Control Plane 管理实例和会话，不直接连接 Firecracker 或 Pi RPC。
+`agentctl` 通过 Control Plane 管理工作区、会话和诊断实例，不直接连接 Firecracker
+或 Pi RPC。`./agentctl workspace` 使用方向键创建或切换工作区；`./agentctl chat`
+从当前工作区选择已有会话或新建会话，后台会在首次发送消息时自动准备 microVM。
 macOS 使用前应先运行 `./run.sh start`，并在另一个终端保持 `./run.sh tunnel`；Windows
 则直接在已经启动 Control Plane 的 VMware Ubuntu 终端中使用。
 
@@ -187,22 +190,29 @@ macOS 使用前应先运行 `./run.sh start`，并在另一个终端保持 `./ru
 ./agentctl login <username>
 ```
 
-密码不会回显。会话 Cookie 以 `0600` 权限保存在用户配置目录，不写入仓库。随后可以
-完成实例的完整操作：
+密码不会回显。会话 Cookie 以 `0600` 权限保存在用户配置目录，不写入仓库。
+日常使用只需选择工作区和会话：
 
 ```bash
-./agentctl create demo-agent
-./agentctl start demo-agent
-./agentctl status demo-agent
-./agentctl chat demo-agent
-./agentctl conversations demo-agent
-./agentctl stop demo-agent
-./agentctl destroy demo-agent
+./agentctl workspace
+./agentctl chat
 ```
 
-`chat` 使用 SSE 显示流式回答，并以不同颜色区分用户输入、Pi 输出、工具调用、系统
-状态和错误。输入 `/exit` 只退出对话，不停止实例。`destroy` 会永久删除实例数据，默认
-要求再次输入实例 ID；自动化环境必须显式添加 `--yes`。不支持 ANSI 颜色的终端可用：
+`workspace` 会显示工作区、会话数量和 `MM/DD HH:MM` 格式的最近活动时间；
+`chat` 显示当前工作区中的会话、最近时间和最多 10 个字的消息预览。两个菜单
+都支持上下方向键、Enter 和 Esc。首条消息会自动启动后台 microVM；输入
+`/exit` 只退出对话，不停止实例。选中已有工作区或会话后，子菜单可选择
+“打开 / 删除 / 取消”。删除会话只清理会话、消息、任务和事件；删除工作区
+会二次校验名称，并同时清理该工作区的会话和用户盘目录。
+
+实例命令仅保留给开发者诊断：
+
+```bash
+./agentctl status
+./agentctl stop <instance-id>
+```
+
+用户持久盘不随运行实例停止或销毁而删除。不支持 ANSI 颜色的终端可用：
 
 ```bash
 ./agentctl --no-color status
@@ -211,22 +221,14 @@ macOS 使用前应先运行 `./run.sh start`，并在另一个终端保持 `./ru
 CLI 默认连接 `http://127.0.0.1:18090`，也可使用 `--base-url` 或 `AAP_BASE_URL` 指定
 其他 Control Plane 地址。
 
-查看会话列表后，可以读取历史或继续指定会话：
+自动化调试也可显式指定工作区或会话：
 
 ```bash
-./agentctl conversations demo-agent
-./agentctl history demo-agent <conversation-id>
-./agentctl chat demo-agent --conversation <conversation-id>
+./agentctl workspace --new "AI Agent Platform"
+./agentctl workspace --select <workspace-id>
+./agentctl chat --workspace <workspace-id> --conversation <conversation-id>
 ```
-
-`history` 默认读取最近 20 条消息，最多允许每页 100 条。如果输出提示仍有更早消息，
-使用提示中的游标继续向前翻页：
-
-```bash
-./agentctl history demo-agent <conversation-id> --before <sequence>
-```
-
-继续旧会话时，CLI 会先展示最近 10 条历史消息，再进入新的流式对话。
+继续旧会话时，CLI 会先展示最近 10 条历史消息，再进入 SSE 流式对话。
 
 ## 核心验收
 
@@ -284,6 +286,18 @@ RECOVERY_READY control_plane=reconnected firecracker_crash=reaped state=reconcil
 Control Plane 提供实例、任务、事件、会话和认证 API。它只监听 Ubuntu 的
 `127.0.0.1:18090`，不应直接暴露到局域网或公网。
 
+工作区与会话主要接口：
+
+```http
+GET    /api/workspaces
+POST   /api/workspaces
+POST   /api/workspaces/{workspace_id}/select
+DELETE /api/workspaces/{workspace_id}
+GET    /api/workspaces/{workspace_id}/conversations
+POST   /api/workspaces/{workspace_id}/conversations
+DELETE /api/workspaces/{workspace_id}/conversations/{conversation_id}
+```
+
 主要实例接口：
 
 ```http
@@ -310,9 +324,9 @@ Pi RPC。它将 Pi 原生 JSONL 事件标准化为 `progress`、`text`、`tool_c
 `tool_result`、`completed` 或 `failed`，写入 SQLite，并通过 SSE 流输出。一个实例同一
 时间串行处理任务，任务执行期间设置生命周期 `busy` 标记。
 
-会话、消息、任务和事件与实例、运行状态和网络租约统一保存在 Ubuntu
-宿主的 `/var/lib/fc/control-plane.db` 中。每次发送消息时，控制面按顺序选取同一
-会话最近的消息组装上下文；显式销毁实例时才删除关联任务和会话记录。
+用户、工作区、会话、消息、任务和事件与实例、运行状态、网络租约及用户数据盘归属
+统一保存在 Ubuntu 宿主的 `/var/lib/fc/control-plane.db` 中。每次发送消息时，控制面
+按顺序选取同一会话最近的消息组装上下文。
 升级前的 `/var/lib/fc/tasks/tasks.db` 会在服务首次启动时自动导入，原文件暂时保留作为备份。
 
 ## 网络与数据边界
@@ -326,7 +340,7 @@ Network Manager 从 `172.29.0.0/16` 地址池按 `/30` 分配槽位。每个运�
 | 数据 | Ubuntu Host 位置 |
 |---|---|
 | 内核与 rootfs | `/srv/fc/artifacts/` |
-| 实例数据盘 | `/srv/fc/volumes/instances/` |
+| 用户唯一持久化数据盘 | `/srv/fc/volumes/users/<user-id>.ext4` |
 | Jailer 临时目录 | `/srv/jailer/firecracker/<instance-id>/` |
 | 控制面数据库 | `/var/lib/fc/control-plane.db` |
 | 空闲活动与长任务标记 | `/var/lib/fc/activity/`、`/var/lib/fc/instances/*.busy` |

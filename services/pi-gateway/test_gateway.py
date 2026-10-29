@@ -95,12 +95,17 @@ class PiGatewayTests(unittest.TestCase):
         server.start()
         events: list[tuple[str, dict]] = []
         output = GATEWAY.PiGateway(task_timeout=2).execute(
-            server.host, server.port, "测试", lambda kind, payload: events.append((kind, payload))
+            server.host,
+            server.port,
+            "测试",
+            lambda kind, payload: events.append((kind, payload)),
+            "workspace-0123456789abcdef",
         )
         server.wait()
 
         self.assertEqual(server.command["type"], "prompt")
         self.assertEqual(server.command["message"], "测试")
+        self.assertEqual(server.command["workspace"], "workspace-0123456789abcdef")
         self.assertEqual(output, "你好，完成")
         self.assertEqual([kind for kind, _ in events], ["progress", "text", "tool_call", "tool_result"])
 

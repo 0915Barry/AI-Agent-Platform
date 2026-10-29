@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """把“实例启动”从回归脚本抽象为可被控制面复用的运行时。
 
-InstanceRuntime 负责准备每个实例独立的数据盘和 jail、生成 Firecracker 配置、
+InstanceRuntime 负责准备每个用户唯一的数据盘和每次运行的 jail、生成 Firecracker 配置、
 启动 VMM、等待 guest 就绪，并把进程交给 lifecycle.py 管理。它刻意不处理 HTTP、
 用户身份或模型消息，避免把高权限宿主操作与产品协议混在同一层。
 
-rootfs 始终只读；用户工作区位于独立 ext4 数据盘。停止实例只清理 VMM/jail，
-显式 destroy 才删除数据盘。这一语义与 M6/M8 的安全和持久化验收保持一致。
+rootfs 始终只读；用户工作区位于用户专属 ext4 数据盘。停止或销毁运行实例只
+清理 VMM/jail，用户盘由账户数据生命周期单独管理。
 """
 
 import json
@@ -23,11 +23,12 @@ from pathlib import Path
 
 from lifecycle import process_matches, validate_instance_id
 from network_manager import NetworkFailure, NetworkManager, SQLiteLeaseStore
-from runtime_store import RuntimeStore, RuntimeStoreError
+from runtime_store import RuntimeStore, RuntimeStoreError, UserVolumeStore
 
 
 DEFAULT_STATE_ROOT = Path("/var/lib/fc")
-DEFAULT_VOLUME_ROOT = Path("/srv/fc/volumes/instances")
+DEFAULT_VOLUME_ROOT = Path("/srv/fc/volumes/users")
+LEGACY_VOLUME_ROOT = Path("/srv/fc/volumes/instances")
 ARTIFACT_ROOT = Path("/srv/fc/artifacts")
 JAILER_ROOT = Path("/srv/jailer")
 FIRECRACKER_JAIL_ROOT = JAILER_ROOT / "firecracker"
@@ -95,6 +96,7 @@ class InstanceRuntime:
             allow_host_connections=True,
         )
         self.runtime_store = RuntimeStore(self.state_database)
+        self.user_volume_store = UserVolumeStore(self.state_database)
         self.manager = Path(__file__).resolve().with_name("lifecycle.py")
         self.gateway = Path(__file__).resolve().parents[1] / "tool-gateway" / "gateway.py"
         kernel_version = load_version("SMOKE_KERNEL_VERSION")
@@ -165,6 +167,7 @@ class InstanceRuntime:
         for directory in (
             FIRECRACKER_JAIL_ROOT,
             self.volume_root,
+            LEGACY_VOLUME_ROOT,
             self.state_root / "instances",
             self.state_root / "activity",
             self.state_root / "control-plane",
@@ -175,9 +178,10 @@ class InstanceRuntime:
                 raise RuntimeFailure(f"DeepSeek credential is missing: {self.deepseek_credential}")
         return account.pw_uid, account.pw_gid, gateway_account.pw_uid, gateway_account.pw_gid
 
-    def paths(self, instance_id: str) -> dict[str, Path]:
+    def paths(self, instance_id: str, volume_owner_id: str | None = None) -> dict[str, Path]:
         """集中生成实例所有路径，确保它们只能落在固定根目录。"""
         instance_id = validate_instance_id(instance_id)
+        volume_owner_id = validate_instance_id(volume_owner_id or instance_id)
         jail_path = FIRECRACKER_JAIL_ROOT / instance_id
         expected_jail = (FIRECRACKER_JAIL_ROOT / instance_id).resolve()
         if jail_path.resolve() != expected_jail:
@@ -187,7 +191,7 @@ class InstanceRuntime:
             "jail": jail_path,
             "chroot": jail_path / "root",
             "socket": jail_path / "root" / "firecracker.socket",
-            "volume": self.volume_root / f"{instance_id}.ext4",
+            "volume": self.volume_root / f"{volume_owner_id}.ext4",
             "metadata": self.state_root / "instances" / f"{instance_id}.json",
             "activity": self.state_root / "activity" / instance_id,
             "state": state_dir,
@@ -198,6 +202,25 @@ class InstanceRuntime:
             "gateway_audit": state_dir / "sidecars" / "gateway.audit.jsonl",
             "credential": state_dir / "sidecars" / "deepseek-api-key",
         }
+
+    def adopt_legacy_volume(
+        self, instance_id: str, owner_id: str, volume_path: Path
+    ) -> None:
+        """首次升级时把当前实例旧盘迁移成用户唯一数据盘。
+
+        只迁移本次实际启动实例对应的旧盘；其他旧实例盘保持原样，避免在无法
+        判断业务归属时自动合并或删除用户文件。
+        """
+
+        if volume_path.exists():
+            return
+        legacy_path = (LEGACY_VOLUME_ROOT / f"{validate_instance_id(instance_id)}.ext4").resolve()
+        if not legacy_path.exists():
+            return
+        if legacy_path.parent != LEGACY_VOLUME_ROOT.resolve():
+            raise RuntimeFailure("invalid legacy volume path")
+        volume_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        os.replace(legacy_path, volume_path)
 
     def create_volume(self, volume_path: Path, uid: int, gid: int) -> None:
         """原子创建 1 GiB ext4 数据盘，并初始化 Pi 可写目录。
@@ -235,6 +258,46 @@ class InstanceRuntime:
                 run(["umount", str(mount_path)], check=False)
             shutil.rmtree(mount_path, ignore_errors=True)
             building_path.unlink(missing_ok=True)
+
+    def delete_workspace_data(self, owner_id: str, directory_name: str) -> bool:
+        """在 microVM 已停止时离线删除用户盘中的一个工作区目录。"""
+
+        owner_id = validate_instance_id(owner_id)
+        directory_name = validate_instance_id(directory_name)
+        binding = self.user_volume_store.get(owner_id)
+        if binding is None:
+            return False
+        volume_path = Path(binding["volume_path"]).resolve()
+        if volume_path.parent != self.volume_root.resolve():
+            raise RuntimeFailure("refusing to mount a user volume outside the configured root")
+        if not volume_path.exists():
+            return False
+
+        filesystem_check = run(["e2fsck", "-f", "-y", str(volume_path)], check=False)
+        if filesystem_check.returncode > 1:
+            raise RuntimeFailure(
+                f"persistent volume check failed: {filesystem_check.stderr.strip()}"
+            )
+
+        mount_path = Path(tempfile.mkdtemp(prefix="agent-workspace-delete.", dir="/var/tmp"))
+        mounted = False
+        deleted = False
+        try:
+            run(["mount", "-o", "loop", str(volume_path), str(mount_path)])
+            mounted = True
+            target = mount_path / "workspace" / "workspaces" / directory_name
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                target.unlink()
+                deleted = True
+            elif target.is_dir():
+                shutil.rmtree(target)
+                deleted = True
+            run(["sync"])
+        finally:
+            if mounted:
+                run(["umount", str(mount_path)], check=False)
+            shutil.rmtree(mount_path, ignore_errors=True)
+        return deleted
 
     def configure_agent_volume(self, volume_path: Path, host_ip: str) -> None:
         """离线挂载数据盘并写入只含占位凭据的 Pi provider 配置。"""
@@ -471,7 +534,7 @@ class InstanceRuntime:
                 raise RuntimeFailure(message) from error
         return subprocess.run(command, check=False, text=True)
 
-    def start(self, instance_id: str) -> dict:
+    def start(self, instance_id: str, owner_id: str | None = None) -> dict:
         """启动实例并等待 AGENT_RUNTIME_READY 后再向调用者返回。
 
         启动成功后登记 PID 并派生独立 idle watcher。即使 HTTP 控制面重启，
@@ -479,7 +542,8 @@ class InstanceRuntime:
         """
         instance_id = validate_instance_id(instance_id)
         uid, gid, gateway_uid, gateway_gid = self.ensure_host()
-        paths = self.paths(instance_id)
+        volume_owner_id = owner_id or instance_id
+        paths = self.paths(instance_id, volume_owner_id)
         existing = self.status(instance_id)
         if existing is not None and existing.get("status") == "running" and existing.get("processAlive"):
             raise RuntimeFailure(f"instance is already running: {instance_id}")
@@ -488,7 +552,13 @@ class InstanceRuntime:
         if self.deepseek_credential is not None:
             os.chown(paths["state"], 0, gateway_gid)
             os.chmod(paths["state"], 0o750)
+        if owner_id is not None:
+            self.adopt_legacy_volume(instance_id, owner_id, paths["volume"])
         self.create_volume(paths["volume"], uid, gid)
+        try:
+            self.user_volume_store.ensure(volume_owner_id, paths["volume"])
+        except RuntimeStoreError as error:
+            raise RuntimeFailure(str(error)) from error
         filesystem_check = run(["e2fsck", "-f", "-y", str(paths["volume"])], check=False)
         if filesystem_check.returncode > 1:
             raise RuntimeFailure(f"persistent volume check failed: {filesystem_check.stderr.strip()}")
@@ -716,15 +786,11 @@ class InstanceRuntime:
         return status
 
     def destroy(self, instance_id: str) -> None:
-        """显式销毁实例，包括持久化数据盘和控制面运行日志目录。"""
+        """销毁一次运行实例，但保留归属于用户的持久化数据盘。"""
         instance_id = validate_instance_id(instance_id)
         paths = self.paths(instance_id)
         if self.status(instance_id) is not None:
-            self.lifecycle("destroy", instance_id)
+            self.lifecycle("destroy", instance_id, "--preserve-volume")
         else:
-            expected_volume_parent = self.volume_root.resolve()
-            if paths["volume"].resolve().parent != expected_volume_parent:
-                raise RuntimeFailure("refusing to delete a volume outside the instance volume root")
-            paths["volume"].unlink(missing_ok=True)
             shutil.rmtree(paths["jail"], ignore_errors=True)
         shutil.rmtree(paths["state"], ignore_errors=True)

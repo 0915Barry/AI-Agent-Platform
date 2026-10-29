@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -13,6 +14,75 @@ from typing import Iterator
 
 class RuntimeStoreError(RuntimeError):
     """运行元数据不存在或无法持久化。"""
+
+
+class UserVolumeStore:
+    """记录每个用户唯一的持久化数据盘。"""
+
+    def __init__(self, database_path: Path) -> None:
+        self.database_path = database_path.resolve()
+        self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+        with self.connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_volumes (
+                    user_id TEXT PRIMARY KEY,
+                    volume_path TEXT UNIQUE NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+        os.chmod(self.database_path, 0o600)
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.database_path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+        except Exception:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+        finally:
+            connection.close()
+
+    def get(self, user_id: str) -> dict | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT user_id,volume_path,created_at,updated_at FROM user_volumes WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def ensure(self, user_id: str, volume_path: Path) -> dict:
+        """首次启动时建立归属；后续启动必须继续使用同一块盘。"""
+
+        now = int(time.time())
+        resolved_path = str(volume_path.resolve())
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT user_id,volume_path,created_at,updated_at FROM user_volumes WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["volume_path"] != resolved_path:
+                    raise RuntimeStoreError(
+                        f"user volume path mismatch for {user_id}: {existing['volume_path']}"
+                    )
+                return dict(existing)
+            connection.execute(
+                "INSERT INTO user_volumes(user_id,volume_path,created_at,updated_at) VALUES(?,?,?,?)",
+                (user_id, resolved_path, now, now),
+            )
+        stored = self.get(user_id)
+        if stored is None:
+            raise RuntimeStoreError("user volume binding disappeared after save")
+        return stored
 
 
 class RuntimeStore:

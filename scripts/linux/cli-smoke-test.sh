@@ -52,7 +52,7 @@ suffix="$(tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-10)"
 instance_id="cli-smoke-${suffix}"
 username="cli-smoke-${suffix}"
 password="Smoke-${suffix}-$(tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-12)"
-volume_path="/srv/fc/volumes/instances/${instance_id}.ext4"
+volume_path=""
 jail_path="/srv/jailer/firecracker/${instance_id}"
 server_pid=""
 instance_created=false
@@ -77,7 +77,9 @@ cleanup() {
   python3 "${repo_dir}/services/instance-manager/lifecycle.py" \
     --state-root "${state_root}" --database "${database_path}" \
     destroy "${instance_id}" >/dev/null 2>&1 || true
-  rm -f "${volume_path}"
+  if [[ -n "${volume_path}" ]]; then
+    rm -f "${volume_path}"
+  fi
   rm -rf --one-file-system "${jail_path}"
   unset password
 }
@@ -102,6 +104,17 @@ from auth import AuthStore
 password_value = sys.stdin.readline().rstrip("\r\n")
 AuthStore(Path(sys.argv[1])).create_user(sys.argv[2], password_value, claim_unowned=False)
 ' "${database_path}" "${username}"
+user_id="$(python3 - "${database_path}" "${username}" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    row = connection.execute("SELECT id FROM users WHERE username=?", (sys.argv[2],)).fetchone()
+assert row is not None
+print(row[0])
+PY
+)"
+volume_path="/srv/fc/volumes/users/${user_id}.ext4"
 
 python3 "${repo_dir}/services/control-plane/server.py" \
   --listen-host 127.0.0.1 \
@@ -187,8 +200,8 @@ grep -Fq "Pi > ${first_marker}" <<< "${history_output}"
 instance_created=false
 "${cli[@]}" logout >/dev/null
 
-if [[ -e "${volume_path}" || -e "${jail_path}" ]]; then
-  echo "FAIL: instance disk or jail remained after destroy" >&2
+if [[ ! -e "${volume_path}" || -e "${jail_path}" ]]; then
+  echo "FAIL: user disk was not preserved or instance jail remained after destroy" >&2
   exit 1
 fi
 if [[ -n "${tap_name}" ]] && ip link show "${tap_name}" >/dev/null 2>&1; then

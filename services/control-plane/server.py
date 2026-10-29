@@ -14,6 +14,7 @@ loopback 监听；开发者应通过 SSH 隧道访问。
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -42,6 +43,7 @@ from runtime import InstanceRuntime, RuntimeFailure  # noqa: E402
 from auth import AuthStore  # noqa: E402
 from gateway import PiGateway, PiGatewayError  # noqa: E402
 from task_store import TaskStore, TaskStoreError  # noqa: E402
+from workspace_store import WorkspaceStore, WorkspaceStoreError  # noqa: E402
 
 
 INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -62,7 +64,15 @@ CONVERSATION_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/conversations/"
     r"(conversation-[0-9a-f]{16})(/messages)?$"
 )
-MAX_INSTANCES_PER_USER = 5
+WORKSPACE_COLLECTION_ROUTE = "/api/workspaces"
+WORKSPACE_ROUTE_RE = re.compile(
+    r"^/api/workspaces/(workspace-[0-9a-f]{16})(?:/(select|conversations))?$"
+)
+WORKSPACE_CONVERSATION_ROUTE_RE = re.compile(
+    r"^/api/workspaces/(workspace-[0-9a-f]{16})/conversations/"
+    r"(conversation-[0-9a-f]{16})$"
+)
+MAX_INSTANCES_PER_USER = 1
 MAX_RUNNING_INSTANCES_PER_USER = 1
 SESSION_COOKIE_NAME = "aap_session"
 
@@ -180,6 +190,17 @@ class InstanceStore:
                 ).fetchall()
         return [self.row_to_dict(row) for row in rows]
 
+    def primary_for_owner(self, owner_id: str) -> dict[str, Any] | None:
+        """返回用户后台运行槽位；优先选择当前活动实例。"""
+
+        records = self.list(owner_id)
+        if not records:
+            return None
+        return next(
+            (record for record in records if record["status"] in {"starting", "running"}),
+            records[0],
+        )
+
     def assert_owner(self, instance_id: str, owner_id: str) -> None:
         """用 404 隐藏其他用户的实例是否存在，防止枚举资源 ID。"""
         with self.connect() as connection:
@@ -236,13 +257,15 @@ class ControlPlane:
         runtime: InstanceRuntime,
         tasks: TaskStore,
         pi_gateway: PiGateway | None = None,
+        workspaces: WorkspaceStore | None = None,
     ) -> None:
         self.store = store
         self.runtime = runtime
         self.tasks = tasks
         self.pi_gateway = pi_gateway
+        self.workspaces = workspaces
         self._locks_guard = threading.Lock()
-        self._locks: dict[str, threading.Lock] = {}
+        self._locks: dict[str, threading.RLock] = {}
         # 配额检查和状态写入必须形成一个临界区，否则两个不同实例的并发请求可能
         # 同时通过检查，使总实例数或运行实例数短暂突破上限。
         self._quota_guard = threading.Lock()
@@ -250,10 +273,10 @@ class ControlPlane:
         self._dispatch_guard = threading.Lock()
         self._dispatching: set[str] = set()
 
-    def lock_for(self, instance_id: str) -> threading.Lock:
+    def lock_for(self, instance_id: str) -> threading.RLock:
         """惰性创建每实例锁，锁表本身由 guard 保护。"""
         with self._locks_guard:
-            return self._locks.setdefault(instance_id, threading.Lock())
+            return self._locks.setdefault(instance_id, threading.RLock())
 
     @staticmethod
     def validate_requested_id(instance_id: str) -> str:
@@ -285,6 +308,132 @@ class ControlPlane:
                     f"每个用户最多创建 {MAX_INSTANCES_PER_USER} 个实例",
                 )
             return self.store.create(instance_id, owner_id)
+
+    def ensure_user_instance(self, owner_id: str) -> dict[str, Any]:
+        """为工作区会话取得用户后台实例，用户无需感知实例 ID。"""
+
+        # 工作区和会话可并发创建，因此“查询—创建”必须与实例配额
+        # 共用同一把锁，避免同一用户在空记录上被同时创建两次。
+        with self._quota_guard:
+            existing = self.store.primary_for_owner(owner_id)
+            if existing is not None:
+                return existing
+            digest = hashlib.sha256(owner_id.encode("utf-8")).hexdigest()[:12]
+            return self.store.create(f"agent-{digest}", owner_id)
+
+    def require_workspace_store(self) -> WorkspaceStore:
+        if self.workspaces is None:
+            raise ApiError(503, "workspaces_unavailable", "工作区功能尚未启用")
+        return self.workspaces
+
+    def list_workspaces(self, owner_id: str) -> list[dict[str, Any]]:
+        store = self.require_workspace_store()
+        default = store.ensure_default(owner_id)
+        for instance in self.store.list(owner_id):
+            self.tasks.assign_unscoped_conversations(instance["id"], default["id"])
+        return store.list(owner_id)
+
+    def create_workspace(self, owner_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        name = payload.get("name")
+        if not isinstance(name, str):
+            raise ApiError(400, "invalid_workspace_name", "工作区名称不能为空")
+        try:
+            return self.require_workspace_store().create(owner_id, name)
+        except WorkspaceStoreError as error:
+            raise ApiError(409, "workspace_invalid", str(error)) from error
+
+    def select_workspace(self, owner_id: str, workspace_id: str) -> dict[str, Any]:
+        try:
+            return self.require_workspace_store().select(owner_id, workspace_id)
+        except WorkspaceStoreError as error:
+            raise ApiError(404, "workspace_not_found", str(error)) from error
+
+    def list_workspace_conversations(
+        self, owner_id: str, workspace_id: str
+    ) -> list[dict[str, Any]]:
+        try:
+            self.require_workspace_store().get(owner_id, workspace_id)
+        except WorkspaceStoreError as error:
+            raise ApiError(404, "workspace_not_found", str(error)) from error
+        return self.tasks.list_workspace_conversations(workspace_id)
+
+    def create_workspace_conversation(
+        self, owner_id: str, workspace_id: str
+    ) -> dict[str, Any]:
+        try:
+            self.require_workspace_store().get(owner_id, workspace_id)
+        except WorkspaceStoreError as error:
+            raise ApiError(404, "workspace_not_found", str(error)) from error
+        instance = self.ensure_user_instance(owner_id)
+        return self.tasks.create_conversation(
+            instance["id"], "新会话", workspace_id=workspace_id
+        )
+
+    def delete_workspace_conversation(
+        self, owner_id: str, workspace_id: str, conversation_id: str
+    ) -> dict[str, Any]:
+        """删除会话数据，不触及该工作区中其他文件。"""
+
+        try:
+            self.require_workspace_store().get(owner_id, workspace_id)
+            deleted = self.tasks.delete_conversation(workspace_id, conversation_id)
+        except WorkspaceStoreError as error:
+            raise ApiError(404, "workspace_not_found", str(error)) from error
+        except TaskStoreError as error:
+            status = 409 if "正在" in str(error) else 404
+            code = "conversation_busy" if status == 409 else "conversation_not_found"
+            raise ApiError(status, code, str(error)) from error
+        return {"id": deleted["id"], "status": "deleted"}
+
+    def delete_workspace(self, owner_id: str, workspace_id: str) -> dict[str, Any]:
+        """停止空闲计算资源，再删除工作区文件与数据库关系。"""
+
+        store = self.require_workspace_store()
+        try:
+            workspace = store.get(owner_id, workspace_id)
+        except WorkspaceStoreError as error:
+            raise ApiError(404, "workspace_not_found", str(error)) from error
+        instance = self.store.primary_for_owner(owner_id)
+        if instance is None:
+            return self._delete_workspace_resources(owner_id, workspace)
+
+        # 删目录时数据盘不能同时被新 microVM 挂载。与 start/stop
+        # 共用实例锁，将“检查—停机—离线挂载—删除”串行化。
+        with self.lock_for(instance["id"]):
+            instance = self.reconcile(self.store.get(instance["id"]))
+            if instance["status"] in {"starting", "stopping"}:
+                raise ApiError(409, "instance_busy", f"instance is {instance['status']}")
+            if self.tasks.workspace_has_active_tasks(workspace_id):
+                raise ApiError(409, "workspace_busy", "工作区仍有正在排队或执行的任务")
+            if self.tasks.instance_has_active_tasks(instance["id"]):
+                raise ApiError(409, "instance_busy", "用户实例正在执行其他工作区的任务")
+            if instance["status"] == "running":
+                self.stop(instance["id"])
+            return self._delete_workspace_resources(owner_id, workspace)
+
+    def _delete_workspace_resources(
+        self, owner_id: str, workspace: dict[str, Any]
+    ) -> dict[str, Any]:
+        """调用方持有实例锁后，执行磁盘和数据库的实际清理。"""
+
+        workspace_id = workspace["id"]
+        store = self.require_workspace_store()
+        try:
+            if hasattr(self.runtime, "delete_workspace_data"):
+                self.runtime.delete_workspace_data(owner_id, workspace["directoryName"])
+            conversation_count = self.tasks.delete_workspace_conversations(workspace_id)
+            store.delete(owner_id, workspace_id)
+            current = store.ensure_default(owner_id)
+        except (RuntimeFailure, OSError, subprocess.SubprocessError) as error:
+            raise ApiError(500, "workspace_cleanup_failed", str(error)) from error
+        except TaskStoreError as error:
+            raise ApiError(409, "workspace_busy", str(error)) from error
+        return {
+            "id": workspace_id,
+            "status": "deleted",
+            "deletedConversations": conversation_count,
+            "currentWorkspace": current,
+        }
 
     def reconcile(self, record: dict[str, Any]) -> dict[str, Any]:
         """用真实 VMM 状态修正可能过期的 SQLite 状态。
@@ -337,7 +486,7 @@ class ControlPlane:
                     # 在释放配额锁之前写入 starting；下一请求会把它计入配额。
                     self.store.update(instance_id, "starting")
             try:
-                runtime_status = self.runtime.start(instance_id)
+                runtime_status = self.runtime.start(instance_id, owner_id)
             except (RuntimeFailure, OSError, subprocess.SubprocessError) as error:
                 self.store.update(instance_id, "failed", str(error)[-4000:])
                 raise ApiError(500, "instance_start_failed", str(error)) from error
@@ -484,7 +633,11 @@ class ControlPlane:
             raise ApiError(404, "conversation_not_found", str(error)) from error
 
     def create_conversation_message(
-        self, instance_id: str, conversation_id: str, payload: dict[str, Any]
+        self,
+        instance_id: str,
+        conversation_id: str,
+        payload: dict[str, Any],
+        owner_id: str | None = None,
     ) -> dict[str, Any]:
         """保存用户消息，以受限历史构造任务，并刷新实例活动时间。"""
 
@@ -496,6 +649,8 @@ class ControlPlane:
         if len(content.encode("utf-8")) > 16384:
             raise ApiError(413, "message_too_large", "message content exceeds 16 KiB")
         record = self.get(instance_id)
+        if record["status"] != "running" and owner_id is not None:
+            record = self.start(instance_id, owner_id)
         if record["status"] != "running":
             raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
         try:
@@ -584,6 +739,7 @@ class ControlPlane:
                 rpc_port,
                 task["prompt"],
                 save_event,
+                task.get("workspaceId"),
             )
             self.tasks.append_event(instance_id, task_id, "completed", {"output": output})
             self.runtime.heartbeat(instance_id)
@@ -752,6 +908,24 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 self.send_payload(200, {"authenticated": user is not None, "user": user})
                 return
             user = self.require_user()
+            if request_path == WORKSPACE_COLLECTION_ROUTE:
+                if user is None:
+                    raise ApiError(404, "route_not_found", "route not found")
+                self.send_payload(200, {"workspaces": self.control.list_workspaces(user["id"])})
+                return
+            workspace_match = WORKSPACE_ROUTE_RE.fullmatch(request_path)
+            if workspace_match and workspace_match.group(2) == "conversations":
+                if user is None:
+                    raise ApiError(404, "route_not_found", "route not found")
+                self.send_payload(
+                    200,
+                    {
+                        "conversations": self.control.list_workspace_conversations(
+                            user["id"], workspace_match.group(1)
+                        )
+                    },
+                )
+                return
             if request_path == "/api/instances":
                 self.send_payload(
                     200,
@@ -867,6 +1041,26 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 )
                 return
             user = self.require_user()
+            if request_path == WORKSPACE_COLLECTION_ROUTE:
+                if user is None:
+                    raise ApiError(404, "route_not_found", "route not found")
+                self.send_payload(201, self.control.create_workspace(user["id"], self.read_json()))
+                return
+            workspace_match = WORKSPACE_ROUTE_RE.fullmatch(request_path)
+            if workspace_match:
+                if user is None:
+                    raise ApiError(404, "route_not_found", "route not found")
+                workspace_id, action = workspace_match.groups()
+                if action == "select":
+                    self.send_payload(200, self.control.select_workspace(user["id"], workspace_id))
+                elif action == "conversations":
+                    self.send_payload(
+                        201,
+                        self.control.create_workspace_conversation(user["id"], workspace_id),
+                    )
+                else:
+                    raise ApiError(404, "route_not_found", "route not found")
+                return
             if request_path == "/api/instances":
                 self.send_payload(
                     201,
@@ -890,7 +1084,10 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 self.send_payload(
                     202,
                     self.control.create_conversation_message(
-                        instance_id, conversation_id, self.read_json()
+                        instance_id,
+                        conversation_id,
+                        self.read_json(),
+                        user["id"] if user is not None else None,
                     ),
                 )
                 return
@@ -918,10 +1115,32 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self.send_error_payload(error)
 
     def do_DELETE(self) -> None:
-        """处理显式实例销毁；这是删除持久化数据的唯一 HTTP 操作。"""
+        """处理工作区、会话和旧式实例记录删除。"""
         try:
             user = self.require_user()
-            match = INSTANCE_ROUTE_RE.fullmatch(urlsplit(self.path).path)
+            request_path = urlsplit(self.path).path
+            conversation_match = WORKSPACE_CONVERSATION_ROUTE_RE.fullmatch(request_path)
+            if conversation_match:
+                if user is None:
+                    raise ApiError(404, "route_not_found", "route not found")
+                workspace_id, conversation_id = conversation_match.groups()
+                self.send_payload(
+                    200,
+                    self.control.delete_workspace_conversation(
+                        user["id"], workspace_id, conversation_id
+                    ),
+                )
+                return
+            workspace_match = WORKSPACE_ROUTE_RE.fullmatch(request_path)
+            if workspace_match and workspace_match.group(2) is None:
+                if user is None:
+                    raise ApiError(404, "route_not_found", "route not found")
+                self.send_payload(
+                    200,
+                    self.control.delete_workspace(user["id"], workspace_match.group(1)),
+                )
+                return
+            match = INSTANCE_ROUTE_RE.fullmatch(request_path)
             if not match or match.group(2) is not None:
                 raise ApiError(404, "route_not_found", "route not found")
             self.authorize_instance(match.group(1), user)
@@ -967,13 +1186,14 @@ def main() -> None:
     if auth_store is not None and not auth_store.has_users():
         raise SystemExit("no M16 user exists; run configure-user before starting the control plane")
     tasks = TaskStore(args.database, legacy_database_path=args.task_database)
+    workspaces = WorkspaceStore(args.database)
     runtime = InstanceRuntime(
         state_root=args.state_root,
         idle_timeout_seconds=args.idle_timeout,
         deepseek_credential=args.deepseek_credential,
         state_database=args.database,
     )
-    control = ControlPlane(store, runtime, tasks, PiGateway())
+    control = ControlPlane(store, runtime, tasks, PiGateway(), workspaces)
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), ControlPlaneHandler)
     server.control = control  # type: ignore[attr-defined]
     server.auth_store = auth_store  # type: ignore[attr-defined]

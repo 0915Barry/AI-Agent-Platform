@@ -88,6 +88,7 @@ class PiGateway:
         port: int,
         prompt: str,
         on_event: TaskEventHandler,
+        workspace_id: str | None = None,
     ) -> str:
         """执行一个 prompt，返回最终文本，并同步上报流式与工具事件。
 
@@ -110,10 +111,10 @@ class PiGateway:
             reader = connection.makefile("rb")
             writer = connection.makefile("wb")
             try:
-                self._send(
-                    writer,
-                    {"id": command_id, "type": "prompt", "message": prompt},
-                )
+                command = {"id": command_id, "type": "prompt", "message": prompt}
+                if workspace_id is not None:
+                    command["workspace"] = workspace_id
+                self._send(writer, command)
                 while True:
                     try:
                         line = reader.readline(self.MAX_RECORD_BYTES + 1)

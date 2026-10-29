@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from runtime_store import RuntimeStore
+from runtime_store import RuntimeStore, RuntimeStoreError, UserVolumeStore
 
 
 def metadata(instance_id: str = "agent-one") -> dict:
@@ -70,6 +70,19 @@ class RuntimeStoreTests(unittest.TestCase):
         self.assertIsNotNone(imported)
         self.assertFalse(legacy.exists())
         self.assertEqual(self.store.get("agent-old")["status"], "running")
+
+    def test_user_has_one_stable_volume_binding(self) -> None:
+        volumes = UserVolumeStore(self.database)
+        first_path = Path(self.temporary.name) / "users" / "user-one.ext4"
+        stored = volumes.ensure("user-one", first_path)
+        self.assertEqual(stored["volume_path"], str(first_path.resolve()))
+        self.assertEqual(volumes.ensure("user-one", first_path)["volume_path"], str(first_path.resolve()))
+
+        with self.assertRaises(RuntimeStoreError):
+            volumes.ensure(
+                "user-one",
+                Path(self.temporary.name) / "users" / "different.ext4",
+            )
 
 
 if __name__ == "__main__":

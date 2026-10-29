@@ -11,8 +11,10 @@ import argparse
 import getpass
 import json
 import os
+import select
 import stat
 import sys
+from contextlib import contextmanager
 from datetime import datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -270,9 +272,98 @@ def display_time(value: Any) -> str:
     return datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def display_menu_time(value: Any) -> str:
+    """菜单统一使用固定的月/日和24小时制，不使用“今天/昨天”。"""
+
+    if not isinstance(value, int):
+        return "--/-- --:--"
+    return datetime.fromtimestamp(value).astimezone().strftime("%m/%d %H:%M")
+
+
 def one_line(value: Any, limit: int = 72) -> str:
     text = " ".join(str(value or "").split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def menu_preview(value: Any) -> str:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return "暂无消息"
+    return text if len(text) <= 10 else text[:10] + "…"
+
+
+@contextmanager
+def raw_terminal() -> Iterator[None]:
+    """临时启用逐键读取；退出时始终恢复原终端设置。"""
+
+    if os.name == "nt":
+        yield
+        return
+    import termios
+    import tty
+
+    descriptor = sys.stdin.fileno()
+    previous = termios.tcgetattr(descriptor)
+    try:
+        tty.setraw(descriptor)
+        yield
+    finally:
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
+
+
+def read_menu_key() -> str:
+    if os.name == "nt":
+        import msvcrt
+
+        key = msvcrt.getwch()
+        if key in {"\x00", "\xe0"}:
+            return {"H": "up", "P": "down"}.get(msvcrt.getwch(), "other")
+        return {"\r": "enter", "\x1b": "escape"}.get(key, "other")
+
+    key = os.read(sys.stdin.fileno(), 1)
+    if key in {b"\r", b"\n"}:
+        return "enter"
+    if key != b"\x1b":
+        return "other"
+    if not select.select([sys.stdin], [], [], 0.05)[0]:
+        return "escape"
+    sequence = os.read(sys.stdin.fileno(), 2)
+    return {b"[A": "up", b"[B": "down"}.get(sequence, "other")
+
+
+def choose_option(title: str, labels: list[str], initial: int = 0) -> int | None:
+    """显示轻量方向键菜单，返回选中项序号；Esc返回None。"""
+
+    if not labels:
+        raise CliError("没有可选择的项目")
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise CliError("交互选择需要终端；自动化调用请显式提供ID")
+    selected = min(max(initial, 0), len(labels) - 1)
+    print(title)
+    print("\n" * len(labels), end="", flush=True)
+    # 选择期间隐藏终端的白色输入光标，避免它停在菜单中间。
+    # 不论 Enter、Esc 还是异常退出，finally 都会恢复光标。
+    print("\033[?25l", end="", flush=True)
+    try:
+        with raw_terminal():
+            while True:
+                print(f"\033[{len(labels)}A", end="")
+                for index, label in enumerate(labels):
+                    marker = "❯" if index == selected else " "
+                    print(f"\033[2K\r{marker} {label}")
+                key = read_menu_key()
+                if key == "up":
+                    selected = (selected - 1) % len(labels)
+                elif key == "down":
+                    selected = (selected + 1) % len(labels)
+                elif key == "enter":
+                    return selected
+                elif key == "escape":
+                    return None
+    finally:
+        # raw mode 中换行只会向下移动，不一定回到第 1 列。显式输出
+        # \r，确保后续的 [成功]、[系统] 从左侧开始。
+        print("\033[?25h\r", end="", flush=True)
 
 
 def print_message(message: dict[str, Any], console: Console) -> None:
@@ -346,6 +437,75 @@ def command_conversations(
         print(console.paint(f"  {preview}", "blue"), file=console.output)
 
 
+def command_workspace(args: argparse.Namespace, store: SessionStore, console: Console) -> None:
+    """创建或选择当前用户的工作区。"""
+
+    client = authenticated_client(args, store)
+    if args.new_name is not None:
+        workspace, _ = client.json("POST", "/api/workspaces", {"name": args.new_name})
+        console.success(f"当前工作区：{workspace['name']}")
+        return
+    if args.select_id is not None:
+        workspace, _ = client.json(
+            "POST", f"/api/workspaces/{args.select_id}/select", {}
+        )
+        console.success(f"当前工作区：{workspace['name']}")
+        return
+
+    payload, _ = client.json("GET", "/api/workspaces")
+    workspaces = payload.get("workspaces", [])
+    labels = [console.paint("＋ New workspace", "green")]
+    initial = 0
+    for index, workspace in enumerate(workspaces, start=1):
+        count = int(workspace.get("conversationCount") or 0)
+        current = console.paint(" · 当前", "green") if workspace.get("current") else ""
+        labels.append(
+            f"{console.paint(workspace['name'], 'cyan')}  "
+            f"{console.paint(f'{count}个会话', 'yellow')} · "
+            f"{console.paint(display_menu_time(workspace.get('updatedAt')), 'blue')}"
+            f"{current}"
+        )
+        if workspace.get("current"):
+            initial = index
+    selected = choose_option("请选择工作区：", labels, initial)
+    if selected is None:
+        return
+    if selected == 0:
+        name = input("工作区名称：").strip()
+        if not name:
+            raise CliError("工作区名称不能为空")
+        workspace, _ = client.json("POST", "/api/workspaces", {"name": name})
+    else:
+        selected_workspace = workspaces[selected - 1]
+        action = choose_option(
+            f"工作区：{selected_workspace['name']}",
+            [
+                console.paint("打开", "green"),
+                console.paint("删除", "red"),
+                "取消",
+            ],
+        )
+        if action is None or action == 2:
+            return
+        workspace_id = selected_workspace["id"]
+        if action == 1:
+            confirmation = input(
+                f"删除工作区会同时删除其会话和工作文件。\n"
+                f"请输入工作区名称 {selected_workspace['name']} 确认："
+            ).strip()
+            if confirmation != selected_workspace["name"]:
+                raise CliError("工作区名称不匹配，已取消删除")
+            result, _ = client.json("DELETE", f"/api/workspaces/{workspace_id}")
+            current = result.get("currentWorkspace") or {}
+            console.success(
+                f"工作区已删除：{selected_workspace['name']}；"
+                f"当前工作区：{current.get('name') or '-'}"
+            )
+            return
+        workspace, _ = client.json("POST", f"/api/workspaces/{workspace_id}/select", {})
+    console.success(f"当前工作区：{workspace['name']}")
+
+
 def fetch_history(
     client: ApiClient,
     instance_id: str,
@@ -394,7 +554,7 @@ def command_destroy(args: argparse.Namespace, store: SessionStore, console: Cons
     if not args.yes:
         if not sys.stdin.isatty():
             raise CliError("非交互环境销毁实例时必须添加 --yes")
-        answer = input(f"此操作会永久删除实例数据。请输入实例 ID {args.instance_id} 确认：")
+        answer = input(f"此操作会删除实例记录和关联会话。请输入实例 ID {args.instance_id} 确认：")
         if answer.strip() != args.instance_id:
             raise CliError("实例 ID 不匹配，已取消销毁")
     client = authenticated_client(args, store)
@@ -449,18 +609,89 @@ def render_task_events(
 def command_chat(args: argparse.Namespace, store: SessionStore, console: Console) -> None:
     client = authenticated_client(args, store)
     conversation_id = args.conversation
+    instance_id = args.instance_id
+    created_new = False
+
+    if instance_id is None:
+        workspace_payload, _ = client.json("GET", "/api/workspaces")
+        workspaces = workspace_payload.get("workspaces", [])
+        if args.workspace is not None:
+            workspace = next(
+                (item for item in workspaces if item.get("id") == args.workspace), None
+            )
+            if workspace is None:
+                raise CliError(f"工作区不存在：{args.workspace}")
+            client.json("POST", f"/api/workspaces/{args.workspace}/select", {})
+        else:
+            workspace = next((item for item in workspaces if item.get("current")), None)
+        if workspace is None:
+            raise CliError("当前没有工作区，请先运行 ./agentctl workspace")
+
+        payload, _ = client.json(
+            "GET", f"/api/workspaces/{workspace['id']}/conversations"
+        )
+        conversations = payload.get("conversations", [])
+        if conversation_id is None:
+            labels = [console.paint("＋ New conversation", "green")]
+            labels.extend(
+                f"{console.paint(item.get('title') or '新会话', 'cyan')}  "
+                f"{console.paint(display_menu_time(item.get('updatedAt')), 'blue')} · "
+                f"{console.paint(menu_preview(item.get('preview')), 'yellow')}"
+                for item in conversations[:20]
+            )
+            selected = choose_option(f"{workspace['name']} / 请选择会话：", labels)
+            if selected is None:
+                return
+            if selected == 0:
+                conversation, _ = client.json(
+                    "POST", f"/api/workspaces/{workspace['id']}/conversations", {}
+                )
+                created_new = True
+            else:
+                conversation = conversations[selected - 1]
+                action = choose_option(
+                    f"会话：{conversation.get('title') or '新会话'}",
+                    [
+                        console.paint("打开", "green"),
+                        console.paint("删除", "red"),
+                        "取消",
+                    ],
+                )
+                if action is None or action == 2:
+                    return
+                if action == 1:
+                    confirmation = input("确认删除该会话？请输入 y：").strip().lower()
+                    if confirmation != "y":
+                        raise CliError("已取消删除")
+                    client.json(
+                        "DELETE",
+                        f"/api/workspaces/{workspace['id']}/conversations/{conversation['id']}",
+                    )
+                    console.success(f"会话已删除：{conversation.get('title') or conversation['id']}")
+                    return
+                conversation_id = conversation["id"]
+        else:
+            conversation = next(
+                (item for item in conversations if item.get("id") == conversation_id), None
+            )
+            if conversation is None:
+                raise CliError(f"会话不属于当前工作区：{conversation_id}")
+        conversation_id = conversation["id"]
+        instance_id = conversation["instanceId"]
+
     if conversation_id is None:
         conversation, _ = client.json(
-            "POST", f"/api/instances/{args.instance_id}/conversations", {"title": "新会话"}
+            "POST", f"/api/instances/{instance_id}/conversations", {"title": "新会话"}
         )
         conversation_id = conversation["id"]
-    else:
+        created_new = True
+    if not created_new:
         conversation, _ = client.json(
-            "GET", f"/api/instances/{args.instance_id}/conversations/{conversation_id}"
+            "GET", f"/api/instances/{instance_id}/conversations/{conversation_id}"
         )
         console.system(f"继续会话：{conversation.get('title') or conversation_id}")
         render_history(
-            fetch_history(client, args.instance_id, conversation_id, args.history_limit),
+            fetch_history(client, instance_id, conversation_id, args.history_limit),
             console,
         )
     console.system(f"会话={conversation_id}；输入 /exit 退出，不会停止实例")
@@ -477,10 +708,10 @@ def command_chat(args: argparse.Namespace, store: SessionStore, console: Console
             continue
         task, _ = client.json(
             "POST",
-            f"/api/instances/{args.instance_id}/conversations/{conversation_id}/messages",
+            f"/api/instances/{instance_id}/conversations/{conversation_id}/messages",
             {"content": message},
         )
-        render_task_events(client, args.instance_id, task["id"], console)
+        render_task_events(client, instance_id, task["id"], console)
 
 
 def message_limit(value: str) -> int:
@@ -498,25 +729,16 @@ def build_parser() -> argparse.ArgumentParser:
         prog="agentctl",
         description=(
             "AI Agent Platform 终端客户端。\n"
-            "INSTANCE_ID 是 create 时指定或系统生成的实例 ID；\n"
-            "CONVERSATION_ID 可通过 conversations 命令查询。"
+            "日常使用只需选择工作区和会话；实例命令保留用于诊断。"
         ),
         epilog=(
             "常用流程：\n"
             "  ./agentctl login <用户名>\n"
-            "  ./agentctl create <实例ID>\n"
-            "  ./agentctl start <实例ID>\n"
-            "  ./agentctl status <实例ID>\n"
-            "  ./agentctl chat <实例ID>\n"
-            "  ./agentctl conversations <实例ID>\n"
-            "  ./agentctl history <实例ID> <会话ID>\n"
-            "  ./agentctl chat <实例ID> --conversation <会话ID>\n"
-            "  ./agentctl stop <实例ID>\n"
-            "  ./agentctl destroy <实例ID>\n\n"
-            "示例：\n"
-            "  ./agentctl create cli-demo\n"
-            "  ./agentctl start cli-demo\n"
-            "  ./agentctl chat cli-demo"
+            "  ./agentctl workspace\n"
+            "  ./agentctl chat\n\n"
+            "诊断实例：\n"
+            "  ./agentctl status\n"
+            "  ./agentctl stop <实例ID>"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -548,6 +770,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="退出平台：logout",
         description="撤销服务端会话并删除本机保存的 Cookie。",
     )
+
+    workspace = commands.add_parser(
+        "workspace",
+        help="创建或选择工作区：workspace",
+        description="使用方向键创建或切换当前工作区。",
+        epilog=(
+            "示例：./agentctl workspace\n"
+            "      ./agentctl workspace --new 'AI Agent Platform'\n"
+            "      ./agentctl workspace --select workspace-1234"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    workspace_actions = workspace.add_mutually_exclusive_group()
+    workspace_actions.add_argument("--new", dest="new_name", metavar="NAME")
+    workspace_actions.add_argument("--select", dest="select_id", metavar="WORKSPACE_ID")
 
     create = commands.add_parser(
         "create",
@@ -600,16 +837,23 @@ def build_parser() -> argparse.ArgumentParser:
     history.add_argument("--before", type=int, metavar="SEQUENCE", help="读取该消息序号之前的一页")
     chat = commands.add_parser(
         "chat",
-        help="进入对话：chat INSTANCE_ID [--conversation ID]",
-        description="与运行中的实例进行流式对话；未指定会话时创建新会话。",
+        help="选择并进入会话：chat [LEGACY_INSTANCE_ID]",
+        description="从当前工作区选择会话；后台会自动准备用户的 microVM。",
         epilog=(
-            "示例：./agentctl chat cli-demo\n"
-            "      ./agentctl chat cli-demo --conversation conversation-1234\n"
+            "示例：./agentctl chat\n"
+            "      ./agentctl chat --conversation conversation-1234\n"
+            "兼容旧用法：./agentctl chat cli-demo\n"
             "对话中输入 /exit 或 /quit 返回终端，不会停止实例。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    chat.add_argument("instance_id", metavar="INSTANCE_ID", help="必须处于 running 状态的实例 ID")
+    chat.add_argument(
+        "instance_id",
+        nargs="?",
+        metavar="LEGACY_INSTANCE_ID",
+        help="兼容旧接口的实例 ID；通常无需提供",
+    )
+    chat.add_argument("--workspace", metavar="WORKSPACE_ID", help="直接选择工作区")
     chat.add_argument("--conversation", metavar="CONVERSATION_ID", help="继续已有会话 ID")
     chat.add_argument(
         "--history-limit",
@@ -627,7 +871,7 @@ def build_parser() -> argparse.ArgumentParser:
     destroy = commands.add_parser(
         "destroy",
         help="销毁实例：destroy INSTANCE_ID",
-        description="永久删除实例、数据盘以及关联任务和会话；默认要求二次确认。",
+        description="删除旧式实例记录及其关联任务和会话；用户持久盘保留。",
         epilog="示例：./agentctl destroy cli-demo",
     )
     destroy.add_argument("instance_id", metavar="INSTANCE_ID", help="要永久销毁的实例 ID")
@@ -638,6 +882,7 @@ def build_parser() -> argparse.ArgumentParser:
 COMMANDS = {
     "login": command_login,
     "logout": command_logout,
+    "workspace": command_workspace,
     "create": command_create,
     "start": command_start,
     "status": command_status,

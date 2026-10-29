@@ -88,12 +88,19 @@ class TaskStore:
                 CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY,
                     instance_id TEXT NOT NULL,
+                    workspace_id TEXT,
                     title TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 )
                 """
             )
+            conversation_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(conversations)").fetchall()
+            }
+            if "workspace_id" not in conversation_columns:
+                connection.execute("ALTER TABLE conversations ADD COLUMN workspace_id TEXT")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS messages (
@@ -118,6 +125,10 @@ class TaskStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS conversations_instance_updated "
                 "ON conversations(instance_id,updated_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS conversations_workspace_updated "
+                "ON conversations(workspace_id,updated_at DESC)"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS messages_conversation_created "
@@ -189,6 +200,7 @@ class TaskStore:
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
             "conversationId": row["conversation_id"],
+            "workspaceId": row["workspace_id"] if "workspace_id" in row.keys() else None,
         }
 
     @staticmethod
@@ -198,6 +210,7 @@ class TaskStore:
         return {
             "id": row["id"],
             "instanceId": row["instance_id"],
+            "workspaceId": row["workspace_id"],
             "title": row["title"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
@@ -217,15 +230,21 @@ class TaskStore:
             "createdAt": row["created_at"],
         }
 
-    def create_conversation(self, instance_id: str, title: str = "新会话") -> dict[str, Any]:
+    def create_conversation(
+        self,
+        instance_id: str,
+        title: str = "新会话",
+        workspace_id: str | None = None,
+    ) -> dict[str, Any]:
         """为实例创建空会话；首条用户消息会自动替换默认标题。"""
 
         conversation_id = f"conversation-{uuid.uuid4().hex[:16]}"
         now = int(time.time())
         with self.connect() as connection:
             connection.execute(
-                "INSERT INTO conversations(id,instance_id,title,created_at,updated_at) VALUES(?,?,?,?,?)",
-                (conversation_id, instance_id, title, now, now),
+                "INSERT INTO conversations"
+                "(id,instance_id,workspace_id,title,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (conversation_id, instance_id, workspace_id, title, now, now),
             )
         return self.get_conversation(instance_id, conversation_id)
 
@@ -257,6 +276,97 @@ class TaskStore:
             {**self.conversation_from_row(row), "preview": row["preview"] or "尚无消息"}
             for row in rows
         ]
+
+    def list_workspace_conversations(self, workspace_id: str) -> list[dict[str, Any]]:
+        """按最近活动优先列出一个工作区中的会话。"""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.*,
+                    (SELECT content FROM messages m WHERE m.conversation_id=c.id
+                     ORDER BY m.sequence DESC LIMIT 1) AS preview
+                FROM conversations c WHERE c.workspace_id=?
+                ORDER BY c.updated_at DESC,c.id DESC
+                """,
+                (workspace_id,),
+            ).fetchall()
+        return [
+            {**self.conversation_from_row(row), "preview": row["preview"] or "暂无消息"}
+            for row in rows
+        ]
+
+    def assign_unscoped_conversations(self, instance_id: str, workspace_id: str) -> int:
+        """升级旧数据时，把实例下尚未分组的会话放入用户默认工作区。"""
+
+        with self.connect() as connection:
+            changed = connection.execute(
+                "UPDATE conversations SET workspace_id=? "
+                "WHERE instance_id=? AND workspace_id IS NULL",
+                (workspace_id, instance_id),
+            )
+        return changed.rowcount
+
+    def delete_conversation(self, workspace_id: str, conversation_id: str) -> dict[str, Any]:
+        """删除会话及其消息、任务和事件，但不处理工作区文件。"""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM conversations WHERE id=? AND workspace_id=?",
+                (conversation_id, workspace_id),
+            ).fetchone()
+            if row is None:
+                raise TaskStoreError(f"conversation not found: {conversation_id}")
+            active = connection.execute(
+                "SELECT 1 FROM tasks WHERE conversation_id=? AND status IN ('queued','running')",
+                (conversation_id,),
+            ).fetchone()
+            if active is not None:
+                raise TaskStoreError("会话仍有正在排队或执行的任务")
+            connection.execute("DELETE FROM tasks WHERE conversation_id=?", (conversation_id,))
+            connection.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
+        return self.conversation_from_row(row)
+
+    def workspace_has_active_tasks(self, workspace_id: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM tasks t JOIN conversations c ON c.id=t.conversation_id "
+                "WHERE c.workspace_id=? AND t.status IN ('queued','running') LIMIT 1",
+                (workspace_id,),
+            ).fetchone()
+        return row is not None
+
+    def instance_has_active_tasks(self, instance_id: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM tasks WHERE instance_id=? AND status IN ('queued','running') LIMIT 1",
+                (instance_id,),
+            ).fetchone()
+        return row is not None
+
+    def delete_workspace_conversations(self, workspace_id: str) -> int:
+        """删除工作区下的会话数据；调用方必须先校验用户归属。"""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                "SELECT 1 FROM tasks t JOIN conversations c ON c.id=t.conversation_id "
+                "WHERE c.workspace_id=? AND t.status IN ('queued','running') LIMIT 1",
+                (workspace_id,),
+            ).fetchone()
+            if active is not None:
+                raise TaskStoreError("工作区仍有正在排队或执行的任务")
+            count = connection.execute(
+                "SELECT COUNT(*) FROM conversations WHERE workspace_id=?", (workspace_id,)
+            ).fetchone()[0]
+            connection.execute(
+                "DELETE FROM tasks WHERE conversation_id IN "
+                "(SELECT id FROM conversations WHERE workspace_id=?)",
+                (workspace_id,),
+            )
+            connection.execute("DELETE FROM conversations WHERE workspace_id=?", (workspace_id,))
+        return int(count)
 
     def list_messages(self, instance_id: str, conversation_id: str) -> list[dict[str, Any]]:
         self.get_conversation(instance_id, conversation_id)
@@ -383,7 +493,9 @@ class TaskStore:
     def get(self, instance_id: str, task_id: str) -> dict[str, Any]:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM tasks WHERE id=? AND instance_id=?",
+                "SELECT t.*,c.workspace_id AS workspace_id FROM tasks t "
+                "LEFT JOIN conversations c ON c.id=t.conversation_id "
+                "WHERE t.id=? AND t.instance_id=?",
                 (task_id, instance_id),
             ).fetchone()
         if row is None:
@@ -397,7 +509,10 @@ class TaskStore:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT * FROM tasks WHERE instance_id=? AND status='queued' ORDER BY created_at,id LIMIT 1",
+                "SELECT t.*,c.workspace_id AS workspace_id FROM tasks t "
+                "LEFT JOIN conversations c ON c.id=t.conversation_id "
+                "WHERE t.instance_id=? AND t.status='queued' "
+                "ORDER BY t.created_at,t.id LIMIT 1",
                 (instance_id,),
             ).fetchone()
             if row is None:

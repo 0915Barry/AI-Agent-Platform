@@ -391,8 +391,10 @@ smoke_test_recovery() {
 
 control_plane_service() {
   action="$1"
-  sync_repo
+  require_vm_host
   if [[ "${action}" == "start" ]]; then
+    # 启动时同步最新代码；查询和停止只操作已部署的远程服务，避免无意义的 rsync。
+    sync_repo
     remote_command="sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/control-plane-service.sh' start"
   else
     remote_command="sudo '${REMOTE_DIR}/scripts/linux/control-plane-service.sh' '${action}'"

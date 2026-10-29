@@ -20,7 +20,7 @@ state_root="/var/lib/fc/control-plane-smoke"
 database_path="${state_root}/control-plane.db"
 log_path="${state_root}/server.log"
 pid_path="${state_root}/server.pid"
-volume_path="/srv/fc/volumes/instances/${instance_id}.ext4"
+volume_path="/srv/fc/volumes/users/${instance_id}.ext4"
 jail_path="/srv/jailer/firecracker/${instance_id}"
 server_pid=""
 instance_created=false
@@ -58,7 +58,7 @@ cleanup() {
   python3 "${repo_dir}/services/instance-manager/lifecycle.py" \
     --state-root "${state_root}" --database "${database_path}" \
     destroy "${instance_id}" >/dev/null 2>&1 || true
-  if [[ "${volume_path}" == "/srv/fc/volumes/instances/m10-smoke.ext4" ]]; then
+  if [[ "${volume_path}" == "/srv/fc/volumes/users/m10-smoke.ext4" ]]; then
     rm -f "${volume_path}"
   fi
   if [[ "${jail_path}" == "/srv/jailer/firecracker/m10-smoke" ]]; then

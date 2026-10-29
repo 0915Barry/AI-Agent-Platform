@@ -9,7 +9,7 @@ PID、PID 启动时钟、jail、数据盘和网络资源写入受控元数据。
 - 实例 ID、TAP 名和 nftables 表名必须经过白名单校验；
 - 仅依据 PID 不足以识别进程，因此同时校验 /proc 中的启动时钟；
 - jail 和数据盘必须位于固定目录，拒绝对任意路径执行清理；
-- 普通停止和空闲回收保留数据盘，只有 destroy 才删除持久化数据。
+- 普通停止和空闲回收保留数据盘；平台运行时销毁可显式要求继续保留用户盘。
 """
 
 import argparse
@@ -418,7 +418,7 @@ def command_stop(args: argparse.Namespace) -> None:
 
 
 def command_destroy(args: argparse.Namespace) -> None:
-    """必要时先停止实例，再删除数据盘、状态文件和活动标记。"""
+    """必要时先停止实例，再清理运行状态；用户盘可按调用方要求保留。"""
     if os.geteuid() != 0:
         raise SystemExit("destroy must run as root")
     instance_id = validate_instance_id(args.instance_id)
@@ -426,17 +426,19 @@ def command_destroy(args: argparse.Namespace) -> None:
     metadata = load_metadata(store, args.state_root, instance_id)
     if metadata.get("status") == "running":
         metadata = stop_instance(store, args.state_root, instance_id, "destroyed")
-    volume_path = Path(metadata["volumePath"]).resolve()
-    volume_root = Path("/srv/fc/volumes").resolve()
-    if volume_root not in volume_path.parents:
-        raise SystemExit("refusing to delete volume outside /srv/fc/volumes")
-    volume_path.unlink(missing_ok=True)
+    if not args.preserve_volume:
+        volume_path = Path(metadata["volumePath"]).resolve()
+        volume_root = Path("/srv/fc/volumes").resolve()
+        if volume_root not in volume_path.parents:
+            raise SystemExit("refusing to delete volume outside /srv/fc/volumes")
+        volume_path.unlink(missing_ok=True)
     legacy_path, busy_path, activity_path = paths(args.state_root, instance_id)
     busy_path.unlink(missing_ok=True)
     activity_path.unlink(missing_ok=True)
     store.delete(instance_id)
     legacy_path.unlink(missing_ok=True)
-    print(f"INSTANCE_DESTROYED id={instance_id} volume=deleted")
+    volume_state = "preserved" if args.preserve_volume else "deleted"
+    print(f"INSTANCE_DESTROYED id={instance_id} volume={volume_state}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -490,6 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     destroy = commands.add_parser("destroy")
     destroy.add_argument("instance_id")
+    destroy.add_argument("--preserve-volume", action="store_true")
     destroy.set_defaults(handler=command_destroy)
     return parser
 

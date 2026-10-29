@@ -19,6 +19,8 @@ import main as cli
 
 
 class MockControlPlane(BaseHTTPRequestHandler):
+    deleted_paths: list[str] = []
+
     def log_message(self, _format: str, *_args: object) -> None:
         return
 
@@ -44,6 +46,38 @@ class MockControlPlane(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
+        if parsed.path == "/api/workspaces":
+            self.send_json(
+                200,
+                {
+                    "workspaces": [
+                        {
+                            "id": "workspace-aaaaaaaaaaaaaaaa",
+                            "name": "测试工作区",
+                            "conversationCount": 1,
+                            "updatedAt": 2,
+                            "current": True,
+                        }
+                    ]
+                },
+            )
+            return
+        if parsed.path == "/api/workspaces/workspace-aaaaaaaaaaaaaaaa/conversations":
+            self.send_json(
+                200,
+                {
+                    "conversations": [
+                        {
+                            "id": "conversation-bbbbbbbbbbbbbbbb",
+                            "instanceId": "agent-demo",
+                            "title": "测试会话",
+                            "preview": "最后一条消息",
+                            "updatedAt": 2,
+                        }
+                    ]
+                },
+            )
+            return
         if parsed.path.endswith("/stream"):
             body = (
                 'id: 1\nevent: task-event\ndata: {"sequence":1,"type":"text",'
@@ -94,9 +128,30 @@ class MockControlPlane(BaseHTTPRequestHandler):
             return
         self.send_json(404, {"error": {"code": "missing", "message": "missing"}})
 
+    def do_DELETE(self) -> None:
+        self.deleted_paths.append(self.path)
+        if self.path == "/api/workspaces/workspace-aaaaaaaaaaaaaaaa":
+            self.send_json(
+                200,
+                {
+                    "id": "workspace-aaaaaaaaaaaaaaaa",
+                    "status": "deleted",
+                    "currentWorkspace": {"name": "默认工作区"},
+                },
+            )
+            return
+        if self.path.endswith("/conversations/conversation-bbbbbbbbbbbbbbbb"):
+            self.send_json(
+                200,
+                {"id": "conversation-bbbbbbbbbbbbbbbb", "status": "deleted"},
+            )
+            return
+        self.send_json(404, {"error": {"code": "missing", "message": "missing"}})
+
 
 class AgentCtlTests(unittest.TestCase):
     def setUp(self) -> None:
+        MockControlPlane.deleted_paths = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), MockControlPlane)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -128,16 +183,65 @@ class AgentCtlTests(unittest.TestCase):
             self.assertEqual(store.load()["username"], "demo")
             self.assertIn("已登录：demo", output.getvalue())
 
-    def test_help_explains_required_identifiers_and_examples(self) -> None:
+    def test_help_explains_user_flow_and_diagnostic_commands(self) -> None:
         help_text = cli.build_parser().format_help()
-        self.assertIn("start <实例ID>", help_text)
-        self.assertIn("CONVERSATION_ID 可通过 conversations 命令查询", help_text)
-        self.assertIn("./agentctl chat cli-demo", help_text)
+        self.assertIn("./agentctl workspace", help_text)
+        self.assertIn("./agentctl chat", help_text)
+        self.assertIn("实例命令保留用于诊断", help_text)
 
     def test_dark_background_colors_use_bright_blue_and_red(self) -> None:
         console = cli.Console(True, io.StringIO())
         self.assertEqual(console.paint("系统", "blue"), "\033[94m系统\033[0m")
         self.assertEqual(console.paint("错误", "red"), "\033[91m错误\033[0m")
+
+    def test_menu_preview_uses_ten_characters(self) -> None:
+        self.assertEqual(cli.menu_preview("一二三四五六七八九十十一"), "一二三四五六七八九十…")
+        self.assertEqual(cli.menu_preview(""), "暂无消息")
+
+    def test_workspace_and_chat_default_to_user_facing_flow(self) -> None:
+        parser = cli.build_parser()
+        workspace = parser.parse_args(["workspace", "--new", "研发项目"])
+        chat = parser.parse_args(["chat"])
+        self.assertEqual(workspace.new_name, "研发项目")
+        self.assertIsNone(chat.instance_id)
+        self.assertIsNone(chat.workspace)
+
+    def test_workspace_and_conversation_can_be_deleted_from_submenus(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = cli.SessionStore(Path(directory) / "state.json")
+            store.save({"cookie": "aap_session=test-token", "baseUrl": self.base_url})
+            console = cli.Console(False, io.StringIO())
+            workspace_args = SimpleNamespace(
+                base_url=self.base_url,
+                new_name=None,
+                select_id=None,
+            )
+            with patch.object(cli, "choose_option", side_effect=[1, 1]), patch(
+                "builtins.input", return_value="测试工作区"
+            ):
+                cli.command_workspace(workspace_args, store, console)
+
+            chat_args = SimpleNamespace(
+                base_url=self.base_url,
+                instance_id=None,
+                conversation=None,
+                workspace=None,
+                history_limit=10,
+            )
+            with patch.object(cli, "choose_option", side_effect=[1, 1]), patch(
+                "builtins.input", return_value="y"
+            ):
+                cli.command_chat(chat_args, store, console)
+
+        self.assertIn(
+            "/api/workspaces/workspace-aaaaaaaaaaaaaaaa",
+            MockControlPlane.deleted_paths,
+        )
+        self.assertIn(
+            "/api/workspaces/workspace-aaaaaaaaaaaaaaaa/conversations/"
+            "conversation-bbbbbbbbbbbbbbbb",
+            MockControlPlane.deleted_paths,
+        )
 
     def test_sse_events_are_decoded(self) -> None:
         events = list(cli.ApiClient(self.base_url, "aap_session=test-token").events("/stream"))

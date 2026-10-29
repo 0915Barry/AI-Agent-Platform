@@ -39,9 +39,9 @@ class FakeRuntime:
     def __init__(self) -> None:
         # instances 保存运行时视角的当前状态；calls 便于后续断言调用顺序。
         self.instances: dict[str, dict] = {}
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, ...]] = []
 
-    def start(self, instance_id: str) -> dict:
+    def start(self, instance_id: str, owner_id: str | None = None) -> dict:
         """模拟启动实例并返回与真实 Runtime 相同形状的状态数据。"""
 
         self.calls.append(("start", instance_id))
@@ -87,15 +87,21 @@ class FakeRuntime:
 
         self.calls.append(("busy_on" if enabled else "busy_off", instance_id))
 
+    def delete_workspace_data(self, owner_id: str, directory_name: str) -> bool:
+        self.calls.append(("delete_workspace_data", owner_id, directory_name))
+        return True
+
 
 class FakePiGateway:
     """不连接网络，模拟一次带文本增量的 Pi RPC 执行。"""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, int, str]] = []
+        self.calls: list[tuple[str, int, str, str | None]] = []
 
-    def execute(self, host: str, port: int, prompt: str, on_event) -> str:
-        self.calls.append((host, port, prompt))
+    def execute(
+        self, host: str, port: int, prompt: str, on_event, workspace_id: str | None = None
+    ) -> str:
+        self.calls.append((host, port, prompt, workspace_id))
         on_event("progress", {"stage": "model_started"})
         on_event("text", {"delta": "自动"})
         return "自动完成"
@@ -113,13 +119,78 @@ class ControlPlaneTests(unittest.TestCase):
         task_database = Path(self.temporary.name) / "tasks.db"
         self.store = SERVER.InstanceStore(database)
         self.tasks = SERVER.TaskStore(task_database)
+        self.workspaces = SERVER.WorkspaceStore(database)
         self.runtime = FakeRuntime()
-        self.control = SERVER.ControlPlane(self.store, self.runtime, self.tasks)
+        self.control = SERVER.ControlPlane(
+            self.store, self.runtime, self.tasks, workspaces=self.workspaces
+        )
 
     def tearDown(self) -> None:
         """清理本用例的临时数据库目录。"""
 
         self.temporary.cleanup()
+
+    def test_workspace_groups_conversations_and_auto_starts_runtime(self) -> None:
+        owner_id = "user-workspace"
+        gateway = FakePiGateway()
+        self.control.pi_gateway = gateway
+        instance = self.store.create("agent-workspace", owner_id)
+        self.assertEqual(instance["status"], "created")
+        workspace = self.control.create_workspace(owner_id, {"name": "Project A"})
+        conversation = self.control.create_workspace_conversation(owner_id, workspace["id"])
+        self.assertEqual(conversation["workspaceId"], workspace["id"])
+
+        listed = self.control.list_workspace_conversations(owner_id, workspace["id"])
+        self.assertEqual([item["id"] for item in listed], [conversation["id"]])
+        task = self.control.create_conversation_message(
+            "agent-workspace",
+            conversation["id"],
+            {"content": "自动启动"},
+            owner_id,
+        )
+        self.assertIn(("start", "agent-workspace"), self.runtime.calls)
+        deadline = time.monotonic() + 2
+        result = self.control.get_task("agent-workspace", task["id"])
+        while result["status"] not in {"completed", "failed"} and time.monotonic() < deadline:
+            time.sleep(0.01)
+            result = self.control.get_task("agent-workspace", task["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(gateway.calls[0][3], workspace["id"])
+
+    def test_conversation_and_workspace_deletion_respect_boundaries(self) -> None:
+        owner_id = "user-delete"
+        self.store.create("agent-delete", owner_id)
+        first = self.control.create_workspace(owner_id, {"name": "Project A"})
+        second = self.control.create_workspace(owner_id, {"name": "Project B"})
+        conversation = self.control.create_workspace_conversation(owner_id, first["id"])
+
+        deleted_conversation = self.control.delete_workspace_conversation(
+            owner_id, first["id"], conversation["id"]
+        )
+        self.assertEqual(deleted_conversation["status"], "deleted")
+        self.assertEqual(self.control.list_workspace_conversations(owner_id, first["id"]), [])
+
+        result = self.control.delete_workspace(owner_id, second["id"])
+        self.assertEqual(result["status"], "deleted")
+        self.assertEqual(result["currentWorkspace"]["id"], first["id"])
+        self.assertIn(
+            ("delete_workspace_data", owner_id, second["directoryName"]),
+            self.runtime.calls,
+        )
+
+    def test_active_conversation_cannot_be_deleted(self) -> None:
+        owner_id = "user-busy-delete"
+        self.store.create("agent-busy-delete", owner_id)
+        workspace = self.control.create_workspace(owner_id, {"name": "Busy"})
+        conversation = self.control.create_workspace_conversation(owner_id, workspace["id"])
+        self.tasks.create_conversation_task(
+            "agent-busy-delete", conversation["id"], "正在执行"
+        )
+        with self.assertRaises(SERVER.ApiError) as error:
+            self.control.delete_workspace_conversation(
+                owner_id, workspace["id"], conversation["id"]
+            )
+        self.assertEqual(error.exception.code, "conversation_busy")
 
     def test_full_lifecycle(self) -> None:
         """完整生命周期应能按 created -> running -> stopped -> destroyed 流转。"""
@@ -175,25 +246,26 @@ class ControlPlaneTests(unittest.TestCase):
         with self.assertRaises(SERVER.ApiError):
             self.store.assert_owner("bob-one", alice)
 
-        for index in range(2, 6):
-            self.control.create({"id": f"alice-{index}"}, alice)
         with self.assertRaises(SERVER.ApiError) as total_quota:
-            self.control.create({"id": "alice-six"}, alice)
+            self.control.create({"id": "alice-two"}, alice)
         self.assertEqual(total_quota.exception.code, "instance_quota_exceeded")
 
+        # 直接插入一条历史实例记录，验证升级后仍会保护单运行实例约束。
+        self.store.create("alice-legacy", alice)
         self.control.start("alice-one", alice)
         with self.assertRaises(SERVER.ApiError) as running_quota:
-            self.control.start("alice-2", alice)
+            self.control.start("alice-legacy", alice)
         self.assertEqual(running_quota.exception.code, "running_quota_exceeded")
         self.control.stop("alice-one")
-        self.assertEqual(self.control.start("alice-2", alice)["status"], "running")
+        self.assertEqual(self.control.start("alice-legacy", alice)["status"], "running")
 
     def test_concurrent_starts_preserve_single_running_instance(self) -> None:
         """同一用户的并发启动请求中只能有一个成功预留运行配额。"""
 
         owner = "user-concurrent"
-        self.control.create({"id": "concurrent-one"}, owner)
-        self.control.create({"id": "concurrent-two"}, owner)
+        # 模拟升级前已存在多条实例记录的用户。
+        self.store.create("concurrent-one", owner)
+        self.store.create("concurrent-two", owner)
         barrier = threading.Barrier(2)
         results: list[str] = []
         results_guard = threading.Lock()
@@ -324,7 +396,7 @@ class ControlPlaneTests(unittest.TestCase):
 
         self.assertEqual(task["status"], "completed")
         self.assertEqual(task["output"], "自动完成")
-        self.assertEqual(gateway.calls, [("172.29.0.2", 8080, "执行任务")])
+        self.assertEqual(gateway.calls, [("172.29.0.2", 8080, "执行任务", None)])
         event_types = [
             event["type"]
             for event in self.control.task_events("agent-gateway", queued["id"])
