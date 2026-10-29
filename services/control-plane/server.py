@@ -47,6 +47,9 @@ from workspace_store import WorkspaceStore, WorkspaceStoreError  # noqa: E402
 
 
 INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+# 路由层只接受受控格式的实例、任务、工作区和会话 ID。这样可以在这些值进入
+# SQLite 查询或文件系统路径之前拦截路径穿越和意外字符。格式校验并不等于权限
+# 校验：资源归属仍由 authorize_instance() 和 WorkspaceStore 分别检查。
 INSTANCE_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})(?:/(start|stop|heartbeat))?$"
 )
@@ -245,7 +248,12 @@ class InstanceStore:
 
 
 class ControlPlane:
-    """协调产品状态机与高权限 InstanceRuntime。
+    """连接业务数据、实例运行时和 Pi RPC 的核心编排模块。
+
+    InstanceStore 保存实例的产品状态；InstanceRuntime 实际创建 TAP、Jailer 和
+    Firecracker；WorkspaceStore 与 TaskStore 保存工作区、会话、消息和任务；
+    PiGateway 则把已排队任务发送到 Guest。HTTP Handler 只负责协议适配，不直接
+    操作这些底层组件。
 
     同一实例的变更使用进程内锁串行化，防止两个并发 start/stop 请求互相覆盖。
     不同实例仍可由 ThreadingHTTPServer 并行处理。
@@ -364,6 +372,9 @@ class ControlPlane:
             self.require_workspace_store().get(owner_id, workspace_id)
         except WorkspaceStoreError as error:
             raise ApiError(404, "workspace_not_found", str(error)) from error
+        # 会话必须关联一个稳定的实例记录，后续任务才能找到用户数据盘与运行端点。
+        # ensure_user_instance() 这里只补齐数据库关系，不会立即启动 microVM；
+        # 用户发送第一条消息时才按需启动计算资源。
         instance = self.ensure_user_instance(owner_id)
         return self.tasks.create_conversation(
             instance["id"], "新会话", workspace_id=workspace_id
@@ -639,7 +650,11 @@ class ControlPlane:
         payload: dict[str, Any],
         owner_id: str | None = None,
     ) -> dict[str, Any]:
-        """保存用户消息，以受限历史构造任务，并刷新实例活动时间。"""
+        """保存用户消息，以受限历史构造任务，并刷新实例活动时间。
+
+        对终端和未来页面而言，“发送消息”是一个业务动作。若实例已经停止，这里
+        会先按用户身份恢复实例，再创建任务；调用方不需要自己编排 start/chat。
+        """
 
         instance_id = self.validate_requested_id(instance_id)
         content = payload.get("content")
@@ -649,6 +664,8 @@ class ControlPlane:
         if len(content.encode("utf-8")) > 16384:
             raise ApiError(413, "message_too_large", "message content exceeds 16 KiB")
         record = self.get(instance_id)
+        # 把实例生命周期隐藏在聊天接口后面：用户关注会话，Control Plane 负责确保
+        # 承载该用户数据盘的 microVM 已经可用。
         if record["status"] != "running" and owner_id is not None:
             record = self.start(instance_id, owner_id)
         if record["status"] != "running":
@@ -656,6 +673,8 @@ class ControlPlane:
         try:
             self.tasks.get_conversation(instance_id, conversation_id)
             self.runtime.heartbeat(instance_id)
+            # TaskStore 在一个事务中写入用户消息、截取受限历史并创建 queued 任务，
+            # 避免出现“消息已保存但没有任务”或相反的半完成状态。
             task = self.tasks.create_conversation_task(
                 instance_id,
                 conversation_id,
@@ -671,7 +690,11 @@ class ControlPlane:
             raise ApiError(500, "conversation_task_create_failed", str(error)) from error
 
     def schedule_tasks(self, instance_id: str) -> None:
-        """确保该实例存在一个宿主机后台线程，把 queued 任务发给 Pi RPC。"""
+        """确保该实例存在一个后台消费者，把 queued 任务发给 Pi RPC。
+
+        消息接口在任务持久化后即可返回 202；模型调用由该线程继续执行。每个实例
+        最多一个消费者，既保持会话事件顺序，也避免两个任务同时修改同一数据盘。
+        """
 
         if self.pi_gateway is None:
             # 单元测试和旧 smoke test 可以显式领取任务；正式服务总会注入 Gateway。
@@ -689,13 +712,16 @@ class ControlPlane:
             thread.start()
 
     def _dispatch_tasks(self, instance_id: str) -> None:
-        """按创建顺序执行同一实例的任务，直到队列为空。"""
+        """按创建顺序原子领取并执行同一实例的任务，直到队列为空。"""
 
         try:
             while True:
+                # claim_next() 使用 SQLite 事务把 queued 改为 running，多个请求即使
+                # 同时触发调度，也只有一个消费者能够领取同一任务。
                 task = self.tasks.claim_next(instance_id)
                 if task is None:
-                    # 在 guard 内再查一次，封住“刚判断为空又创建任务”的竞态窗口。
+                    # 在 guard 内再查一次，封住“刚判断为空、另一请求恰好创建任务”的
+                    # 竞态窗口，避免新任务一直等到下一次请求才被执行。
                     with self._dispatch_guard:
                         task = self.tasks.claim_next(instance_id)
                         if task is None:
@@ -709,7 +735,12 @@ class ControlPlane:
                 self._dispatching.discard(instance_id)
 
     def _run_pi_task(self, instance_id: str, task: dict[str, Any]) -> None:
-        """解析实例端点、执行一次 Pi RPC，并把事件写回 TaskStore。"""
+        """解析 Guest 端点、执行一次 Pi RPC，并把事件写回 TaskStore。
+
+        TaskStore 提供 prompt 与 workspaceId，InstanceRuntime 提供 Guest IP 和 RPC
+        端口；PiGateway 产生的文本增量、工具事件和终态会被统一保存，供 SSE、CLI
+        或未来页面读取。
+        """
 
         assert self.pi_gateway is not None
         task_id = task["id"]
@@ -719,6 +750,8 @@ class ControlPlane:
             nonlocal last_heartbeat
             self.tasks.append_event(instance_id, task_id, event_type, payload)
             now = time.monotonic()
+            # 流式 token 可能非常密集。心跳最多每十秒刷新一次，既保护正在生成的
+            # 实例不被空闲回收，又避免每个 token 都触发运行时状态写入。
             if now - last_heartbeat >= 10:
                 self.runtime.heartbeat(instance_id)
                 last_heartbeat = now
@@ -741,6 +774,8 @@ class ControlPlane:
                 save_event,
                 task.get("workspaceId"),
             )
+            # PiGateway 只有收到 agent_settled 才会返回，因此这里的 completed 表示
+            # 模型循环及其中的工具调用均已真正结束，而不只是收到最后一个文本块。
             self.tasks.append_event(instance_id, task_id, "completed", {"output": output})
             self.runtime.heartbeat(instance_id)
         except Exception as error:
@@ -762,7 +797,11 @@ class ControlPlane:
                     pass
 
 class ControlPlaneHandler(BaseHTTPRequestHandler):
-    """只接受固定路由和 JSON 对象的小型 HTTP 适配层。"""
+    """把 HTTP 请求适配为 ControlPlane 方法调用。
+
+    该层只负责路由、认证、JSON 校验与响应格式，不直接写 SQL，也不操作
+    Firecracker 或 Pi RPC。因此 CLI、Web 和 Desktop 可以复用同一组业务接口。
+    """
 
     server_version = "AgentControlPlane/0.1"
     protocol_version = "HTTP/1.1"
@@ -836,7 +875,11 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         return None if morsel is None else morsel.value
 
     def current_user(self) -> dict[str, Any] | None:
-        """未启用认证的 smoke test 返回 None；正式服务必须解析有效会话。"""
+        """把 Cookie 中的随机会话令牌解析为平台用户。
+
+        客户端只保存令牌，不保存用户密码；AuthStore 负责令牌有效期和 user_id
+        映射。未启用认证的底层 smoke test 返回 None。
+        """
         if self.auth_store is None:
             return None
         token = self.session_token()
@@ -849,6 +892,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         return user
 
     def authorize_instance(self, instance_id: str, user: dict[str, Any] | None) -> None:
+        """确认实例属于当前用户，防止仅凭猜中实例 ID 跨用户访问。"""
         if user is not None:
             self.control.store.assert_owner(instance_id, user["id"])
 
