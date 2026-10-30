@@ -193,6 +193,48 @@ if [[ "${node_version}" == "v" || -z "${pi_version}" || -z "${pi_uid}" \
   echo "RUNTIME_METADATA_FAILURE missing_version_or_uid" >&2
   exit 1
 fi
+
+# 正式实例只信任构建阶段写入的只读元数据。runtime-smoke-test 会通过内核参数
+# 显式开启这一分支，在真实 Guest 内再次启动 Node/Pi 并核对版本与非 root UID。
+runtime_smoke="$(cmdline_value agent_runtime_smoke || true)"
+runtime_verification="metadata"
+if [[ "${runtime_smoke}" == "1" ]]; then
+  expected_node="$(cmdline_value agent_expected_node)"
+  expected_pi="$(cmdline_value agent_expected_pi)"
+  expected_uid="$(cmdline_value agent_expected_uid)"
+  if [[ "${node_version}" != "${expected_node}" \
+    || "${pi_version}" != "${expected_pi}" \
+    || "${pi_uid}" != "${expected_uid}" ]]; then
+    echo "RUNTIME_VERSION_FAILURE build_metadata_does_not_match_pinned_config" >&2
+    exit 1
+  fi
+  node_actual="$(
+    runuser -u pi -- env HOME=/home/pi PATH="${runtime_path}" \
+      /usr/local/bin/node --version
+  )"
+  pi_actual="$(
+    runuser -u pi -- env \
+      HOME=/home/pi \
+      PATH="${runtime_path}" \
+      PI_OFFLINE=1 \
+      PI_SKIP_VERSION_CHECK=1 \
+      /usr/local/bin/pi --version
+  )"
+  uid_actual="$(id -u pi)"
+  if [[ "${node_actual}" != "${node_version}" ]]; then
+    echo "RUNTIME_VERSION_FAILURE component=node expected=${node_version} actual=${node_actual}" >&2
+    exit 1
+  fi
+  if [[ "${pi_actual}" != *"${pi_version}"* ]]; then
+    echo "RUNTIME_VERSION_FAILURE component=pi expected=${pi_version} actual=${pi_actual}" >&2
+    exit 1
+  fi
+  if [[ "${uid_actual}" != "${pi_uid}" ]]; then
+    echo "RUNTIME_VERSION_FAILURE component=uid expected=${pi_uid} actual=${uid_actual}" >&2
+    exit 1
+  fi
+  runtime_verification="executed"
+fi
 guest_timing_mark version_check  # GUEST_STARTUP_TIMING_DIAGNOSTIC
 
 # 系统盘所有权、shadow 与 /usr/local 权限已在 rootfs 构建时验证。启动时只保留
@@ -201,7 +243,7 @@ runuser -u pi -- sh -c \
   'probe=/workspace/.pi-permission-probe; : > "${probe}"; rm -f "${probe}"'
 guest_timing_mark security_check  # GUEST_STARTUP_TIMING_DIAGNOSTIC
 
-echo "AGENT_RUNTIME_READY node=${node_version} pi=${pi_version} uid=${pi_uid}"
+echo "AGENT_RUNTIME_READY node=${node_version} pi=${pi_version} uid=${pi_uid} verification=${runtime_verification}"
 echo "AGENT_SECURITY_READY static=build-verified workspace_write=allowed"
 
 if [[ "${managed_runtime}" == "1" ]]; then

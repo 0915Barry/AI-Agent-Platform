@@ -364,6 +364,44 @@ Ubuntu rootfs 构建，不是每次任务都会发生。
 如果 Ubuntu Snapshot 服务返回 503，脚本会自动重试；服务持续不可用时，稍后重新运行
 同一命令即可。
 
+### microVM 冷启动优化
+
+在 Apple Silicon + UTM + Ubuntu ARM64 开发环境中，受管 microVM 冷启动最初实测约为
+`11.75 s`。该耗时并非主要来自数据盘、TAP 或 nftables，而是 Guest 每次启动都
+重复执行 Pi CLI 版本检查、静态权限验证，Host 还以较大的时间间隔轮询 Guest 就绪标记。
+
+本轮优化包括：
+
+- 在 rootfs 构建时真实执行 Node.js 和 Pi 版本验证，并将结果写入只读系统盘的
+  `/etc/ai-agent-platform-build`。Guest 启动时只读取该构建元数据，不再重复启动
+  Node.js 和 Pi CLI。这是最主要的优化，消除了原来约 `6.45 s` 的重复版本检查。
+  `runtime-smoke-test` 会显式启用验收模式，在真实 Guest 中再运行一次 Node.js、Pi 和
+  UID 检查，因此完整验证能力没有被取消。验收时约 `6.5 s` 的版本检查耗时
+  是预期行为，不属于正式实例的冷启动时间。
+- 将 Node 文件所有者、`/etc/shadow` 访问权限和 `/usr/local` 写权限等静态安全
+  检查移到 rootfs 构建阶段。Guest 每次启动仍以 `pi` 用户实际写入一次
+  `/workspace`，验证本次挂载的用户数据盘权限，因此没有牺牲运行时安全验证。
+- 将 Host 等待 `PI_RPC_READY` 的轮询间隔从 `250 ms` 缩短为 `100 ms`，减少 Guest
+  已就绪但 Host 尚未发现的额外等待。
+- 在 Instance Manager 和 Guest 启动脚本中增加分阶段计时，并由 Control Plane
+  通过 SSE 传递给 `agentctl`。CLI 会在冷启动后以亮粉色逐行显示 Host 和 Guest
+  各阶段耗时，便于后续定位回归。
+
+优化后同一环境的实测冷启动降至约 `5.00 s`，相比最初减少约 `57%`。
+最近一次样本中，Host 的数据盘、网络和模型网关准备总计不到 `0.4 s`；主要剩余瓶颈是
+Guest 内核启动并进入 init，约为 `3.07 s`。因此继续压缩几十毫秒的 Host 操作收益
+有限；如需进一步显著缩短启动时间，后续应优先评估预热实例或 Firecracker 快照恢复。
+上述数据是开发环境样本，实际耗时会随 CPU、磁盘和外层虚拟化环境变化。
+
+需要重新验证 Guest 内的真实版本时，运行：
+
+```bash
+./run.sh runtime-smoke-test
+```
+
+成功输出中的 `verification=executed` 表示 Node.js、Pi 和 UID 命令确实已在 Guest 内执行，
+而不是仅读取构建元数据。
+
 ## 可配置参数
 
 macOS 的连接参数保存在仓库根目录 `.env`，该文件已被 Git 忽略：
