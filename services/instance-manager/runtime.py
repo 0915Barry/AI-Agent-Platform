@@ -28,6 +28,7 @@ from runtime_store import RuntimeStore, RuntimeStoreError, UserVolumeStore
 
 DEFAULT_STATE_ROOT = Path("/var/lib/fc")
 DEFAULT_VOLUME_ROOT = Path("/srv/fc/volumes/users")
+DEFAULT_SNAPSHOT_ROOT = Path("/srv/fc/snapshots/instances")
 LEGACY_VOLUME_ROOT = Path("/srv/fc/volumes/instances")
 ARTIFACT_ROOT = Path("/srv/fc/artifacts")
 JAILER_ROOT = Path("/srv/jailer")
@@ -160,6 +161,7 @@ class InstanceRuntime:
         idle_timeout_seconds: int = 300,
         deepseek_credential: Path | None = None,
         state_database: Path | None = None,
+        snapshot_root: Path = DEFAULT_SNAPSHOT_ROOT,
     ) -> None:
         self.state_root = state_root.resolve()
         self.volume_root = volume_root.resolve()
@@ -168,6 +170,7 @@ class InstanceRuntime:
         self.state_database = (
             state_database.resolve() if state_database else self.state_root / "control-plane.db"
         )
+        self.snapshot_root = snapshot_root.resolve()
         # 正式受管实例需要由宿主机主动连接 Guest 的 Pi RPC 端口，因此允许
         # 已建立的 host -> Guest TCP 连接响应通过实例 nftables 规则。
         self.network_manager = NetworkManager(
@@ -250,6 +253,7 @@ class InstanceRuntime:
             self.state_root / "instances",
             self.state_root / "activity",
             self.state_root / "control-plane",
+            self.snapshot_root,
         ):
             directory.mkdir(parents=True, exist_ok=True, mode=0o755)
         if self.deepseek_credential is not None:
@@ -280,6 +284,8 @@ class InstanceRuntime:
             "gateway_log": state_dir / "sidecars" / "gateway.log",
             "gateway_audit": state_dir / "sidecars" / "gateway.audit.jsonl",
             "credential": state_dir / "sidecars" / "deepseek-api-key",
+            "snapshot": self.snapshot_root / instance_id,
+            "snapshot_next": self.snapshot_root / f"{instance_id}.next",
         }
 
     def adopt_legacy_volume(
@@ -656,6 +662,86 @@ class InstanceRuntime:
                 raise RuntimeFailure(message) from error
         return subprocess.run(command, check=False, text=True)
 
+    @staticmethod
+    def firecracker_api(
+        socket_path: Path, method: str, route: str, payload: dict
+    ) -> None:
+        """通过实例独立的 Unix API Socket 调用 Firecracker。"""
+
+        try:
+            run(
+                [
+                    "curl",
+                    "--fail-with-body",
+                    "--silent",
+                    "--show-error",
+                    "--unix-socket",
+                    str(socket_path),
+                    "--request",
+                    method,
+                    "--header",
+                    "Content-Type: application/json",
+                    "--data",
+                    json.dumps(payload, separators=(",", ":")),
+                    f"http://localhost{route}",
+                ]
+            )
+        except subprocess.CalledProcessError as error:
+            message = (error.stderr or error.stdout or str(error)).strip()
+            raise RuntimeFailure(f"Firecracker API {method} {route} failed: {message}") from error
+
+    @staticmethod
+    def wait_for_socket(socket_path: Path, process: subprocess.Popen[bytes]) -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if socket_path.is_socket():
+                return
+            if process.poll() is not None:
+                break
+            time.sleep(0.05)
+        raise RuntimeFailure("Firecracker API socket did not become ready")
+
+    @staticmethod
+    def start_idle_watcher(manager: Path, state_root: Path, database: Path, instance_id: str, log: Path) -> None:
+        """启动独立空闲回收器；冷启动和快照恢复共用相同登记规则。"""
+
+        reaper_handle = log.open("ab", buffering=0)
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(manager),
+                "--state-root",
+                str(state_root),
+                "--database",
+                str(database),
+                "watch",
+                instance_id,
+                "--poll-interval",
+                "1",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=reaper_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        reaper_handle.close()
+
+    def snapshot_manifest(self, instance_id: str) -> dict:
+        paths = self.paths(instance_id)
+        manifest_path = paths["snapshot"] / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+            raise RuntimeFailure(f"valid snapshot manifest is missing: {instance_id}") from error
+        if manifest.get("instanceId") != instance_id or manifest.get("version") != 1:
+            raise RuntimeFailure(f"invalid snapshot manifest: {instance_id}")
+        return manifest
+
+    def discard_snapshot(self, instance_id: str) -> None:
+        paths = self.paths(instance_id)
+        shutil.rmtree(paths["snapshot"], ignore_errors=True)
+        shutil.rmtree(paths["snapshot_next"], ignore_errors=True)
+
     def start(self, instance_id: str, owner_id: str | None = None) -> dict:
         """启动实例并等待 AGENT_RUNTIME_READY 后再向调用者返回。
 
@@ -837,26 +923,13 @@ class InstanceRuntime:
                     register_arguments.extend(["--sidecar-pid", str(sidecar.pid)])
             self.lifecycle(*register_arguments)
             # watcher 是独立进程，因此控制面服务退出后空闲回收仍然有效。
-            reaper_handle = paths["reaper"].open("ab", buffering=0)
-            subprocess.Popen(
-                [
-                    sys.executable,
-                    str(self.manager),
-                    "--state-root",
-                    str(self.state_root),
-                    "--database",
-                    str(self.state_database),
-                    "watch",
-                    instance_id,
-                    "--poll-interval",
-                    "1",
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=reaper_handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
+            self.start_idle_watcher(
+                self.manager,
+                self.state_root,
+                self.state_database,
+                instance_id,
+                paths["reaper"],
             )
-            reaper_handle.close()
             # 回收由本进程创建的 VMM 子进程，防止停止后留下 zombie。
             threading.Thread(target=process.wait, daemon=True).start()
             for sidecar in sidecars:
@@ -886,6 +959,286 @@ class InstanceRuntime:
                     pass
             shutil.rmtree(paths["jail"], ignore_errors=True)
             timing.emit("failed")  # STARTUP_TIMING_DIAGNOSTIC
+            if isinstance(error, NetworkFailure):
+                raise RuntimeFailure(str(error)) from error
+            raise
+
+    def suspend(self, instance_id: str, owner_id: str) -> dict:
+        """暂停运行实例、创建完整快照并释放计算与临时网络资源。"""
+
+        instance_id = validate_instance_id(instance_id)
+        owner_id = validate_instance_id(owner_id)
+        uid, _, _, _ = self.ensure_host()
+        paths = self.paths(instance_id, owner_id)
+        metadata = self.status(instance_id)
+        if metadata is None or metadata.get("status") != "running" or not metadata.get("processAlive"):
+            raise RuntimeFailure(f"instance is not running: {instance_id}")
+        lease = self.network_manager.store.get(instance_id)
+        if lease is None:
+            raise RuntimeFailure(f"network lease is missing: {instance_id}")
+
+        source_snapshot = paths["chroot"] / "snapshot-next"
+        shutil.rmtree(source_snapshot, ignore_errors=True)
+        shutil.rmtree(paths["snapshot_next"], ignore_errors=True)
+        source_snapshot.mkdir(mode=0o700)
+        os.chown(source_snapshot, uid, pwd.getpwnam(FIRECRACKER_USER).pw_gid)
+
+        paused = False
+        started_at = time.monotonic()
+        self.busy(instance_id, True)
+        try:
+            self.firecracker_api(paths["socket"], "PATCH", "/vm", {"state": "Paused"})
+            paused = True
+            snapshot_started = time.monotonic()
+            self.firecracker_api(
+                paths["socket"],
+                "PUT",
+                "/snapshot/create",
+                {
+                    "snapshot_type": "Full",
+                    "snapshot_path": "/snapshot-next/vmstate.snap",
+                    "mem_file_path": "/snapshot-next/memory.snap",
+                },
+            )
+            snapshot_ms = round((time.monotonic() - snapshot_started) * 1000)
+            if not (source_snapshot / "vmstate.snap").is_file() or not (
+                source_snapshot / "memory.snap"
+            ).is_file():
+                raise RuntimeFailure("Firecracker did not create complete snapshot files")
+
+            # 先把新快照移出即将清理的 jail，但旧快照仍可能是当前 VMM 的内存
+            # 后端，因此必须等 VMM 退出后才能替换旧目录。
+            os.replace(source_snapshot, paths["snapshot_next"])
+            self.lifecycle(
+                "stop",
+                instance_id,
+                "--reason",
+                "suspended",
+                "--skip-guest-shutdown",
+            )
+            paused = False
+            shutil.rmtree(paths["snapshot"], ignore_errors=True)
+            os.replace(paths["snapshot_next"], paths["snapshot"])
+
+            build_id_path = ARTIFACT_ROOT / "agent-rootfs.build-id"
+            manifest = {
+                "version": 1,
+                "instanceId": instance_id,
+                "ownerId": owner_id,
+                "createdAt": int(time.time()),
+                "rootfsBuildId": build_id_path.read_text(encoding="utf-8").strip(),
+                "volumePath": metadata["volumePath"],
+                "network": lease,
+            }
+            manifest_path = paths["snapshot"] / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(manifest_path, 0o600)
+            os.chmod(paths["snapshot"] / "vmstate.snap", 0o444)
+            os.chmod(paths["snapshot"] / "memory.snap", 0o444)
+            status = self.status(instance_id)
+            if status is None:
+                raise RuntimeFailure(f"suspended runtime metadata is missing: {instance_id}")
+            status["snapshotTiming"] = {
+                "totalMs": round((time.monotonic() - started_at) * 1000),
+                "createMs": snapshot_ms,
+            }
+            return status
+        except Exception:
+            shutil.rmtree(paths["snapshot_next"], ignore_errors=True)
+            if paused and process_matches(metadata):
+                try:
+                    self.firecracker_api(paths["socket"], "PATCH", "/vm", {"state": "Resumed"})
+                except RuntimeFailure:
+                    pass
+            try:
+                self.busy(instance_id, False)
+            except (RuntimeFailure, subprocess.SubprocessError):
+                pass
+            raise
+
+    def resume(self, instance_id: str, owner_id: str) -> dict:
+        """使用完整快照恢复实例，并重新建立原网络、Gateway 和生命周期登记。"""
+
+        instance_id = validate_instance_id(instance_id)
+        owner_id = validate_instance_id(owner_id)
+        started_at = time.monotonic()
+        uid, gid, gateway_uid, gateway_gid = self.ensure_host()
+        paths = self.paths(instance_id, owner_id)
+        manifest = self.snapshot_manifest(instance_id)
+        if manifest.get("ownerId") != owner_id:
+            raise RuntimeFailure("snapshot owner does not match the requested user")
+        build_id_path = ARTIFACT_ROOT / "agent-rootfs.build-id"
+        current_build_id = build_id_path.read_text(encoding="utf-8").strip()
+        if manifest.get("rootfsBuildId") != current_build_id:
+            raise RuntimeFailure("snapshot rootfs version is no longer compatible")
+        if str(paths["volume"].resolve()) != str(Path(manifest["volumePath"]).resolve()):
+            raise RuntimeFailure("snapshot data volume does not match the user volume")
+        for snapshot_file in ("vmstate.snap", "memory.snap"):
+            if not (paths["snapshot"] / snapshot_file).is_file():
+                raise RuntimeFailure(f"snapshot file is missing: {snapshot_file}")
+
+        network: dict | None = None
+        sidecars: list[subprocess.Popen[bytes]] = []
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            network = self.network_manager.reserve_snapshot_lease(
+                instance_id, manifest["network"]
+            )
+            self.network_manager.setup(network, uid, (GATEWAY_PORT,))
+
+            paths["state"].mkdir(parents=True, exist_ok=True, mode=0o750)
+            os.chown(paths["state"], 0, gateway_gid)
+            os.chmod(paths["state"], 0o750)
+            paths["activity"].parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            paths["activity"].touch()
+            os.chown(paths["activity"], gateway_uid, gateway_gid)
+            os.chmod(paths["activity"], 0o600)
+            gateway_started = time.monotonic()
+            sidecars = self.start_model_gateway(
+                instance_id, paths, network, gateway_uid, gateway_gid
+            )
+            gateway_ms = round((time.monotonic() - gateway_started) * 1000)
+
+            shutil.rmtree(paths["jail"], ignore_errors=True)
+            paths["chroot"].mkdir(parents=True, mode=0o755)
+            os.link(self.rootfs_source, paths["chroot"] / "rootfs.ext4")
+            os.link(paths["volume"], paths["chroot"] / "data.ext4")
+            jail_snapshot = paths["chroot"] / "snapshot"
+            jail_snapshot.mkdir(mode=0o700)
+            os.chown(jail_snapshot, uid, gid)
+            os.link(paths["snapshot"] / "vmstate.snap", jail_snapshot / "vmstate.snap")
+            os.link(paths["snapshot"] / "memory.snap", jail_snapshot / "memory.snap")
+
+            paths["console"].write_text("", encoding="utf-8")
+            os.chmod(paths["console"], 0o640)
+            console_handle = paths["console"].open("ab", buffering=0)
+            process_started = time.monotonic()
+            process = subprocess.Popen(
+                [
+                    "/usr/local/bin/jailer",
+                    "--id",
+                    instance_id,
+                    "--exec-file",
+                    "/usr/local/bin/firecracker",
+                    "--uid",
+                    str(uid),
+                    "--gid",
+                    str(gid),
+                    "--chroot-base-dir",
+                    str(JAILER_ROOT),
+                    "--cgroup-version",
+                    "2",
+                    "--resource-limit",
+                    "no-file=2048",
+                    "--",
+                    "--api-sock",
+                    "/firecracker.socket",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=console_handle,
+                stderr=subprocess.STDOUT,
+                env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+                start_new_session=True,
+            )
+            console_handle.close()
+            self.wait_for_socket(paths["socket"], process)
+            process_ms = round((time.monotonic() - process_started) * 1000)
+
+            load_started = time.monotonic()
+            self.firecracker_api(
+                paths["socket"],
+                "PUT",
+                "/snapshot/load",
+                {
+                    "snapshot_path": "/snapshot/vmstate.snap",
+                    "mem_backend": {
+                        "backend_path": "/snapshot/memory.snap",
+                        "backend_type": "File",
+                    },
+                    "track_dirty_pages": False,
+                    "resume_vm": False,
+                },
+            )
+            load_ms = round((time.monotonic() - load_started) * 1000)
+            resumed_at = time.monotonic()
+            self.firecracker_api(paths["socket"], "PATCH", "/vm", {"state": "Resumed"})
+            resume_api_ms = round((time.monotonic() - resumed_at) * 1000)
+
+            self.network_manager.activate(instance_id)
+            register_arguments = [
+                "register",
+                instance_id,
+                "--pid",
+                str(process.pid),
+                "--idle-timeout",
+                str(self.idle_timeout_seconds),
+                "--jail-path",
+                str(paths["jail"]),
+                "--api-socket",
+                str(paths["socket"]),
+                "--volume-path",
+                str(paths["volume"]),
+                "--tap-name",
+                str(network["tap"]),
+                "--nft-family",
+                "inet",
+                "--nft-table",
+                str(network["nft_table"]),
+                "--network-database",
+                str(self.state_database),
+                "--network-subnet",
+                str(network["subnet"]),
+                "--host-ip",
+                str(network["host_ip"]),
+                "--guest-ip",
+                str(network["guest_ip"]),
+                "--rpc-port",
+                str(PI_RPC_PORT),
+                "--activity-uid",
+                str(gateway_uid),
+            ]
+            for sidecar in sidecars:
+                register_arguments.extend(["--sidecar-pid", str(sidecar.pid)])
+            self.lifecycle(*register_arguments)
+            self.start_idle_watcher(
+                self.manager,
+                self.state_root,
+                self.state_database,
+                instance_id,
+                paths["reaper"],
+            )
+            threading.Thread(target=process.wait, daemon=True).start()
+            for sidecar in sidecars:
+                threading.Thread(target=sidecar.wait, daemon=True).start()
+            status = self.status(instance_id)
+            if status is None:
+                raise RuntimeFailure("snapshot restore did not register runtime metadata")
+            status["resumeTiming"] = {
+                "totalMs": round((time.monotonic() - started_at) * 1000),
+                "gatewayMs": gateway_ms,
+                "processMs": process_ms,
+                "loadMs": load_ms,
+                "resumeApiMs": resume_api_ms,
+            }
+            return status
+        except Exception as error:
+            if process is not None and process.poll() is None:
+                process.kill()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+            for sidecar in sidecars:
+                self.terminate_process(sidecar)
+            if network is not None:
+                try:
+                    self.network_manager.release(instance_id)
+                except NetworkFailure:
+                    pass
+            shutil.rmtree(paths["jail"], ignore_errors=True)
             if isinstance(error, NetworkFailure):
                 raise RuntimeFailure(str(error)) from error
             raise
@@ -922,6 +1275,7 @@ class InstanceRuntime:
         """停止计算资源但保留实例记录和持久化数据盘。"""
         instance_id = validate_instance_id(instance_id)
         self.lifecycle("stop", instance_id, "--reason", reason)
+        self.discard_snapshot(instance_id)
         status = self.status(instance_id)
         if status is None:
             raise RuntimeFailure(f"instance is not registered: {instance_id}")
@@ -936,3 +1290,4 @@ class InstanceRuntime:
         else:
             shutil.rmtree(paths["jail"], ignore_errors=True)
         shutil.rmtree(paths["state"], ignore_errors=True)
+        self.discard_snapshot(instance_id)

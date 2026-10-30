@@ -82,6 +82,25 @@ class FakeRuntime:
         self.instances[instance_id].update(status="stopped", processAlive=False)
         return dict(self.instances[instance_id])
 
+    def suspend(self, instance_id: str, owner_id: str) -> dict:
+        self.calls.append(("suspend", instance_id))
+        self.instances[instance_id].update(status="stopped", processAlive=False)
+        return {
+            **self.instances[instance_id],
+            "snapshotTiming": {"createMs": 20, "totalMs": 30},
+        }
+
+    def resume(self, instance_id: str, owner_id: str) -> dict:
+        self.calls.append(("resume", instance_id))
+        self.instances[instance_id].update(status="running", processAlive=True)
+        return {
+            **self.instances[instance_id],
+            "resumeTiming": {"loadMs": 5, "totalMs": 25},
+        }
+
+    def discard_snapshot(self, instance_id: str) -> None:
+        self.calls.append(("discard_snapshot", instance_id))
+
     def destroy(self, instance_id: str) -> None:
         """模拟彻底销毁实例及其运行时状态。"""
 
@@ -247,6 +266,22 @@ class ControlPlaneTests(unittest.TestCase):
         with self.assertRaises(SERVER.ApiError) as missing:
             self.control.get("agent-test")
         self.assertEqual(missing.exception.status, 404)
+
+    def test_manual_snapshot_suspend_and_resume(self) -> None:
+        """认证用户可以手动暂停并从快照恢复自己的运行实例。"""
+
+        owner_id = "user-snapshot"
+        self.control.create({"id": "agent-snapshot"}, owner_id)
+        self.control.start("agent-snapshot", owner_id)
+
+        suspended = self.control.suspend("agent-snapshot", owner_id)
+        self.assertEqual(suspended["status"], "suspended")
+        self.assertEqual(suspended["runtime"]["snapshotTiming"]["createMs"], 20)
+
+        resumed = self.control.resume("agent-snapshot", owner_id)
+        self.assertEqual(resumed["status"], "running")
+        self.assertTrue(resumed["runtime"]["processAlive"])
+        self.assertEqual(resumed["runtime"]["resumeTiming"]["loadMs"], 5)
 
     def test_duplicate_and_invalid_ids_are_rejected(self) -> None:
         """ID 必须符合安全字符规则且在数据库中唯一。"""
@@ -548,18 +583,20 @@ class ControlPlaneTests(unittest.TestCase):
         messages = self.control.conversation_messages("agent-chat", conversation["id"])
         self.assertEqual([message["role"] for message in messages], ["user", "assistant", "user"])
         self.assertEqual(messages[1]["content"], "好的，我会记住。")
-        page, next_before, startup_timing = self.control.conversation_messages_page(
+        page, next_before, startup_timing, history_timing = self.control.conversation_messages_page(
             "agent-chat", conversation["id"], 2, None
         )
         self.assertEqual([message["role"] for message in page], ["assistant", "user"])
         self.assertIsInstance(next_before, int)
         self.assertIsNone(startup_timing)
-        older, final_cursor, startup_timing = self.control.conversation_messages_page(
+        self.assertIsInstance(history_timing.get("piSessionLoadMs"), int)
+        older, final_cursor, startup_timing, history_timing = self.control.conversation_messages_page(
             "agent-chat", conversation["id"], 2, next_before
         )
         self.assertEqual([message["role"] for message in older], ["user"])
         self.assertIsNone(final_cursor)
         self.assertIsNone(startup_timing)
+        self.assertIsInstance(history_timing.get("piSessionLoadMs"), int)
         listed = self.control.list_conversations("agent-chat")
         self.assertEqual(listed[0]["title"], "请记住我的代号是 Alpha")
 

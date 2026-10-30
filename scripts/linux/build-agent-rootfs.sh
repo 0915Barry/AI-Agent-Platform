@@ -114,8 +114,41 @@ STATIC_SECURITY_VERIFIED=1
 EOF
 }
 
+ensure_clean_rootfs() {
+  local check_status repaired_path repair_status
+  repaired_path="${rootfs_path}.repairing"
+
+  # 系统盘以只读方式交给 Guest。只读 ext4 无法回放未完成的日志，因此即使
+  # Build ID 没有变化，也必须先确认镜像处于可直接只读挂载的干净状态。
+  set +e
+  e2fsck -f -n "${rootfs_path}" >/dev/null 2>&1
+  check_status=$?
+  set -e
+  if [[ "${check_status}" -le 1 ]]; then
+    return 0
+  fi
+
+  # 不在公共 inode 上直接修复：它可能仍被正在运行的 Jailer 通过硬链接读取。
+  # 修复独立副本后原子替换路径，已有实例继续使用旧 inode，新实例使用干净副本。
+  rm -f "${repaired_path}"
+  cp --reflink=auto --sparse=always "${rootfs_path}" "${repaired_path}"
+  set +e
+  e2fsck -f -y "${repaired_path}" >/dev/null
+  repair_status=$?
+  set -e
+  if [[ "${repair_status}" -gt 1 ]]; then
+    rm -f "${repaired_path}"
+    echo "Rootfs filesystem repair failed with status ${repair_status}" >&2
+    return "${repair_status}"
+  fi
+  chmod 0644 "${repaired_path}"
+  mv "${repaired_path}" "${rootfs_path}"
+  echo "Repaired runtime rootfs filesystem state: ${rootfs_path}"
+}
+
 if [[ -f "${rootfs_path}" && -f "${build_id_path}" && -f "${runtime_dir}/config.json" ]] \
   && [[ "$(<"${build_id_path}")" == "${build_id}" ]]; then
+  ensure_clean_rootfs
   echo "Verified existing runtime rootfs: ${rootfs_path}"
   echo "Build ID: ${build_id}"
   exit 0

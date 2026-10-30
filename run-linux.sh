@@ -38,6 +38,7 @@ Commands:
   agent-task-smoke-test Verify host Pi Gateway with a real DeepSeek task
   cli-smoke-test        Verify the authenticated agentctl lifecycle and resumed chat
   recovery-smoke-test   Verify Control Plane restart and Firecracker crash recovery
+  snapshot-smoke-test   Verify full snapshot creation and Pi RPC restore
   control-plane-start   Start the loopback-only HTTP API
   control-plane-stop    Stop the API; running instances remain managed
   control-plane-status  Show whether the API service is running
@@ -151,6 +152,10 @@ case "${command}" in
   recovery-smoke-test)
     build_rootfs
     sudo "${repo_dir}/scripts/linux/recovery-smoke-test.sh"
+    ;;
+  snapshot-smoke-test)
+    build_rootfs
+    sudo "${repo_dir}/scripts/linux/snapshot-smoke-test.sh"
     ;;
   control-plane-start)
     build_rootfs

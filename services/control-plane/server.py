@@ -51,7 +51,7 @@ INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 # SQLite 查询或文件系统路径之前拦截路径穿越和意外字符。格式校验并不等于权限
 # 校验：资源归属仍由 authorize_instance() 和 WorkspaceStore 分别检查。
 INSTANCE_ROUTE_RE = re.compile(
-    r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})(?:/(start|stop|heartbeat))?$"
+    r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})(?:/(start|stop|suspend|resume|heartbeat))?$"
 )
 TASK_COLLECTION_ROUTE_RE = re.compile(
     r"^/api/instances/([a-z0-9][a-z0-9-]{0,62})/tasks$"
@@ -200,7 +200,12 @@ class InstanceStore:
         if not records:
             return None
         return next(
-            (record for record in records if record["status"] in {"starting", "running"}),
+            (
+                record
+                for record in records
+                if record["status"]
+                in {"starting", "running", "suspending", "suspended", "resuming"}
+            ),
             records[0],
         )
 
@@ -482,7 +487,13 @@ class ControlPlane:
         例如独立 idle watcher 已停止实例，但控制面进程当时并未收到事件；下一次
         GET/LIST 会在这里把 running 自动修正为 stopped。
         """
-        if record["status"] not in {"running", "starting", "stopping"}:
+        if record["status"] not in {
+            "running",
+            "starting",
+            "stopping",
+            "suspending",
+            "resuming",
+        }:
             return record
         runtime_status = self.runtime.status(record["id"])
         if runtime_status is None:
@@ -508,7 +519,9 @@ class ControlPlane:
             record = self.get(instance_id)
             if record["status"] == "running":
                 raise ApiError(409, "instance_running", f"instance is already running: {instance_id}")
-            if record["status"] in {"starting", "stopping"}:
+            if record["status"] == "suspended":
+                raise ApiError(409, "instance_suspended", "实例已有快照，请使用 resume 恢复")
+            if record["status"] in {"starting", "stopping", "suspending", "resuming"}:
                 raise ApiError(409, "instance_busy", f"instance is currently {record['status']}: {instance_id}")
             if owner_id is None:
                 self.store.update(instance_id, "starting")
@@ -517,7 +530,7 @@ class ControlPlane:
                     # 先校准同一用户可能已被空闲回收器关闭的实例，再计算运行配额。
                     self.list(owner_id)
                     if self.store.count_for_owner(
-                        owner_id, ("starting", "running")
+                        owner_id, ("starting", "running", "resuming")
                     ) >= MAX_RUNNING_INSTANCES_PER_USER:
                         raise ApiError(
                             409,
@@ -540,8 +553,11 @@ class ControlPlane:
             record = self.get(instance_id)
             if record["status"] in {"created", "stopped", "failed"}:
                 raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
-            if record["status"] in {"starting", "stopping"}:
+            if record["status"] in {"starting", "stopping", "suspending", "resuming"}:
                 raise ApiError(409, "instance_busy", f"instance is currently {record['status']}: {instance_id}")
+            if record["status"] == "suspended":
+                self.runtime.discard_snapshot(instance_id)
+                return self.store.update(instance_id, "stopped")
             self.store.update(instance_id, "stopping")
             try:
                 runtime_status = self.runtime.stop(instance_id)
@@ -550,6 +566,54 @@ class ControlPlane:
                 raise ApiError(500, "instance_stop_failed", str(error)) from error
             self.tasks.fail_running(instance_id, "instance stopped before task completed")
             return {**self.store.update(instance_id, "stopped"), "runtime": runtime_status}
+
+    def suspend(self, instance_id: str, owner_id: str | None) -> dict[str, Any]:
+        """手动执行 running → suspending → suspended，并保留用户数据盘。"""
+
+        instance_id = self.validate_requested_id(instance_id)
+        if owner_id is None:
+            raise ApiError(400, "snapshot_owner_required", "快照暂停需要已认证用户")
+        with self.lock_for(instance_id):
+            record = self.get(instance_id)
+            if record["status"] != "running":
+                raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
+            if self.tasks.instance_has_active_tasks(instance_id):
+                raise ApiError(409, "instance_busy", "实例仍有正在排队或执行的任务")
+            self.store.update(instance_id, "suspending")
+            try:
+                runtime_status = self.runtime.suspend(instance_id, owner_id)
+            except (RuntimeFailure, OSError, subprocess.SubprocessError) as error:
+                self.store.update(instance_id, "running", str(error)[-4000:])
+                raise ApiError(500, "instance_suspend_failed", str(error)) from error
+            return {**self.store.update(instance_id, "suspended"), "runtime": runtime_status}
+
+    def resume(self, instance_id: str, owner_id: str | None) -> dict[str, Any]:
+        """手动执行 suspended → resuming → running。"""
+
+        instance_id = self.validate_requested_id(instance_id)
+        if owner_id is None:
+            raise ApiError(400, "snapshot_owner_required", "快照恢复需要已认证用户")
+        with self.lock_for(instance_id):
+            record = self.store.get(instance_id)
+            if record["status"] != "suspended":
+                raise ApiError(409, "instance_not_suspended", f"instance is not suspended: {instance_id}")
+            with self._quota_guard:
+                self.list(owner_id)
+                if self.store.count_for_owner(
+                    owner_id, ("starting", "running", "resuming")
+                ) >= MAX_RUNNING_INSTANCES_PER_USER:
+                    raise ApiError(
+                        409,
+                        "running_quota_exceeded",
+                        f"每个用户最多同时运行 {MAX_RUNNING_INSTANCES_PER_USER} 个实例",
+                    )
+                self.store.update(instance_id, "resuming")
+            try:
+                runtime_status = self.runtime.resume(instance_id, owner_id)
+            except (RuntimeFailure, OSError, subprocess.SubprocessError) as error:
+                self.store.update(instance_id, "suspended", str(error)[-4000:])
+                raise ApiError(500, "instance_resume_failed", str(error)) from error
+            return {**self.store.update(instance_id, "running"), "runtime": runtime_status}
 
     def heartbeat(self, instance_id: str) -> dict[str, Any]:
         """仅允许 running 实例刷新活动时间。"""
@@ -673,12 +737,12 @@ class ControlPlane:
         instance_id: str,
         conversation: dict[str, Any],
         owner_id: str | None,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, int]]:
         """启动必要的计算资源，并通过 Pi RPC 读取数据盘中的原生 Session。"""
 
         if self.pi_gateway is None:
             # 纯本地单元测试或旧服务没有 Gateway 时保留兼容查询路径。
-            return self.tasks.list_messages(instance_id, conversation["id"]), None
+            return self.tasks.list_messages(instance_id, conversation["id"]), None, {}
         if self.tasks.instance_has_active_tasks(instance_id):
             raise ApiError(409, "instance_busy", "实例正在执行任务，暂时无法读取会话历史")
         record = self.get(instance_id)
@@ -708,9 +772,20 @@ class ControlPlane:
             raise ApiError(500, "session_route_invalid", "Pi Session route is incomplete")
         try:
             self.runtime.heartbeat(instance_id)
+            # PI_SESSION_TIMING_DIAGNOSTIC_BEGIN
+            # 这段时间覆盖 Host 建立 TCP 连接、socat 启动 Guest 会话
+            # 脚本、Pi 进程启动并加载原生 Session，直到 get_messages
+            # 响应返回。它用于定位当前“打开旧会话”的等待时间。
+            history_started_ns = time.monotonic_ns()
             source = self.pi_gateway.get_messages(
                 guest_ip, rpc_port, workspace_id, session_id
             )
+            history_timing = {
+                "piSessionLoadMs": max(
+                    0, (time.monotonic_ns() - history_started_ns) // 1_000_000
+                )
+            }
+            # PI_SESSION_TIMING_DIAGNOSTIC_END
         except (PiGatewayError, RuntimeFailure, OSError) as error:
             raise ApiError(502, "session_read_failed", str(error)) from error
 
@@ -737,7 +812,7 @@ class ControlPlane:
                     "createdAt": created_at,
                 }
             )
-        return messages, startup_timing
+        return messages, startup_timing, history_timing
 
     def conversation_messages(
         self, instance_id: str, conversation_id: str, owner_id: str | None = None
@@ -747,7 +822,7 @@ class ControlPlane:
         try:
             conversation = self.tasks.get_conversation(instance_id, conversation_id)
             if conversation["sessionBackend"] == "pi-native":
-                messages, _ = self._native_conversation_messages(
+                messages, _, _ = self._native_conversation_messages(
                     instance_id, conversation, owner_id
                 )
                 return messages
@@ -762,7 +837,12 @@ class ControlPlane:
         limit: int,
         before_sequence: int | None,
         owner_id: str | None = None,
-    ) -> tuple[list[dict[str, Any]], int | None, dict[str, Any] | None]:
+    ) -> tuple[
+        list[dict[str, Any]],
+        int | None,
+        dict[str, Any] | None,
+        dict[str, int] | None,
+    ]:
         """为终端和页面返回有上限的历史消息，避免长会话被一次性载入。"""
 
         instance_id = self.validate_requested_id(instance_id)
@@ -773,8 +853,8 @@ class ControlPlane:
                 messages, next_before = self.tasks.list_messages_page(
                     instance_id, conversation_id, limit, before_sequence
                 )
-                return messages, next_before, None
-            messages, startup_timing = self._native_conversation_messages(
+                return messages, next_before, None, None
+            messages, startup_timing, history_timing = self._native_conversation_messages(
                 instance_id, conversation, owner_id
             )
             eligible = [
@@ -784,7 +864,7 @@ class ControlPlane:
             ]
             selected = eligible[-limit:]
             next_before = selected[0]["sequence"] if len(eligible) > limit and selected else None
-            return selected, next_before, startup_timing
+            return selected, next_before, startup_timing, history_timing
         except TaskStoreError as error:
             raise ApiError(404, "conversation_not_found", str(error)) from error
 
@@ -1159,12 +1239,14 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                             "invalid_message_cursor",
                             "limit must be 1-100 and before must be positive",
                         )
-                    messages, next_before, startup_timing = self.control.conversation_messages_page(
+                    messages, next_before, startup_timing, history_timing = (
+                        self.control.conversation_messages_page(
                         instance_id,
                         conversation_id,
                         limit,
                         before,
                         user["id"] if user is not None else None,
+                        )
                     )
                     self.send_payload(
                         200,
@@ -1172,6 +1254,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                             "messages": messages,
                             "nextBefore": next_before,
                             "startupTiming": startup_timing,
+                            "historyTiming": history_timing,
                         },
                     )
                 else:
@@ -1314,6 +1397,16 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 )
             elif action == "stop":
                 self.send_payload(200, self.control.stop(instance_id))
+            elif action == "suspend":
+                self.send_payload(
+                    200,
+                    self.control.suspend(instance_id, user["id"] if user is not None else None),
+                )
+            elif action == "resume":
+                self.send_payload(
+                    200,
+                    self.control.resume(instance_id, user["id"] if user is not None else None),
+                )
             elif action == "heartbeat":
                 self.send_payload(200, self.control.heartbeat(instance_id))
             else:

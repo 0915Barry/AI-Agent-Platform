@@ -104,6 +104,15 @@ class NetworkManagerTests(unittest.TestCase):
         with self.assertRaises(LeaseConflict):
             self.store.reserve(duplicate)
 
+    def test_snapshot_restore_reserves_the_original_slot(self) -> None:
+        original = self.manager.allocate("agent-snapshot")
+        self.manager.setup(original, 999, (18082,))
+        self.manager.release("agent-snapshot")
+
+        restored = self.manager.reserve_snapshot_lease("agent-snapshot", original)
+        self.assertEqual(restored["slot"], original["slot"])
+        self.assertEqual(restored["guest_ip"], original["guest_ip"])
+
     def test_host_rpc_replies_are_opt_in_and_forwarding_stays_blocked(self) -> None:
         lease = self.manager.allocate("agent-rpc")
         default_rules = self.manager.network._build_firewall_rules(lease, (18082,))

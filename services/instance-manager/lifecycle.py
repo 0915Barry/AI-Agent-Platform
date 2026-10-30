@@ -152,16 +152,17 @@ def wait_for_exit(metadata: dict, seconds: float) -> bool:
     return not process_matches(metadata)
 
 
-def stop_process(metadata: dict) -> str:
+def stop_process(metadata: dict, *, guest_shutdown: bool = True) -> str:
     """按 guest shutdown → SIGTERM → SIGKILL 的顺序停止 VMM。"""
     if not process_matches(metadata):
         return "already-exited"
 
     pid = int(metadata["pid"])
     api_socket = Path(metadata["apiSocket"])
-    graceful_requested = request_guest_shutdown(api_socket)
-    if graceful_requested and wait_for_exit(metadata, 3):
-        return "guest-shutdown"
+    if guest_shutdown:
+        graceful_requested = request_guest_shutdown(api_socket)
+        if graceful_requested and wait_for_exit(metadata, 3):
+            return "guest-shutdown"
 
     if process_matches(metadata):
         try:
@@ -239,10 +240,17 @@ def cleanup_ephemeral(metadata: dict, state_root: Path) -> None:
     shutil.rmtree(jail_path, ignore_errors=True)
 
 
-def stop_instance(store: RuntimeStore, state_root: Path, instance_id: str, reason: str) -> dict:
+def stop_instance(
+    store: RuntimeStore,
+    state_root: Path,
+    instance_id: str,
+    reason: str,
+    *,
+    guest_shutdown: bool = True,
+) -> dict:
     """停止实例、清理临时资源，并保留可供重启的数据盘和元数据。"""
     metadata = load_metadata(store, state_root, instance_id)
-    stop_method = stop_process(metadata)
+    stop_method = stop_process(metadata, guest_shutdown=guest_shutdown)
     stop_sidecars(metadata)
     cleanup_ephemeral(metadata, state_root)
     metadata.update(
@@ -253,7 +261,17 @@ def stop_instance(store: RuntimeStore, state_root: Path, instance_id: str, reaso
             "stoppedAt": int(time.time()),
         }
     )
-    return store.save(metadata)
+    stopped = store.save(metadata)
+    if reason != "suspended":
+        snapshot_root = Path("/srv/fc/snapshots/instances")
+        for candidate in (
+            snapshot_root / instance_id,
+            snapshot_root / f"{instance_id}.next",
+        ):
+            if candidate.parent.resolve() != snapshot_root.resolve():
+                raise SystemExit(f"refusing to clean unexpected snapshot path: {candidate}")
+            shutil.rmtree(candidate, ignore_errors=True)
+    return stopped
 
 
 def command_register(args: argparse.Namespace) -> None:
@@ -410,7 +428,13 @@ def command_stop(args: argparse.Namespace) -> None:
     if os.geteuid() != 0:
         raise SystemExit("stop must run as root")
     instance_id = validate_instance_id(args.instance_id)
-    stopped = stop_instance(RuntimeStore(args.database), args.state_root, instance_id, args.reason)
+    stopped = stop_instance(
+        RuntimeStore(args.database),
+        args.state_root,
+        instance_id,
+        args.reason,
+        guest_shutdown=not args.skip_guest_shutdown,
+    )
     print(
         f"INSTANCE_STOPPED id={instance_id} reason={args.reason} "
         f"stop={stopped['stopMethod']} volume=preserved"
@@ -488,6 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
     stop = commands.add_parser("stop")
     stop.add_argument("instance_id")
     stop.add_argument("--reason", default="manual")
+    stop.add_argument("--skip-guest-shutdown", action="store_true")
     stop.set_defaults(handler=command_stop)
 
     destroy = commands.add_parser("destroy")

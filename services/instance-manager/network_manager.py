@@ -671,6 +671,35 @@ class NetworkManager:
 
         raise NetworkFailure(f"no free network slot remains in {self.address_pool.network}")
 
+    def reserve_snapshot_lease(self, instance_id: str, lease: dict) -> dict:
+        """为快照恢复重新预留原来的网络槽位。
+
+        Guest 的 IP、MAC 和虚拟网卡状态已经保存在 Firecracker 快照中，恢复时
+        不能改用另一个槽位。SQLite 唯一约束会在该槽位已被占用时拒绝恢复。
+        """
+
+        if self.store.get(instance_id) is not None:
+            raise NetworkFailure(f"instance already has a network lease: {instance_id}")
+        slot = int(lease["slot"])
+        expected = self.address_pool.build_lease(instance_id, slot)
+        comparable = (
+            "subnet",
+            "host_ip",
+            "host_cidr",
+            "guest_ip",
+            "guest_cidr",
+            "guest_mac",
+            "tap",
+            "nft_table",
+            "nft_family",
+        )
+        for field in comparable:
+            if str(lease.get(field)) != str(expected[field]):
+                raise NetworkFailure(f"snapshot network lease mismatch: {field}")
+        if not self.network.resources_are_free(expected):
+            raise NetworkFailure(f"snapshot network slot is not free: {expected['subnet']}")
+        return self.store.reserve(expected)
+
     def setup(self, lease: dict, firecracker_uid: int, allowed_host_ports: tuple[int, ...]) -> None:
         """根据已经分配的租约创建真实网络，并在创建失败时处理租约记录。失败时释放租约或保留 error 记录。"""
         instance_id = str(lease["instance_id"])

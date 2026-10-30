@@ -53,6 +53,7 @@ Commands:
   agent-task-smoke-test  Verify host Pi Gateway with a real DeepSeek task
   cli-smoke-test         Verify authenticated agentctl lifecycle and resumed chat
   recovery-smoke-test    Verify Control Plane restart and Firecracker crash recovery
+  snapshot-smoke-test    Verify full snapshot creation and Pi RPC restore
   control-plane-start    Start the loopback-only API in the Linux VM
   control-plane-stop     Stop the API; running instances remain managed
   control-plane-status   Show whether the API service is running
@@ -389,6 +390,18 @@ smoke_test_recovery() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/recovery-smoke-test.sh'"
 }
 
+smoke_test_snapshot() {
+  sync_repo
+  echo "Building and testing Firecracker snapshot restore in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/snapshot-smoke-test.sh'"
+}
+
 control_plane_service() {
   action="$1"
   require_vm_host
@@ -508,6 +521,9 @@ case "${command}" in
     ;;
   recovery-smoke-test)
     smoke_test_recovery
+    ;;
+  snapshot-smoke-test)
+    smoke_test_snapshot
     ;;
   control-plane-start)
     control_plane_service start

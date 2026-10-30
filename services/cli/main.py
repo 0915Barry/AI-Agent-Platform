@@ -575,6 +575,14 @@ def fetch_history(
 
 def render_history(payload: dict[str, Any], console: Console) -> None:
     render_startup_timing(payload.get("startupTiming"), console)
+    # PI_SESSION_TIMING_DIAGNOSTIC_BEGIN
+    history_timing = payload.get("historyTiming")
+    if isinstance(history_timing, dict):
+        milliseconds = history_timing.get("piSessionLoadMs")
+        if isinstance(milliseconds, int):
+            console.timing("[会话加载耗时]")
+            console.timing(f"Pi进程启动并加载原生Session = {milliseconds} ms")
+    # PI_SESSION_TIMING_DIAGNOSTIC_END
     messages = payload.get("messages", [])
     if not messages:
         console.warning("该页没有消息")
@@ -598,6 +606,41 @@ def command_stop(args: argparse.Namespace, store: SessionStore, console: Console
     console.system(f"正在停止实例 {args.instance_id}……")
     instance, _ = client.json("POST", f"/api/instances/{args.instance_id}/stop", {})
     console.success(f"实例已停止，数据盘保留：{instance['id']}")
+
+
+def command_suspend(args: argparse.Namespace, store: SessionStore, console: Console) -> None:
+    client = authenticated_client(args, store)
+    console.system(f"正在暂停实例并创建快照 {args.instance_id}……")
+    instance, _ = client.json("POST", f"/api/instances/{args.instance_id}/suspend", {})
+    timing = instance.get("runtime", {}).get("snapshotTiming", {})
+    console.success(f"实例已暂停：{instance['id']}")
+    if isinstance(timing, dict):
+        console.timing("[快照创建耗时]")
+        if isinstance(timing.get("createMs"), int):
+            console.timing(f"Firecracker生成快照 = {timing['createMs']} ms")
+        if isinstance(timing.get("totalMs"), int):
+            console.timing(f"暂停总耗时 = {timing['totalMs']} ms")
+
+
+def command_resume(args: argparse.Namespace, store: SessionStore, console: Console) -> None:
+    client = authenticated_client(args, store)
+    console.system(f"正在从快照恢复实例 {args.instance_id}……")
+    instance, _ = client.json("POST", f"/api/instances/{args.instance_id}/resume", {})
+    timing = instance.get("runtime", {}).get("resumeTiming", {})
+    console.success(f"实例已恢复：{instance['id']}")
+    if isinstance(timing, dict):
+        labels = (
+            ("模型网关启动", "gatewayMs"),
+            ("Firecracker进程就绪", "processMs"),
+            ("快照加载", "loadMs"),
+            ("Guest恢复运行", "resumeApiMs"),
+            ("快照恢复总耗时", "totalMs"),
+        )
+        console.timing("[快照恢复耗时]")
+        for label, key in labels:
+            if isinstance(timing.get(key), int):
+                console.timing(f"{label} = {timing[key]} ms")
+    print_instance(instance, console)
 
 
 def command_destroy(args: argparse.Namespace, store: SessionStore, console: Console) -> None:
@@ -920,6 +963,20 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="示例：./agentctl stop cli-demo",
     )
     stop.add_argument("instance_id", metavar="INSTANCE_ID", help="要停止的实例 ID")
+    suspend = commands.add_parser(
+        "suspend",
+        help="快照暂停实例：suspend INSTANCE_ID",
+        description="创建完整 Firecracker 快照并释放计算与临时网络资源，数据盘保持锁定配对。",
+        epilog="示例：./agentctl suspend cli-demo",
+    )
+    suspend.add_argument("instance_id", metavar="INSTANCE_ID", help="要暂停的实例 ID")
+    resume = commands.add_parser(
+        "resume",
+        help="从快照恢复实例：resume INSTANCE_ID",
+        description="恢复暂停时的内存和设备状态，并重新建立原网络槽位与模型网关。",
+        epilog="示例：./agentctl resume cli-demo",
+    )
+    resume.add_argument("instance_id", metavar="INSTANCE_ID", help="要恢复的实例 ID")
     destroy = commands.add_parser(
         "destroy",
         help="销毁实例：destroy INSTANCE_ID",
@@ -942,6 +999,8 @@ COMMANDS = {
     "history": command_history,
     "chat": command_chat,
     "stop": command_stop,
+    "suspend": command_suspend,
+    "resume": command_resume,
     "destroy": command_destroy,
 }
 

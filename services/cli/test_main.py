@@ -221,6 +221,26 @@ class AgentCtlTests(unittest.TestCase):
             ],
         )
 
+    def test_pi_session_load_timing_is_rendered_before_history(self) -> None:
+        output = io.StringIO()
+        console = cli.Console(False, output)
+        cli.render_history(
+            {
+                "historyTiming": {"piSessionLoadMs": 4876},
+                "messages": [],
+                "nextBefore": None,
+            },
+            console,
+        )
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                "[会话加载耗时]",
+                "Pi进程启动并加载原生Session = 4876 ms",
+                "[警告] 该页没有消息",
+            ],
+        )
+
     def test_menu_preview_uses_ten_characters(self) -> None:
         self.assertEqual(cli.menu_preview("一二三四五六七八九十十一"), "一二三四五六七八九十…")
         self.assertEqual(cli.menu_preview(""), "暂无消息")

@@ -211,8 +211,15 @@ macOS 使用前应先运行 `./run.sh start`，并在另一个终端保持 `./ru
 
 ```bash
 ./agentctl status
+./agentctl start <instance-id>
+./agentctl suspend <instance-id>
+./agentctl resume <instance-id>
 ./agentctl stop <instance-id>
 ```
+
+`suspend`只允许空闲的运行实例执行：平台创建完整 Firecracker 快照后释放 VMM、
+TAP、nftables 和模型网关，但保留并锁定配套用户数据盘。`resume`必须重新取得快照
+记录的原网络槽位，并校验用户、数据盘和 rootfs Build ID；任一条件不一致都会拒绝恢复。
 
 用户持久盘不随运行实例停止或销毁而删除。不支持 ANSI 颜色的终端可用：
 
@@ -253,6 +260,7 @@ CLI 默认连接 `http://127.0.0.1:18090`，也可使用 `--base-url` 或 `AAP_B
 | Host Pi Gateway | `./run.sh agent-task-smoke-test` | `./run-linux.sh agent-task-smoke-test` |
 | 终端完整链路 | `./run.sh cli-smoke-test` | `./run-linux.sh cli-smoke-test` |
 | 异常恢复 | `./run.sh recovery-smoke-test` | `./run-linux.sh recovery-smoke-test` |
+| 快照恢复 | `./run.sh snapshot-smoke-test` | `./run-linux.sh snapshot-smoke-test` |
 
 网络租约成功标志：
 
@@ -281,6 +289,13 @@ CLI_SMOKE_READY auth=session lifecycle=create,start,stop,restart,destroy convers
 ```text
 PASS: Control Plane restart and Firecracker crash recovery preserved instance data
 RECOVERY_READY control_plane=reconnected firecracker_crash=reaped state=reconciled network=clean data=preserved restart=verified
+```
+
+快照恢复成功标志：
+
+```text
+PASS: Firecracker restored Pi RPC from a full snapshot with its paired data volume
+SNAPSHOT_RESTORE_READY type=full ... data=preserved network=reconnected
 ```
 
 ## Control Plane 与 Pi Gateway
@@ -430,4 +445,5 @@ Pi Agent 的版本与校验值统一维护在 `config/versions.env`。
 ## 项目文档
 
 规划与架构文档位于 [`docs/`](./docs/README.md)。README 只维护当前代码可执行的环境
-搭建、运行和验收方法；尚未实现的快照、预热池、生产集群等设计不作为当前命令承诺。
+搭建、运行和验收方法。当前只实现手动快照暂停与恢复；自动快照策略、预热池和生产
+集群仍属于后续设计，不作为当前命令承诺。
