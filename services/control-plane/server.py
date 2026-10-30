@@ -673,17 +673,21 @@ class ControlPlane:
         instance_id: str,
         conversation: dict[str, Any],
         owner_id: str | None,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         """启动必要的计算资源，并通过 Pi RPC 读取数据盘中的原生 Session。"""
 
         if self.pi_gateway is None:
             # 纯本地单元测试或旧服务没有 Gateway 时保留兼容查询路径。
-            return self.tasks.list_messages(instance_id, conversation["id"])
+            return self.tasks.list_messages(instance_id, conversation["id"]), None
         if self.tasks.instance_has_active_tasks(instance_id):
             raise ApiError(409, "instance_busy", "实例正在执行任务，暂时无法读取会话历史")
         record = self.get(instance_id)
+        startup_timing = None
         if record["status"] != "running" and owner_id is not None:
             record = self.start(instance_id, owner_id)
+            runtime = record.get("runtime")
+            if isinstance(runtime, dict) and isinstance(runtime.get("startupTiming"), dict):
+                startup_timing = runtime["startupTiming"]
         if record["status"] != "running":
             raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
         runtime_status = self.runtime.status(instance_id)
@@ -733,7 +737,7 @@ class ControlPlane:
                     "createdAt": created_at,
                 }
             )
-        return messages
+        return messages, startup_timing
 
     def conversation_messages(
         self, instance_id: str, conversation_id: str, owner_id: str | None = None
@@ -743,7 +747,10 @@ class ControlPlane:
         try:
             conversation = self.tasks.get_conversation(instance_id, conversation_id)
             if conversation["sessionBackend"] == "pi-native":
-                return self._native_conversation_messages(instance_id, conversation, owner_id)
+                messages, _ = self._native_conversation_messages(
+                    instance_id, conversation, owner_id
+                )
+                return messages
             return self.tasks.list_messages(instance_id, conversation_id)
         except TaskStoreError as error:
             raise ApiError(404, "conversation_not_found", str(error)) from error
@@ -755,7 +762,7 @@ class ControlPlane:
         limit: int,
         before_sequence: int | None,
         owner_id: str | None = None,
-    ) -> tuple[list[dict[str, Any]], int | None]:
+    ) -> tuple[list[dict[str, Any]], int | None, dict[str, Any] | None]:
         """为终端和页面返回有上限的历史消息，避免长会话被一次性载入。"""
 
         instance_id = self.validate_requested_id(instance_id)
@@ -763,10 +770,13 @@ class ControlPlane:
         try:
             conversation = self.tasks.get_conversation(instance_id, conversation_id)
             if conversation["sessionBackend"] == "database":
-                return self.tasks.list_messages_page(
+                messages, next_before = self.tasks.list_messages_page(
                     instance_id, conversation_id, limit, before_sequence
                 )
-            messages = self._native_conversation_messages(instance_id, conversation, owner_id)
+                return messages, next_before, None
+            messages, startup_timing = self._native_conversation_messages(
+                instance_id, conversation, owner_id
+            )
             eligible = [
                 message
                 for message in messages
@@ -774,7 +784,7 @@ class ControlPlane:
             ]
             selected = eligible[-limit:]
             next_before = selected[0]["sequence"] if len(eligible) > limit and selected else None
-            return selected, next_before
+            return selected, next_before, startup_timing
         except TaskStoreError as error:
             raise ApiError(404, "conversation_not_found", str(error)) from error
 
@@ -799,10 +809,14 @@ class ControlPlane:
         if len(content.encode("utf-8")) > 16384:
             raise ApiError(413, "message_too_large", "message content exceeds 16 KiB")
         record = self.get(instance_id)
+        startup_timing = None
         # 把实例生命周期隐藏在聊天接口后面：用户关注会话，Control Plane 负责确保
         # 承载该用户数据盘的 microVM 已经可用。
         if record["status"] != "running" and owner_id is not None:
             record = self.start(instance_id, owner_id)
+            runtime = record.get("runtime")
+            if isinstance(runtime, dict) and isinstance(runtime.get("startupTiming"), dict):
+                startup_timing = runtime["startupTiming"]
         if record["status"] != "running":
             raise ApiError(409, "instance_not_running", f"instance is not running: {instance_id}")
         try:
@@ -815,6 +829,11 @@ class ControlPlane:
                 conversation_id,
                 content,
             )
+            if startup_timing is not None:
+                # STARTUP_TIMING_DIAGNOSTIC: 让本次冷启动耗时先于模型事件进入 SSE。
+                self.tasks.append_event(
+                    instance_id, task["id"], "startup_timing", startup_timing
+                )
             self.schedule_tasks(instance_id)
             return task
         except TaskStoreError as error:
@@ -1140,7 +1159,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                             "invalid_message_cursor",
                             "limit must be 1-100 and before must be positive",
                         )
-                    messages, next_before = self.control.conversation_messages_page(
+                    messages, next_before, startup_timing = self.control.conversation_messages_page(
                         instance_id,
                         conversation_id,
                         limit,
@@ -1149,7 +1168,11 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                     )
                     self.send_payload(
                         200,
-                        {"messages": messages, "nextBefore": next_before},
+                        {
+                            "messages": messages,
+                            "nextBefore": next_before,
+                            "startupTiming": startup_timing,
+                        },
                     )
                 else:
                     self.send_payload(200, self.control.get_conversation(instance_id, conversation_id))

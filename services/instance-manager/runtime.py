@@ -70,6 +70,85 @@ def load_version(name: str) -> str:
     raise RuntimeFailure(f"missing {name} in {versions_path}")
 
 
+# STARTUP_TIMING_DIAGNOSTIC_BEGIN
+# 临时启动性能诊断。后续完成优化后，可按 STARTUP_TIMING_DIAGNOSTIC 全局搜索，
+# 删除本类以及 start() 中对应的 mark()/emit() 调用，不影响实例业务逻辑。
+class StartupTimingDiagnostic:
+    """按启动阶段输出一行可机器检索的毫秒级耗时。"""
+
+    STAGES = (
+        "ensure_host_ms",
+        "volume_create_ms",
+        "e2fsck_ms",
+        "network_allocate_ms",
+        "volume_config_ms",
+        "network_setup_ms",
+        "gateway_ready_ms",
+        "jail_prepare_ms",
+        "guest_ready_ms",
+        "lifecycle_ms",
+    )
+
+    def __init__(self, instance_id: str) -> None:
+        self.instance_id = instance_id
+        self.started_at = time.monotonic()
+        self.previous_at = self.started_at
+        self.values = {stage: 0 for stage in self.STAGES}
+        self.emitted = False
+        self.result: dict | None = None
+
+    def mark(self, stage: str) -> None:
+        now = time.monotonic()
+        self.values[stage] = round((now - self.previous_at) * 1000)
+        self.previous_at = now
+
+    def emit(self, outcome: str, guest: dict[str, int] | None = None) -> dict:
+        if self.emitted:
+            return self.result or {}
+        self.emitted = True
+        total_ms = round((time.monotonic() - self.started_at) * 1000)
+        self.result = {
+            "outcome": outcome,
+            "totalMs": total_ms,
+            "host": dict(self.values),
+            "guest": dict(guest or {}),
+        }
+        stage_values = " ".join(f"{name}={self.values[name]}" for name in self.STAGES)
+        print(
+            f"INSTANCE_START_TIMING instance={self.instance_id} outcome={outcome} "
+            f"{stage_values} total_ms={total_ms}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return self.result
+
+
+def parse_guest_startup_timing(console: str) -> dict[str, int]:
+    """从 Guest 串口日志提取临时启动计时，不解析其他不可信输出。"""
+
+    result: dict[str, int] = {}
+    for line in console.splitlines():
+        if not line.startswith("GUEST_START_TIMING "):
+            continue
+        fields: dict[str, str] = {}
+        for token in line.split()[1:]:
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+        stage = fields.get("stage")
+        value = fields.get("total_ms" if stage == "complete" else "delta_ms")
+        if stage is None or value is None:
+            continue
+        try:
+            result["total_ms" if stage == "complete" else stage] = int(value)
+        except ValueError:
+            continue
+    return result
+
+
+# STARTUP_TIMING_DIAGNOSTIC_END
+
+
 class InstanceRuntime:
     """一台 Ubuntu KVM 宿主上的 Firecracker 实例运行时。"""
 
@@ -584,7 +663,10 @@ class InstanceRuntime:
         watcher 仍会在 5 分钟无活动后回收计算资源。
         """
         instance_id = validate_instance_id(instance_id)
+        # STARTUP_TIMING_DIAGNOSTIC: 启动链路计时从进入 runtime.start() 开始。
+        timing = StartupTimingDiagnostic(instance_id)
         uid, gid, gateway_uid, gateway_gid = self.ensure_host()
+        timing.mark("ensure_host_ms")  # STARTUP_TIMING_DIAGNOSTIC
         volume_owner_id = owner_id or instance_id
         paths = self.paths(instance_id, volume_owner_id)
         existing = self.status(instance_id)
@@ -602,15 +684,19 @@ class InstanceRuntime:
             self.user_volume_store.ensure(volume_owner_id, paths["volume"])
         except RuntimeStoreError as error:
             raise RuntimeFailure(str(error)) from error
+        timing.mark("volume_create_ms")  # STARTUP_TIMING_DIAGNOSTIC
         filesystem_check = run(["e2fsck", "-f", "-y", str(paths["volume"])], check=False)
         if filesystem_check.returncode > 1:
             raise RuntimeFailure(f"persistent volume check failed: {filesystem_check.stderr.strip()}")
+        timing.mark("e2fsck_ms")  # STARTUP_TIMING_DIAGNOSTIC
         network: dict[str, str] | None = None
         sidecars: list[subprocess.Popen[bytes]] = []
         if self.deepseek_credential is not None:
             try:
                 network = self.network_manager.allocate(instance_id)
+                timing.mark("network_allocate_ms")  # STARTUP_TIMING_DIAGNOSTIC
                 self.configure_agent_volume(paths["volume"], str(network["host_ip"]))
+                timing.mark("volume_config_ms")  # STARTUP_TIMING_DIAGNOSTIC
                 paths["activity"].parent.mkdir(parents=True, exist_ok=True, mode=0o755)
                 paths["activity"].touch()
                 os.chown(paths["activity"], gateway_uid, gateway_gid)
@@ -620,6 +706,7 @@ class InstanceRuntime:
                     uid,
                     (GATEWAY_PORT,),
                 )
+                timing.mark("network_setup_ms")  # STARTUP_TIMING_DIAGNOSTIC
                 sidecars = self.start_model_gateway(
                     instance_id,
                     paths,
@@ -627,7 +714,9 @@ class InstanceRuntime:
                     gateway_uid,
                     gateway_gid,
                 )
+                timing.mark("gateway_ready_ms")  # STARTUP_TIMING_DIAGNOSTIC
                 self.prepare_jail(instance_id, paths, network)
+                timing.mark("jail_prepare_ms")  # STARTUP_TIMING_DIAGNOSTIC
             except Exception as error:
                 for sidecar in sidecars:
                     self.terminate_process(sidecar)
@@ -636,11 +725,13 @@ class InstanceRuntime:
                         self.network_manager.release(instance_id)
                     except NetworkFailure:
                         pass
+                timing.emit("failed")  # STARTUP_TIMING_DIAGNOSTIC
                 if isinstance(error, NetworkFailure):
                     raise RuntimeFailure(str(error)) from error
                 raise
         else:
             self.prepare_jail(instance_id, paths)
+            timing.mark("jail_prepare_ms")  # STARTUP_TIMING_DIAGNOSTIC
         paths["console"].write_text("", encoding="utf-8")
         os.chmod(paths["console"], 0o640)
 
@@ -691,7 +782,8 @@ class InstanceRuntime:
                     break
                 if process.poll() is not None:
                     break
-                time.sleep(0.25)
+                # STARTUP_TIMING_DIAGNOSTIC: 100 ms兼顾就绪响应速度与日志读取开销。
+                time.sleep(0.1)
             if not ready:
                 if process.poll() is None:
                     process.terminate()
@@ -701,6 +793,7 @@ class InstanceRuntime:
                         process.kill()
                 tail = paths["console"].read_text(encoding="utf-8", errors="replace")[-8000:]
                 raise RuntimeFailure(f"guest did not become ready\n{tail}")
+            timing.mark("guest_ready_ms")  # STARTUP_TIMING_DIAGNOSTIC
 
             register_arguments = [
                 "register",
@@ -771,6 +864,11 @@ class InstanceRuntime:
             status = self.status(instance_id)
             if status is None:
                 raise RuntimeFailure("lifecycle registration did not create instance metadata")
+            timing.mark("lifecycle_ms")  # STARTUP_TIMING_DIAGNOSTIC
+            # STARTUP_TIMING_DIAGNOSTIC: READY 之前 Guest 已把全部阶段写入串口。
+            guest_timing = parse_guest_startup_timing(console)
+            startup_timing = timing.emit("ready", guest_timing)
+            status["startupTiming"] = startup_timing
             return status
         except Exception as error:
             if process.poll() is None:
@@ -787,6 +885,7 @@ class InstanceRuntime:
                 except NetworkFailure:
                     pass
             shutil.rmtree(paths["jail"], ignore_errors=True)
+            timing.emit("failed")  # STARTUP_TIMING_DIAGNOSTIC
             if isinstance(error, NetworkFailure):
                 raise RuntimeFailure(str(error)) from error
             raise

@@ -44,6 +44,7 @@ class Console:
         "green": "\033[32m",
         "yellow": "\033[33m",
         "red": "\033[91m",
+        "pink": "\033[95m",
     }
     RESET = "\033[0m"
 
@@ -70,6 +71,11 @@ class Console:
 
     def error(self, message: str) -> None:
         print(self.paint(f"[错误] {message}", "red"), file=sys.stderr)
+
+    def timing(self, message: str) -> None:
+        """用亮粉色展示临时启动性能诊断，避免与普通系统输出混淆。"""
+
+        print(self.paint(message, "pink"), file=self.output)
 
 
 class SessionStore:
@@ -382,6 +388,46 @@ def print_message(message: dict[str, Any], console: Console) -> None:
     )
 
 
+# STARTUP_TIMING_DIAGNOSTIC_BEGIN
+def render_startup_timing(value: Any, console: Console) -> None:
+    """逐行展示一次真实冷启动的 Host 与 Guest 阶段耗时。"""
+
+    if not isinstance(value, dict):
+        return
+    host = value.get("host") if isinstance(value.get("host"), dict) else {}
+    guest = value.get("guest") if isinstance(value.get("guest"), dict) else {}
+    lines: list[tuple[str, Any]] = [
+        ("实例启动总耗时", value.get("totalMs")),
+        ("宿主环境检查", host.get("ensure_host_ms")),
+        ("用户数据盘准备", host.get("volume_create_ms")),
+        ("数据盘文件系统检查", host.get("e2fsck_ms")),
+        ("网络租约分配", host.get("network_allocate_ms")),
+        ("数据盘运行配置", host.get("volume_config_ms")),
+        ("TAP与防火墙配置", host.get("network_setup_ms")),
+        ("模型网关启动", host.get("gateway_ready_ms")),
+        ("Jailer目录准备", host.get("jail_prepare_ms")),
+        ("Guest启动并就绪", host.get("guest_ready_ms")),
+        ("生命周期登记", host.get("lifecycle_ms")),
+        ("内核启动并进入 init", guest.get("kernel_to_init")),
+        ("Guest数据盘挂载", guest.get("data_mount")),
+        ("Guest网络配置", guest.get("network")),
+        ("Guest预检", guest.get("preflight_tests")),
+        ("版本构建元数据读取", guest.get("version_check")),
+        ("Guest安全检查", guest.get("security_check")),
+        ("Pi RPC监听启动", guest.get("rpc_listener")),
+        ("Guest启动总耗时", guest.get("total_ms")),
+    ]
+    rendered = [(label, milliseconds) for label, milliseconds in lines if isinstance(milliseconds, int)]
+    if not rendered:
+        return
+    console.timing("[启动耗时]")
+    for label, milliseconds in rendered:
+        console.timing(f"{label} = {milliseconds} ms")
+
+
+# STARTUP_TIMING_DIAGNOSTIC_END
+
+
 def authenticated_client(args: argparse.Namespace, store: SessionStore) -> ApiClient:
     cookie, _ = require_cookie(store, args.base_url)
     return ApiClient(args.base_url, cookie)
@@ -399,6 +445,9 @@ def command_start(args: argparse.Namespace, store: SessionStore, console: Consol
     console.system(f"正在启动实例 {args.instance_id}……")
     instance, _ = client.json("POST", f"/api/instances/{args.instance_id}/start", {})
     console.success("实例启动完成")
+    runtime = instance.get("runtime")
+    if isinstance(runtime, dict):
+        render_startup_timing(runtime.get("startupTiming"), console)
     print_instance(instance, console)
 
 
@@ -525,6 +574,7 @@ def fetch_history(
 
 
 def render_history(payload: dict[str, Any], console: Console) -> None:
+    render_startup_timing(payload.get("startupTiming"), console)
     messages = payload.get("messages", [])
     if not messages:
         console.warning("该页没有消息")
@@ -569,7 +619,9 @@ def render_task_events(
     for event in client.events(f"/api/instances/{instance_id}/tasks/{task_id}/stream"):
         event_type = event.get("type")
         payload = event.get("data") if isinstance(event.get("data"), dict) else {}
-        if event_type == "progress":
+        if event_type == "startup_timing":
+            render_startup_timing(payload, console)
+        elif event_type == "progress":
             if text_started:
                 print(file=console.output)
                 text_started = False

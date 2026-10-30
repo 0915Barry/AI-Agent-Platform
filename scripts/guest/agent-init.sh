@@ -19,6 +19,37 @@ mount_if_needed /dev/pts devpts devpts
 
 exec > /dev/ttyS0 2>&1
 
+# GUEST_STARTUP_TIMING_DIAGNOSTIC_BEGIN
+# 临时 Guest 启动性能诊断。完成优化后可按
+# GUEST_STARTUP_TIMING_DIAGNOSTIC 全局搜索并删除这一组函数和调用。
+guest_uptime_ms() {
+  local uptime_seconds whole fraction
+  read -r uptime_seconds _ < /proc/uptime
+  whole="${uptime_seconds%%.*}"
+  fraction="${uptime_seconds#*.}000"
+  fraction="${fraction:0:3}"
+  printf '%d\n' "$((10#${whole} * 1000 + 10#${fraction}))"
+}
+
+guest_timing_previous_ms=0
+guest_timing_mark() {
+  local stage="$1" current_ms delta_ms
+  current_ms="$(guest_uptime_ms)"
+  delta_ms="$((current_ms - guest_timing_previous_ms))"
+  guest_timing_previous_ms="${current_ms}"
+  echo "GUEST_START_TIMING stage=${stage} delta_ms=${delta_ms} uptime_ms=${current_ms}"
+}
+
+guest_timing_complete() {
+  local total_ms
+  total_ms="$(guest_uptime_ms)"
+  echo "GUEST_START_TIMING stage=complete total_ms=${total_ms}"
+}
+
+# 包含 Guest 内核启动、根文件系统挂载以及进入 agent-init 前后的基础设备挂载。
+guest_timing_mark kernel_to_init  # GUEST_STARTUP_TIMING_DIAGNOSTIC
+# GUEST_STARTUP_TIMING_DIAGNOSTIC_END
+
 cmdline_value() {
   key="$1"
   for token in $(</proc/cmdline); do
@@ -53,6 +84,7 @@ fi
 
 mkdir -p /workspace /home/pi/.pi/agent
 chown -R pi:pi /workspace /home/pi/.pi
+guest_timing_mark data_mount  # GUEST_STARTUP_TIMING_DIAGNOSTIC
 
 network_test="$(cmdline_value agent_network_test || true)"
 gateway_test="$(cmdline_value agent_gateway_test || true)"
@@ -74,6 +106,7 @@ if [[ "${network_test}" == "1" || "${gateway_test}" == "1" \
     printf 'nameserver %s\noptions timeout:2 attempts:2\n' "${guest_dns}" > /etc/resolv.conf
   fi
 fi
+guest_timing_mark network  # GUEST_STARTUP_TIMING_DIAGNOSTIC
 
 if [[ "${deepseek_e2e_test}" == "1" ]]; then
   gateway_host="$(cmdline_value agent_gateway_host)"
@@ -142,45 +175,34 @@ if [[ "${gateway_test}" == "1" ]]; then
 
   echo "AGENT_GATEWAY_READY credential=placeholder upstream=authorized direct_upstream=denied response=gateway-smoke-response"
 fi
+guest_timing_mark preflight_tests  # GUEST_STARTUP_TIMING_DIAGNOSTIC
 
-node_version="$(
-  runuser -u pi -- env \
-    HOME=/home/pi \
-    PATH="${runtime_path}" \
-    /usr/local/bin/node --version
-)"
-pi_version="$(
-  runuser -u pi -- env \
-    HOME=/home/pi \
-    PATH="${runtime_path}" \
-    PI_OFFLINE=1 \
-    PI_SKIP_VERSION_CHECK=1 \
-    /usr/local/bin/pi --version
-)"
-pi_uid="$(id -u pi)"
-
-node_owner="$(stat -c '%u:%g' /usr/local/bin/node)"
-if [[ "${node_owner}" != "0:0" ]]; then
-  echo "SECURITY_FAILURE node_owner=${node_owner}" >&2
+# Node、Pi 和 UID 已在 rootfs 构建阶段执行真实命令验证，并写入只读系统盘。
+# 正式实例启动时只读取可信构建元数据，避免每次拉起 Node/Pi CLI 再重复验收。
+build_metadata="/etc/ai-agent-platform-build"
+metadata_value() {
+  local key="$1"
+  sed -n "s/^${key}=//p" "${build_metadata}" | head -n 1
+}
+node_version="v$(metadata_value NODE_VERSION)"
+pi_version="$(metadata_value PI_VERSION)"
+pi_uid="$(metadata_value AGENT_UID)"
+static_security_verified="$(metadata_value STATIC_SECURITY_VERIFIED)"
+if [[ "${node_version}" == "v" || -z "${pi_version}" || -z "${pi_uid}" \
+  || "${static_security_verified}" != "1" ]]; then
+  echo "RUNTIME_METADATA_FAILURE missing_version_or_uid" >&2
   exit 1
 fi
+guest_timing_mark version_check  # GUEST_STARTUP_TIMING_DIAGNOSTIC
 
-if runuser -u pi -- head -c 1 /etc/shadow >/dev/null 2>&1; then
-  echo "SECURITY_FAILURE pi_can_read_shadow" >&2
-  exit 1
-fi
-
-if runuser -u pi -- sh -c ': > /usr/local/.pi-permission-probe' 2>/dev/null; then
-  rm -f /usr/local/.pi-permission-probe
-  echo "SECURITY_FAILURE pi_can_write_runtime" >&2
-  exit 1
-fi
-
+# 系统盘所有权、shadow 与 /usr/local 权限已在 rootfs 构建时验证。启动时只保留
+# 与本次数据盘挂载有关的动态检查，确保 /workspace 确实可由 pi 用户写入。
 runuser -u pi -- sh -c \
   'probe=/workspace/.pi-permission-probe; : > "${probe}"; rm -f "${probe}"'
+guest_timing_mark security_check  # GUEST_STARTUP_TIMING_DIAGNOSTIC
 
 echo "AGENT_RUNTIME_READY node=${node_version} pi=${pi_version} uid=${pi_uid}"
-echo "AGENT_SECURITY_READY runtime_owner=${node_owner} shadow=denied runtime_write=denied workspace_write=allowed"
+echo "AGENT_SECURITY_READY static=build-verified workspace_write=allowed"
 
 if [[ "${managed_runtime}" == "1" ]]; then
   rpc_port="$(cmdline_value agent_rpc_port)"
@@ -229,7 +251,14 @@ if [[ "${managed_runtime}" == "1" ]]; then
     echo "PI_RPC_FAILURE listener_not_ready" >&2
     exit 1
   fi
+  # 先输出诊断计时，再输出 PI_RPC_READY。Host 看到 READY 时即可确保计时日志
+  # 已经完整写入串口，不会因读取过早遗漏最后两个阶段。
+  guest_timing_mark rpc_listener  # GUEST_STARTUP_TIMING_DIAGNOSTIC
+  guest_timing_complete  # GUEST_STARTUP_TIMING_DIAGNOSTIC
   echo "PI_RPC_READY address=${rpc_bind_ip}:${rpc_port} transport=tcp protocol=jsonl provider=${rpc_provider:-unconfigured} model=${rpc_model:-unconfigured}"
+else
+  guest_timing_mark rpc_listener  # GUEST_STARTUP_TIMING_DIAGNOSTIC
+  guest_timing_complete  # GUEST_STARTUP_TIMING_DIAGNOSTIC
 fi
 
 if [[ "${persistence_test}" == "1" ]]; then

@@ -52,6 +52,12 @@ class FakeRuntime:
             "idleSeconds": 0,
             "guestIp": "172.29.0.2",
             "rpcPort": 8080,
+            "startupTiming": {
+                "outcome": "ready",
+                "totalMs": 100,
+                "host": {"guest_ready_ms": 80},
+                "guest": {"kernel_to_init": 40},
+            },
         }
         self.instances[instance_id] = status
         return status
@@ -173,6 +179,11 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(gateway.calls[0][3], workspace["id"])
         self.assertEqual(gateway.calls[0][4], conversation["piSessionId"])
+        event_types = [
+            event["type"]
+            for event in self.control.task_events("agent-workspace", task["id"])
+        ]
+        self.assertIn("startup_timing", event_types)
 
     def test_conversation_and_workspace_deletion_respect_boundaries(self) -> None:
         owner_id = "user-delete"
@@ -537,16 +548,18 @@ class ControlPlaneTests(unittest.TestCase):
         messages = self.control.conversation_messages("agent-chat", conversation["id"])
         self.assertEqual([message["role"] for message in messages], ["user", "assistant", "user"])
         self.assertEqual(messages[1]["content"], "好的，我会记住。")
-        page, next_before = self.control.conversation_messages_page(
+        page, next_before, startup_timing = self.control.conversation_messages_page(
             "agent-chat", conversation["id"], 2, None
         )
         self.assertEqual([message["role"] for message in page], ["assistant", "user"])
         self.assertIsInstance(next_before, int)
-        older, final_cursor = self.control.conversation_messages_page(
+        self.assertIsNone(startup_timing)
+        older, final_cursor, startup_timing = self.control.conversation_messages_page(
             "agent-chat", conversation["id"], 2, next_before
         )
         self.assertEqual([message["role"] for message in older], ["user"])
         self.assertIsNone(final_cursor)
+        self.assertIsNone(startup_timing)
         listed = self.control.list_conversations("agent-chat")
         self.assertEqual(listed[0]["title"], "请记住我的代号是 Alpha")
 

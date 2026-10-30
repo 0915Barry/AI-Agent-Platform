@@ -80,6 +80,25 @@ install_project_runtime_files() {
   chmod -R go-w "${root}/usr/local"
 }
 
+verify_static_guest_security() {
+  root="$1"
+  node_owner="$(stat -c '%u:%g' "${root}/usr/local/bin/node")"
+  if [[ "${node_owner}" != "0:0" ]]; then
+    echo "Unexpected Node owner in rootfs: ${node_owner}" >&2
+    exit 1
+  fi
+  if chroot "${root}" runuser -u pi -- head -c 1 /etc/shadow >/dev/null 2>&1; then
+    echo "The pi user can read /etc/shadow in the rootfs" >&2
+    exit 1
+  fi
+  if chroot "${root}" runuser -u pi -- sh -c \
+      ': > /usr/local/.pi-permission-probe' 2>/dev/null; then
+    rm -f "${root}/usr/local/.pi-permission-probe"
+    echo "The pi user can write /usr/local in the rootfs" >&2
+    exit 1
+  fi
+}
+
 write_build_metadata() {
   root="$1"
   cat > "${root}/etc/ai-agent-platform-build" <<EOF
@@ -91,6 +110,7 @@ PI_PACKAGE=${PI_PACKAGE}
 PI_VERSION=${PI_VERSION}
 AGENT_UID=${AGENT_UID}
 ARCHITECTURE=${arch}
+STATIC_SECURITY_VERIFIED=1
 EOF
 }
 
@@ -134,6 +154,7 @@ if [[ -f "${rootfs_path}" && -f "${manifest_path}" && -f "${runtime_dir}/config.
       && grep -Fxq "ARCHITECTURE=${arch}" "${build_metadata}" \
       && [[ -x "${refresh_mount}/usr/bin/socat" ]]; then
       install_project_runtime_files "${refresh_mount}"
+      verify_static_guest_security "${refresh_mount}"
       write_build_metadata "${refresh_mount}"
       sync
       umount "${refresh_mount}"
@@ -291,6 +312,7 @@ chroot "${mount_dir}" useradd \
   pi
 
 install_project_runtime_files "${mount_dir}"
+verify_static_guest_security "${mount_dir}"
 
 node_actual="$(chroot "${mount_dir}" node --version)"
 pi_actual="$(chroot "${mount_dir}" env PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 pi --version)"

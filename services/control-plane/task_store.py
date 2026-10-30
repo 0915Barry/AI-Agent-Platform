@@ -601,6 +601,7 @@ class TaskStore:
         """追加 guest 事件，并在 completed/failed 时同步任务终态。"""
 
         if event_type not in {
+            "startup_timing",
             "progress",
             "text",
             "tool_call",

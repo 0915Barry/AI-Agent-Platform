@@ -105,6 +105,11 @@ class MockControlPlane(BaseHTTPRequestHandler):
                         },
                     ],
                     "nextBefore": None,
+                    "startupTiming": {
+                        "totalMs": 100,
+                        "host": {"guest_ready_ms": 80},
+                        "guest": {"kernel_to_init": 40},
+                    },
                 },
             )
             return
@@ -193,6 +198,28 @@ class AgentCtlTests(unittest.TestCase):
         console = cli.Console(True, io.StringIO())
         self.assertEqual(console.paint("系统", "blue"), "\033[94m系统\033[0m")
         self.assertEqual(console.paint("错误", "red"), "\033[91m错误\033[0m")
+        self.assertEqual(console.paint("启动", "pink"), "\033[95m启动\033[0m")
+
+    def test_startup_timing_is_rendered_one_item_per_line(self) -> None:
+        output = io.StringIO()
+        console = cli.Console(False, output)
+        cli.render_startup_timing(
+            {
+                "totalMs": 11754,
+                "host": {"guest_ready_ms": 11269},
+                "guest": {"kernel_to_init": 3060},
+            },
+            console,
+        )
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                "[启动耗时]",
+                "实例启动总耗时 = 11754 ms",
+                "Guest启动并就绪 = 11269 ms",
+                "内核启动并进入 init = 3060 ms",
+            ],
+        )
 
     def test_menu_preview_uses_ten_characters(self) -> None:
         self.assertEqual(cli.menu_preview("一二三四五六七八九十十一"), "一二三四五六七八九十…")
