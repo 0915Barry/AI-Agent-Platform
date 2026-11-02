@@ -1,0 +1,609 @@
+openapi: 3.0.3
+info:
+  title: AI Agent Platform — Control Plane API
+  version: "1.0"
+  description: |
+    AI Agent 平台下层控制面（Control Plane）的 HTTP / SSE 接口规范。
+    字段名、状态值与事件类型以 services/control-plane/server.py 与 task_store.py 的实际实现为准。
+    部署时服务只监听 http://127.0.0.1:18090，并启用本地账号认证（--require-auth）。
+servers:
+  - url: http://127.0.0.1:18090
+    description: 本机 loopback（正式部署）；联调时经 SSH 隧道或同源代理访问
+security:
+  - cookieAuth: []
+paths:
+  /healthz:
+    get:
+      summary: 健康检查
+      security: []
+      responses:
+        "200":
+          description: 服务存活
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /api/auth/session:
+    get:
+      summary: 查询当前登录状态
+      security: []
+      responses:
+        "200":
+          description: 当前会话（未登录时 authenticated=false）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+
+  /api/auth/login:
+    post:
+      summary: 登录
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: 登录成功，Set-Cookie 下发会话（名称 aap_session）
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LoginResponse" }
+        "401":
+          $ref: "#/components/responses/Error"
+
+  /api/auth/logout:
+    post:
+      summary: 登出
+      security: []
+      responses:
+        "200":
+          description: 已登出，清除 Cookie
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: logged_out }
+
+  /api/workspaces:
+    get:
+      summary: 列出当前用户工作区
+      responses:
+        "200":
+          description: 工作区列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workspaces:
+                    type: array
+                    items: { $ref: "#/components/schemas/Workspace" }
+    post:
+      summary: 创建工作区
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workspace" }
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /api/workspaces/{workspaceId}/select:
+    post:
+      summary: 切换当前工作区
+      parameters:
+        - { $ref: "#/components/parameters/WorkspaceId" }
+      responses:
+        "200":
+          description: 选中后的工作区（current=true）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workspace" }
+
+  /api/workspaces/{workspaceId}:
+    delete:
+      summary: 删除工作区（含会话与用户盘目录）
+      parameters:
+        - { $ref: "#/components/parameters/WorkspaceId" }
+      responses:
+        "200":
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  status: { type: string, example: deleted }
+                  deletedConversations: { type: integer }
+                  currentWorkspace: { $ref: "#/components/schemas/Workspace" }
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /api/workspaces/{workspaceId}/conversations:
+    get:
+      summary: 列出工作区会话（最近活动优先）
+      parameters:
+        - { $ref: "#/components/parameters/WorkspaceId" }
+      responses:
+        "200":
+          description: 会话列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  conversations:
+                    type: array
+                    items: { $ref: "#/components/schemas/Conversation" }
+    post:
+      summary: 新建会话
+      parameters:
+        - { $ref: "#/components/parameters/WorkspaceId" }
+      responses:
+        "201":
+          description: 已创建（sessionBackend=pi-native）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Conversation" }
+
+  /api/workspaces/{workspaceId}/conversations/{conversationId}:
+    delete:
+      summary: 删除会话（会先停止实例再清理）
+      parameters:
+        - { $ref: "#/components/parameters/WorkspaceId" }
+        - { $ref: "#/components/parameters/ConversationId" }
+      responses:
+        "200":
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  status: { type: string, example: deleted }
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /api/instances:
+    get:
+      summary: 列出当前用户实例
+      responses:
+        "200":
+          description: 实例列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instances:
+                    type: array
+                    items: { $ref: "#/components/schemas/Instance" }
+    post:
+      summary: 创建实例（可选指定 id）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id: { type: string }
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Instance" }
+
+  /api/instances/{instanceId}:
+    parameters:
+      - { $ref: "#/components/parameters/InstanceId" }
+    get:
+      summary: 查询单个实例（含校准后的运行态）
+      responses:
+        "200":
+          description: 实例对象
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Instance" }
+    delete:
+      summary: 销毁实例（保留用户数据盘）
+      responses:
+        "200":
+          description: 已销毁
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  status: { type: string, example: destroyed }
+
+  /api/instances/{instanceId}/start:
+    post:
+      summary: 启动实例
+      parameters: [{ $ref: "#/components/parameters/InstanceId" }]
+      responses:
+        "200": { $ref: "#/components/responses/InstanceAction" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /api/instances/{instanceId}/stop:
+    post:
+      summary: 停止实例（保留数据盘）
+      parameters: [{ $ref: "#/components/parameters/InstanceId" }]
+      responses:
+        "200": { $ref: "#/components/responses/InstanceAction" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /api/instances/{instanceId}/suspend:
+    post:
+      summary: 暂停实例并创建完整快照（仅空闲运行实例）
+      parameters: [{ $ref: "#/components/parameters/InstanceId" }]
+      responses:
+        "200": { $ref: "#/components/responses/InstanceAction" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /api/instances/{instanceId}/resume:
+    post:
+      summary: 从快照恢复实例
+      parameters: [{ $ref: "#/components/parameters/InstanceId" }]
+      responses:
+        "200": { $ref: "#/components/responses/InstanceAction" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /api/instances/{instanceId}/heartbeat:
+    post:
+      summary: 心跳（刷新空闲活动时间）
+      parameters: [{ $ref: "#/components/parameters/InstanceId" }]
+      responses:
+        "200": { $ref: "#/components/responses/InstanceAction" }
+
+  /api/instances/{instanceId}/conversations:
+    parameters:
+      - { $ref: "#/components/parameters/InstanceId" }
+    get:
+      summary: 列出实例下的会话（旧式实例级路径）
+      responses:
+        "200":
+          description: 会话列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  conversations:
+                    type: array
+                    items: { $ref: "#/components/schemas/Conversation" }
+    post:
+      summary: "在实例下创建会话（请求体字段 title）"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string }
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Conversation" }
+
+  /api/instances/{instanceId}/conversations/{conversationId}:
+    get:
+      summary: 查询会话
+      parameters:
+        - { $ref: "#/components/parameters/InstanceId" }
+        - { $ref: "#/components/parameters/ConversationId" }
+      responses:
+        "200":
+          description: 会话对象
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Conversation" }
+
+  /api/instances/{instanceId}/conversations/{conversationId}/messages:
+    parameters:
+      - { $ref: "#/components/parameters/InstanceId" }
+      - { $ref: "#/components/parameters/ConversationId" }
+    get:
+      summary: 分页读取会话历史（可能触发冷启动）
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: before
+          in: query
+          description: 上一页返回的 nextBefore 游标；省略取最新一页
+          schema: { type: integer }
+      responses:
+        "200":
+          description: 消息页
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessagesPage" }
+    post:
+      summary: 发消息（自动按需启动实例），返回任务对象供 SSE 订阅
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string, maxLength: 16384 }
+      responses:
+        "202":
+          description: 已受理，返回任务（含 taskId）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+
+  /api/instances/{instanceId}/tasks:
+    post:
+      summary: 直接对运行实例下发 prompt（不挂会话）
+      parameters: [{ $ref: "#/components/parameters/InstanceId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt]
+              properties:
+                prompt: { type: string }
+      responses:
+        "202":
+          description: 已受理
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+
+  /api/instances/{instanceId}/tasks/{taskId}:
+    get:
+      summary: 查询任务状态
+      parameters:
+        - { $ref: "#/components/parameters/InstanceId" }
+        - { $ref: "#/components/parameters/TaskId" }
+      responses:
+        "200":
+          description: 任务对象
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+
+  /api/instances/{instanceId}/tasks/{taskId}/events:
+    get:
+      summary: 一次性拉取任务事件（轮询用）
+      parameters:
+        - { $ref: "#/components/parameters/InstanceId" }
+        - { $ref: "#/components/parameters/TaskId" }
+        - name: after
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        "200":
+          description: 事件列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/TaskEvent" }
+
+  /api/instances/{instanceId}/tasks/{taskId}/stream:
+    get:
+      summary: SSE 流式订阅任务事件（收到 completed/failed 后关闭）
+      parameters:
+        - { $ref: "#/components/parameters/InstanceId" }
+        - { $ref: "#/components/parameters/TaskId" }
+        - name: after
+          in: query
+          schema: { type: integer, default: 0 }
+        - name: Last-Event-ID
+          in: header
+          description: 断线续传游标（等于最后收到事件的 sequence）
+          schema: { type: integer }
+      responses:
+        "200":
+          description: |
+            text/event-stream。每帧：
+              id: <sequence>
+              event: task-event
+              data: {"sequence":..,"type":..,"data":{..},"createdAt":..}
+            空闲时每 10 秒发 ": heartbeat"。
+          content:
+            text/event-stream:
+              schema: { $ref: "#/components/schemas/TaskEvent" }
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: aap_session
+      description: 登录后由服务端下发的 HttpOnly 会话 Cookie（HttpOnly; SameSite=Strict）
+
+  parameters:
+    WorkspaceId:
+      name: workspaceId
+      in: path
+      required: true
+      schema: { type: string, example: workspace-0123456789abcdef }
+    ConversationId:
+      name: conversationId
+      in: path
+      required: true
+      schema: { type: string, example: conversation-0123456789abcdef }
+    InstanceId:
+      name: instanceId
+      in: path
+      required: true
+      schema: { type: string, example: agent-0123456789ab }
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      schema: { type: string, example: task-0123456789abcdef }
+
+  responses:
+    Error:
+      description: 统一错误
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InstanceAction:
+      description: 实例动作结果（含运行态）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Instance" }
+
+  schemas:
+    User:
+      type: object
+      properties:
+        id: { type: string, example: user-0123456789abcdef }
+        username: { type: string, example: alice }
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: instance_not_found }
+            message: { type: string }
+
+    SessionResponse:
+      type: object
+      properties:
+        authenticated: { type: boolean }
+        user: { $ref: "#/components/schemas/User", nullable: true }
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string }
+
+    LoginResponse:
+      type: object
+      properties:
+        user: { $ref: "#/components/schemas/User" }
+        expiresAt: { type: integer }
+
+    Workspace:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        directoryName: { type: string }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+        current: { type: boolean }
+        conversationCount: { type: integer, nullable: true }
+
+    Conversation:
+      type: object
+      properties:
+        id: { type: string }
+        instanceId: { type: string }
+        workspaceId: { type: string, nullable: true }
+        piSessionId: { type: string }
+        sessionBackend: { type: string, enum: [pi-native, database] }
+        title: { type: string }
+        preview: { type: string }
+        messageCount: { type: integer }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+
+    Message:
+      type: object
+      properties:
+        sequence: { type: integer }
+        id: { type: string }
+        conversationId: { type: string }
+        role: { type: string, enum: [user, assistant] }
+        content: { type: string }
+        taskId: { type: string, nullable: true }
+        createdAt: { type: integer }
+
+    MessagesPage:
+      type: object
+      properties:
+        messages:
+          type: array
+          items: { $ref: "#/components/schemas/Message" }
+        nextBefore: { type: integer, nullable: true }
+        startupTiming: { type: object, nullable: true }
+        historyTiming: { type: object, nullable: true }
+
+    Task:
+      type: object
+      properties:
+        id: { type: string }
+        instanceId: { type: string }
+        prompt: { type: string }
+        status: { type: string, enum: [queued, running, completed, failed] }
+        output: { type: string, nullable: true }
+        error: { type: string, nullable: true }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+        conversationId: { type: string, nullable: true }
+        workspaceId: { type: string, nullable: true }
+        piSessionId: { type: string, nullable: true }
+        sessionBackend: { type: string, nullable: true }
+
+    TaskEvent:
+      type: object
+      description: |
+        type 取值：queued | started | startup_timing | progress | text | tool_call | tool_result | completed | failed
+        data 随 type 变化（见 docs/API契约.md §8）。
+      properties:
+        sequence: { type: integer }
+        type: { type: string }
+        data: { type: object }
+        createdAt: { type: integer }
+
+    Instance:
+      type: object
+      properties:
+        id: { type: string }
+        status:
+          type: string
+          enum: [created, starting, running, stopping, stopped, failed, suspending, suspended, resuming]
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+        lastError: { type: string, nullable: true }
+        ownerId: { type: string, nullable: true }
+        runtime:
+          type: object
+          nullable: true
+          description: 底层运行态（hostIp/guestIp/rpcPort/idleSeconds/busy/processAlive/startupTiming 等），上层不要依赖其细节

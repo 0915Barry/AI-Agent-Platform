@@ -442,6 +442,23 @@ Pi Agent 的版本与校验值统一维护在 `config/versions.env`。
 | DeepSeek 401/403 | 重新运行 `configure-deepseek`，不要把 Key 写入 `.env` |
 | `Unknown command` | 本地代码版本过旧；更新仓库后重新执行 |
 
+## API 文档与本地预览
+
+控制面（Control Plane）对外提供的 HTTP / SSE 接口已固化为机器可读的
+OpenAPI 规范，供上中层前后端对接：
+
+- 机器可读规范：[`docs/api/openapi.yaml`](./docs/api/openapi.yaml)（可生成客户端 SDK、导入 Postman）；
+- 给人看的契约：[`docs/api/API契约.md`](./docs/api/API契约.md)（含 SSE 事件、错误码、聊天时序）；
+- 本地预览（无需启动控制面或 microVM）：
+
+```bash
+./scripts/api-docs/render-api-docs.sh
+```
+
+该命令会启动本地静态服务器并自动打开浏览器：Swagger UI 位于
+`/api-preview.html`，Redoc 位于 `/api-redoc.html`。停止用
+`./scripts/api-docs/render-api-docs.sh stop`，查询用 `status`，重启用 `restart`。
+
 ## 项目文档
 
 规划与架构文档位于 [`docs/`](./docs/README.md)。README 只维护当前代码可执行的环境
