@@ -19,6 +19,7 @@
 | [api-preview.html](./api/api-preview.html) | Swagger UI 本地预览页 |
 | [api-redoc.html](./api/api-redoc.html) | Redoc 本地预览页 |
 | [协作约定.md](./api/协作约定.md) | 上下层联调接入与接口变更约定 |
+| [联调接入测试.md](./api/联调接入测试.md) | 局域网接入方式介绍与验证步骤命令 |
 
 本地预览（无需启动控制面或 microVM）：
 
