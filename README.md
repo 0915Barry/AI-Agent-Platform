@@ -459,6 +459,10 @@ OpenAPI 规范，供上中层前后端对接：
 `/api-preview.html`，Redoc 位于 `/api-redoc.html`。停止用
 `./scripts/api-docs/render-api-docs.sh stop`，查询用 `status`，重启用 `restart`。
 
+## 上下层协作约定
+
+上下层（前端/后端与下层运行平台）的联调接入方式、接口变更分级与影响控制原则，见 [`docs/api/协作约定.md`](./docs/api/协作约定.md)。
+
 ## 项目文档
 
 规划与架构文档位于 [`docs/`](./docs/README.md)。README 只维护当前代码可执行的环境

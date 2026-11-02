@@ -18,6 +18,7 @@
 | [API契约.md](./api/API契约.md) | 给人看的接口契约（含 SSE 事件、错误码、聊天时序） |
 | [api-preview.html](./api/api-preview.html) | Swagger UI 本地预览页 |
 | [api-redoc.html](./api/api-redoc.html) | Redoc 本地预览页 |
+| [协作约定.md](./api/协作约定.md) | 上下层联调接入与接口变更约定 |
 
 本地预览（无需启动控制面或 microVM）：
 
