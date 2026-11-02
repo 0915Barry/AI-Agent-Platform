@@ -203,7 +203,7 @@ class AgentCtlTests(unittest.TestCase):
     def test_startup_timing_is_rendered_one_item_per_line(self) -> None:
         output = io.StringIO()
         console = cli.Console(False, output)
-        cli.render_startup_timing(
+        total_ms = cli.render_startup_timing(
             {
                 "totalMs": 11754,
                 "host": {"guest_ready_ms": 11269},
@@ -211,13 +211,16 @@ class AgentCtlTests(unittest.TestCase):
             },
             console,
         )
+        self.assertEqual(total_ms, 11754)
         self.assertEqual(
             output.getvalue().splitlines(),
             [
-                "[启动耗时]",
-                "实例启动总耗时 = 11754 ms",
-                "Guest启动并就绪 = 11269 ms",
-                "内核启动并进入 init = 3060 ms",
+                "[microVM 启动耗时] 从「停止」到「microVM 就绪」",
+                "启动总耗时（宿主计时） = 11754 ms",
+                "宿主侧：",
+                "  等待Guest就绪 = 11269 ms",
+                "Guest 侧（内核时钟，与宿主计时口径不同）：",
+                "  内核启动并进入init = 3060 ms",
             ],
         )
 
@@ -235,11 +238,52 @@ class AgentCtlTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue().splitlines(),
             [
-                "[会话加载耗时]",
-                "Pi进程启动并加载原生Session = 4876 ms",
+                "[Pi 进程加载会话] 从「连接 Guest Pi RPC」到「历史返回」",
+                "Pi 进程冷启动并加载 Session = 4876 ms",
+                "（microVM 已就绪，本次未包含启动耗时）",
                 "[警告] 该页没有消息",
             ],
         )
+
+    def test_history_renders_combined_total_from_startup_and_session(self) -> None:
+        output = io.StringIO()
+        console = cli.Console(False, output)
+        cli.render_history(
+            {
+                "startupTiming": {"totalMs": 5011, "host": {}, "guest": {}},
+                "historyTiming": {"piSessionLoadMs": 7064},
+                "messages": [],
+                "nextBefore": None,
+            },
+            console,
+        )
+        self.assertIn(
+            "microVM 启动 5011 ms + Pi 加载会话 7064 ms = 12075 ms",
+            output.getvalue(),
+        )
+
+    def test_cold_start_baseline_is_persisted_per_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = cli.SessionStore(Path(directory) / "state.json")
+            self.assertIsNone(store.cold_start_baseline("agent-one"))
+            store.remember_cold_start("agent-one", 5443)
+            store.remember_cold_start("agent-two", 6200)
+            self.assertEqual(store.cold_start_baseline("agent-one"), 5443)
+            self.assertEqual(store.cold_start_baseline("agent-two"), 6200)
+            store.remember_cold_start("agent-one", 5000)
+            self.assertEqual(store.cold_start_baseline("agent-one"), 5000)
+
+    def test_cold_start_baseline_is_recorded_from_history_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = cli.SessionStore(Path(directory) / "state.json")
+            cli.remember_cold_start_from_payload(
+                store, "agent-one", {"startupTiming": {"totalMs": 5443}}
+            )
+            self.assertEqual(store.cold_start_baseline("agent-one"), 5443)
+            cli.remember_cold_start_from_payload(
+                store, "agent-one", {"historyTiming": {"piSessionLoadMs": 7879}}
+            )
+            self.assertEqual(store.cold_start_baseline("agent-one"), 5443)
 
     def test_menu_preview_uses_ten_characters(self) -> None:
         self.assertEqual(cli.menu_preview("一二三四五六七八九十十一"), "一二三四五六七八九十…")

@@ -115,6 +115,25 @@ class SessionStore:
         except OSError as error:
             raise CliError(f"无法删除登录状态：{error}") from error
 
+    def cold_start_baseline(self, instance_id: str) -> int | None:
+        """读取某实例最近一次冷启动的总耗时基线（毫秒），供快照恢复对比。"""
+        state = self.load()
+        baselines = state.get("coldStartBaselines")
+        if not isinstance(baselines, dict):
+            return None
+        value = baselines.get(instance_id)
+        return value if isinstance(value, int) else None
+
+    def remember_cold_start(self, instance_id: str, total_ms: int) -> None:
+        """记录某实例最近一次冷启动总耗时，覆盖旧的基线。"""
+        state = self.load()
+        baselines = state.get("coldStartBaselines")
+        if not isinstance(baselines, dict):
+            baselines = {}
+        baselines[instance_id] = total_ms
+        state["coldStartBaselines"] = baselines
+        self.save(state)
+
 
 class ApiClient:
     """Control Plane HTTP/SSE 客户端。"""
@@ -389,40 +408,65 @@ def print_message(message: dict[str, Any], console: Console) -> None:
 
 
 # STARTUP_TIMING_DIAGNOSTIC_BEGIN
-def render_startup_timing(value: Any, console: Console) -> None:
-    """逐行展示一次真实冷启动的 Host 与 Guest 阶段耗时。"""
+def render_startup_timing(value: Any, console: Console) -> int | None:
+    """展示一次 microVM 冷启动的分阶段耗时，并返回宿主计时的总耗时（毫秒）。
+
+    这里的「启动」只覆盖「实例从停止到 microVM 就绪」，不包含之后读历史时
+    Pi 进程加载原生 Session 的时间。宿主阶段与 Guest 阶段使用不同时钟，因此
+    总耗时以宿主计时为准，Guest 分组仅用于定位瓶颈。
+    """
 
     if not isinstance(value, dict):
-        return
+        return None
     host = value.get("host") if isinstance(value.get("host"), dict) else {}
     guest = value.get("guest") if isinstance(value.get("guest"), dict) else {}
-    lines: list[tuple[str, Any]] = [
-        ("实例启动总耗时", value.get("totalMs")),
-        ("宿主环境检查", host.get("ensure_host_ms")),
-        ("用户数据盘准备", host.get("volume_create_ms")),
+    total_ms = value.get("totalMs")
+    outcome = value.get("outcome")
+    host_stages: list[tuple[str, Any]] = [
+        ("环境检查", host.get("ensure_host_ms")),
+        ("数据盘准备", host.get("volume_create_ms")),
         ("数据盘文件系统检查", host.get("e2fsck_ms")),
         ("网络租约分配", host.get("network_allocate_ms")),
         ("数据盘运行配置", host.get("volume_config_ms")),
         ("TAP与防火墙配置", host.get("network_setup_ms")),
         ("模型网关启动", host.get("gateway_ready_ms")),
         ("Jailer目录准备", host.get("jail_prepare_ms")),
-        ("Guest启动并就绪", host.get("guest_ready_ms")),
+        ("等待Guest就绪", host.get("guest_ready_ms")),
         ("生命周期登记", host.get("lifecycle_ms")),
-        ("内核启动并进入 init", guest.get("kernel_to_init")),
-        ("Guest数据盘挂载", guest.get("data_mount")),
-        ("Guest网络配置", guest.get("network")),
-        ("Guest预检", guest.get("preflight_tests")),
-        ("版本构建元数据读取", guest.get("version_check")),
-        ("Guest安全检查", guest.get("security_check")),
-        ("Pi RPC监听启动", guest.get("rpc_listener")),
-        ("Guest启动总耗时", guest.get("total_ms")),
     ]
-    rendered = [(label, milliseconds) for label, milliseconds in lines if isinstance(milliseconds, int)]
-    if not rendered:
-        return
-    console.timing("[启动耗时]")
-    for label, milliseconds in rendered:
-        console.timing(f"{label} = {milliseconds} ms")
+    guest_stages: list[tuple[str, Any]] = [
+        ("内核启动并进入init", guest.get("kernel_to_init")),
+        ("数据盘挂载", guest.get("data_mount")),
+        ("网络配置", guest.get("network")),
+        ("预检测试", guest.get("preflight_tests")),
+        ("版本元数据读取", guest.get("version_check")),
+        ("安全检查", guest.get("security_check")),
+        ("Pi RPC监听启动", guest.get("rpc_listener")),
+    ]
+    guest_total = guest.get("total_ms")
+    has_host = any(isinstance(ms, int) for _, ms in host_stages)
+    has_guest = any(isinstance(ms, int) for _, ms in guest_stages)
+    if not isinstance(total_ms, int) and not has_host and not has_guest:
+        return None
+
+    console.timing("[microVM 启动耗时] 从「停止」到「microVM 就绪」")
+    if isinstance(total_ms, int):
+        console.timing(f"启动总耗时（宿主计时） = {total_ms} ms")
+    if isinstance(outcome, str):
+        console.timing(f"启动结果 = {outcome}")
+    if has_host:
+        console.timing("宿主侧：")
+        for label, ms in host_stages:
+            if isinstance(ms, int):
+                console.timing(f"  {label} = {ms} ms")
+    if has_guest:
+        console.timing("Guest 侧（内核时钟，与宿主计时口径不同）：")
+        for label, ms in guest_stages:
+            if isinstance(ms, int):
+                console.timing(f"  {label} = {ms} ms")
+        if isinstance(guest_total, int):
+            console.timing(f"  Guest 自计时总耗时 = {guest_total} ms")
+    return total_ms if isinstance(total_ms, int) else None
 
 
 # STARTUP_TIMING_DIAGNOSTIC_END
@@ -448,6 +492,9 @@ def command_start(args: argparse.Namespace, store: SessionStore, console: Consol
     runtime = instance.get("runtime")
     if isinstance(runtime, dict):
         render_startup_timing(runtime.get("startupTiming"), console)
+        startup = runtime.get("startupTiming")
+        if isinstance(startup, dict) and isinstance(startup.get("totalMs"), int):
+            store.remember_cold_start(args.instance_id, startup["totalMs"])
     print_instance(instance, console)
 
 
@@ -573,16 +620,37 @@ def fetch_history(
     return payload
 
 
+def remember_cold_start_from_payload(
+    store: SessionStore, instance_id: str, payload: dict[str, Any]
+) -> None:
+    """若响应中带了冷启动计时，就把它存为该实例的冷启动基线。"""
+    startup = payload.get("startupTiming")
+    if isinstance(startup, dict) and isinstance(startup.get("totalMs"), int):
+        store.remember_cold_start(instance_id, startup["totalMs"])
+
+
 def render_history(payload: dict[str, Any], console: Console) -> None:
-    render_startup_timing(payload.get("startupTiming"), console)
+    startup_total = render_startup_timing(payload.get("startupTiming"), console)
     # PI_SESSION_TIMING_DIAGNOSTIC_BEGIN
     history_timing = payload.get("historyTiming")
-    if isinstance(history_timing, dict):
-        milliseconds = history_timing.get("piSessionLoadMs")
-        if isinstance(milliseconds, int):
-            console.timing("[会话加载耗时]")
-            console.timing(f"Pi进程启动并加载原生Session = {milliseconds} ms")
+    session_ms = (
+        history_timing.get("piSessionLoadMs")
+        if isinstance(history_timing, dict)
+        and isinstance(history_timing.get("piSessionLoadMs"), int)
+        else None
+    )
     # PI_SESSION_TIMING_DIAGNOSTIC_END
+    if session_ms is not None:
+        console.timing("[Pi 进程加载会话] 从「连接 Guest Pi RPC」到「历史返回」")
+        console.timing(f"Pi 进程冷启动并加载 Session = {session_ms} ms")
+    if startup_total is not None and session_ms is not None:
+        console.timing("— 打开旧会话总耗时 —")
+        console.timing(
+            f"microVM 启动 {startup_total} ms + Pi 加载会话 {session_ms} ms = "
+            f"{startup_total + session_ms} ms"
+        )
+    elif session_ms is not None:
+        console.timing("（microVM 已就绪，本次未包含启动耗时）")
     messages = payload.get("messages", [])
     if not messages:
         console.warning("该页没有消息")
@@ -598,6 +666,7 @@ def command_history(args: argparse.Namespace, store: SessionStore, console: Cons
     payload = fetch_history(
         client, args.instance_id, args.conversation_id, args.limit, args.before
     )
+    remember_cold_start_from_payload(store, args.instance_id, payload)
     render_history(payload, console)
 
 
@@ -630,16 +699,26 @@ def command_resume(args: argparse.Namespace, store: SessionStore, console: Conso
     console.success(f"实例已恢复：{instance['id']}")
     if isinstance(timing, dict):
         labels = (
-            ("模型网关启动", "gatewayMs"),
-            ("Firecracker进程就绪", "processMs"),
-            ("快照加载", "loadMs"),
+            ("模型网关启动（宿主，仍需重做）", "gatewayMs"),
+            ("Firecracker进程就绪（宿主）", "processMs"),
+            ("快照加载（替代Guest启动）", "loadMs"),
             ("Guest恢复运行", "resumeApiMs"),
             ("快照恢复总耗时", "totalMs"),
         )
-        console.timing("[快照恢复耗时]")
+        console.timing("[快照恢复耗时] 从「suspended」到「running」")
         for label, key in labels:
             if isinstance(timing.get(key), int):
                 console.timing(f"{label} = {timing[key]} ms")
+        resume_total = timing.get("totalMs")
+        if isinstance(resume_total, int):
+            baseline = store.cold_start_baseline(args.instance_id)
+            if baseline is not None and baseline > resume_total:
+                console.timing(
+                    f"相比上次冷启动 {baseline} ms，本次快照恢复省掉约 "
+                    f"{baseline - resume_total} ms"
+                )
+        console.timing("说明：快照只省「microVM 开机（Guest 启动）」这一段")
+        console.timing("不省「Pi 进程加载会话」——读历史时仍会单独计时。")
     print_instance(instance, console)
 
 
@@ -785,10 +864,11 @@ def command_chat(args: argparse.Namespace, store: SessionStore, console: Console
             "GET", f"/api/instances/{instance_id}/conversations/{conversation_id}"
         )
         console.system(f"继续会话：{conversation.get('title') or conversation_id}")
-        render_history(
-            fetch_history(client, instance_id, conversation_id, args.history_limit),
-            console,
+        history_payload = fetch_history(
+            client, instance_id, conversation_id, args.history_limit
         )
+        remember_cold_start_from_payload(store, instance_id, history_payload)
+        render_history(history_payload, console)
     console.system(f"会话={conversation_id}；输入 /exit 退出，不会停止实例")
 
     while True:

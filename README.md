@@ -468,3 +468,15 @@ OpenAPI 规范，供上中层前后端对接：
 规划与架构文档位于 [`docs/`](./docs/README.md)。README 只维护当前代码可执行的环境
 搭建、运行和验收方法。当前只实现手动快照暂停与恢复；自动快照策略、预热池和生产
 集群仍属于后续设计，不作为当前命令承诺。
+
+## 任务交接记录
+
+> 基于 commit `9b496bd`（分支 `codex/snapshot-resume`），本次改动如下，供后续 agent 交接。
+
+- 重构 `agentctl` 计时打印（`services/cli/main.py`）：
+  - 「microVM 启动耗时」按宿主侧 / Guest 侧分组，并注明两组计时源不同（宿主 `time.monotonic` vs Guest `/proc/uptime`），避免「宿主总耗时」与「Guest 自计时」混淆。
+  - 读历史时新增「打开旧会话总耗时 = microVM 启动 + Pi 加载会话」汇总行，明确快照只省前者、不省后者。
+  - 新增冷启动基线持久化（写入本地会话文件），`agentctl resume` 会打印「相比上次冷启动省掉约 X ms」，并说明快照省/不省的范围。
+- 同步更新 `services/cli/test_main.py`（16 个用例全部通过）。
+
+仅改动客户端展示逻辑，未改控制面接口；控制面与 microVM 无需重启。
