@@ -97,8 +97,8 @@ class AuthStore:
     @staticmethod
     def validate_password(password: str) -> None:
         password_bytes = password.encode("utf-8")
-        if len(password_bytes) < 12 or len(password_bytes) > 256:
-            raise AuthError("密码长度必须为 12-256 个 UTF-8 字节")
+        if len(password_bytes) < 8 or len(password_bytes) > 256:
+            raise AuthError("密码长度必须为 8-256 个 UTF-8 字节")
 
     def create_user(self, username: str, password: str, *, claim_unowned: bool = True) -> dict[str, Any]:
         username = self.validate_username(username)
