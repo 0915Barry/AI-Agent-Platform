@@ -53,6 +53,55 @@ macOS + UTM / Windows + VMware
 Windows 不应在 PowerShell、Git Bash 或 WSL2 中直接执行 `run-linux.sh`。仓库、镜像和
 数据盘必须放在 VMware Ubuntu 的原生 ext4 磁盘中。
 
+## Linux 服务器部署前的资源与能力要求
+
+Firecracker 必须运行在能够访问 KVM 的 Linux Host 上。租用服务器时，优先选择
+裸金属服务器；也可以选择明确支持嵌套虚拟化、并允许 Ubuntu 读写 `/dev/kvm` 的云主机。
+普通云主机即使 CPU 和内存充足，如果没有暴露 `/dev/kvm`，也无法运行本项目。
+
+服务器还需要允许创建 TUN/TAP 设备、配置 nftables、开启 IPv4 forwarding，并提供
+root 或完整 `sudo` 权限。仓库、rootfs、用户数据盘和快照应放在 Linux 原生 ext4
+文件系统中，建议使用本地 NVMe SSD；不要放在 SMB、NFS 或云盘共享目录中直接运行。
+
+当前每个受管 microVM 的实际配置为：
+
+| 资源 | 当前值 |
+|---|---:|
+| vCPU | 2 |
+| Guest 内存 | 1024 MiB |
+| 共享只读 rootfs | 4 GiB |
+| 用户持久化数据盘 | 1 GiB |
+| 默认空闲回收时间 | 300 秒 |
+
+服务器可按使用阶段选择：
+
+| 使用阶段 | CPU | 内存 | 存储 | 适用范围 |
+|---|---:|---:|---:|---|
+| 最低功能验证 | 4 核 | 16 GiB | 100–200 GiB SSD | 约 1–3 个轻量并发实例 |
+| 团队测试 / MVP | 8 核 | 32 GiB | 300 GiB 以上 NVMe | 约 5–10 个轻量并发实例 |
+| 生产试点 | 16 核 | 64 GiB | 1 TiB NVMe | 需压测后确定并发上限 |
+
+内存可按下面的方式粗略估算：Host 预留约 8 GiB，再为每个并发 microVM 预留约
+1.2 GiB。磁盘除操作系统和共享 rootfs 外，还需要容纳每个用户的数据盘、每个暂停
+实例的内存快照、构建缓存、日志和备份，因此不能只按 rootfs 大小采购。
+
+租用前应向供应商确认：服务器是否为裸金属或支持嵌套虚拟化，Ubuntu 是否能够直接
+读写 `/dev/kvm`，以及是否允许配置 TAP、nftables 和 IP forwarding。拿到服务器后先执行：
+
+```bash
+uname -m
+cat /etc/os-release
+ls -l /dev/kvm
+test -r /dev/kvm && test -w /dev/kvm && echo "KVM access OK"
+lsmod | grep kvm
+df -T
+```
+
+只有输出 `KVM access OK` 才应继续部署。项目已经准备 `x86_64` 与 `aarch64` 的固定构建物，
+但当前完整实测环境仍是 Apple Silicon + UTM + Ubuntu ARM64；租用常见 `x86_64` Linux
+服务器后，应先执行 `./run-linux.sh doctor`、`bootstrap` 和 `verify` 完成实机验收，
+再根据真实并发和启动耗时决定长期服务器规格。
+
 ## macOS + UTM 首次部署
 
 ### 1. 创建 Ubuntu VM
