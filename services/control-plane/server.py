@@ -632,12 +632,17 @@ class ControlPlane:
         return {**record, "runtime": runtime_status}
 
     def destroy(self, instance_id: str) -> dict[str, Any]:
-        """先销毁宿主资源，再删除 SQLite 记录，避免产生孤儿磁盘。"""
+        """先销毁宿主资源，再删除 SQLite 记录，避免产生孤儿磁盘。
+
+        有属主的用户实例保留其持久化数据盘；无属主的临时实例（smoke/诊断）
+        连同数据盘一起删除。
+        """
         instance_id = self.validate_requested_id(instance_id)
         with self.lock_for(instance_id):
             record = self.store.get(instance_id)
+            preserve_volume = record.get("ownerId") is not None
             try:
-                self.runtime.destroy(instance_id)
+                self.runtime.destroy(instance_id, preserve_volume=preserve_volume)
             except (RuntimeFailure, subprocess.SubprocessError) as error:
                 self.store.update(instance_id, "failed", str(error)[-4000:])
                 raise ApiError(500, "instance_destroy_failed", str(error)) from error

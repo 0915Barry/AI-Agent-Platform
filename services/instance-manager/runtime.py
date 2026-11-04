@@ -1281,12 +1281,20 @@ class InstanceRuntime:
             raise RuntimeFailure(f"instance is not registered: {instance_id}")
         return status
 
-    def destroy(self, instance_id: str) -> None:
-        """销毁一次运行实例，但保留归属于用户的持久化数据盘。"""
+    def destroy(self, instance_id: str, *, preserve_volume: bool = True) -> None:
+        """销毁一次运行实例。
+
+        preserve_volume=True 时保留用户持久化数据盘（有属主的用户实例）；
+        False 时连同数据盘一起删除（无属主的 smoke/临时实例）。由调用方根据
+        实例是否有 owner 决定。
+        """
         instance_id = validate_instance_id(instance_id)
         paths = self.paths(instance_id)
         if self.status(instance_id) is not None:
-            self.lifecycle("destroy", instance_id, "--preserve-volume")
+            arguments = ["destroy", instance_id]
+            if preserve_volume:
+                arguments.append("--preserve-volume")
+            self.lifecycle(*arguments)
         else:
             shutil.rmtree(paths["jail"], ignore_errors=True)
         shutil.rmtree(paths["state"], ignore_errors=True)

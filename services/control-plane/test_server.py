@@ -101,10 +101,10 @@ class FakeRuntime:
     def discard_snapshot(self, instance_id: str) -> None:
         self.calls.append(("discard_snapshot", instance_id))
 
-    def destroy(self, instance_id: str) -> None:
+    def destroy(self, instance_id: str, *, preserve_volume: bool = True) -> None:
         """模拟彻底销毁实例及其运行时状态。"""
 
-        self.calls.append(("destroy", instance_id))
+        self.calls.append(("destroy", instance_id, preserve_volume))
         self.instances.pop(instance_id, None)
 
     def busy(self, instance_id: str, enabled: bool) -> None:
@@ -266,6 +266,17 @@ class ControlPlaneTests(unittest.TestCase):
         with self.assertRaises(SERVER.ApiError) as missing:
             self.control.get("agent-test")
         self.assertEqual(missing.exception.status, 404)
+
+    def test_destroy_preserves_volume_only_for_owned_instances(self) -> None:
+        """无属主的临时实例 destroy 应删卷，有属主的用户实例应保留卷。"""
+
+        self.control.create({"id": "agent-temp"})
+        self.control.destroy("agent-temp")
+        self.assertIn(("destroy", "agent-temp", False), self.runtime.calls)
+
+        self.control.create({"id": "agent-owned"}, "user-owner")
+        self.control.destroy("agent-owned")
+        self.assertIn(("destroy", "agent-owned", True), self.runtime.calls)
 
     def test_manual_snapshot_suspend_and_resume(self) -> None:
         """认证用户可以手动暂停并从快照恢复自己的运行实例。"""
