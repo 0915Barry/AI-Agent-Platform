@@ -116,7 +116,7 @@ class PiGatewayTests(unittest.TestCase):
         self.assertEqual(server.command["workspace"], "workspace-0123456789abcdef")
         self.assertEqual(server.command["session"], "conversation-0123456789abcdef")
         self.assertEqual(output, "你好，完成")
-        self.assertEqual([kind for kind, _ in events], ["progress", "text", "tool_call", "tool_result"])
+        self.assertEqual([kind for kind, _ in events], ["progress", "message.delta", "tool.started", "tool.completed"])
         self.assertTrue(server.flush_probe_received)
 
     def test_rejected_prompt_raises_protocol_error(self) -> None:

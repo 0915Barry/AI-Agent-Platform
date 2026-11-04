@@ -159,10 +159,10 @@ events="$(
 printf '%s' "${events}" | jq -e '
   [.events[].type] as $types
   | ($types | index("queued")) != null
-  and ($types | index("started")) != null
+  and ($types | index("run.started")) != null
   and ($types | index("progress")) != null
-  and ($types | index("text")) != null
-  and ($types | index("completed")) != null
+  and ($types | index("message.delta")) != null
+  and ($types | index("run.completed")) != null
 ' >/dev/null
 
 curl --fail --silent --show-error --max-time 30 \

@@ -386,8 +386,8 @@ GET  /api/instances/{id}/tasks/{task_id}/stream
 ```
 
 Pi Gateway 从实例运行元数据读取 `guestIp` 和 `rpcPort`，通过 TCP 连接 Guest 的
-Pi RPC。它将 Pi 原生 JSONL 事件标准化为 `progress`、`text`、`tool_call`、
-`tool_result`、`completed` 或 `failed`，写入 SQLite，并通过 SSE 流输出。一个实例同一
+Pi RPC。它将 Pi 原生 JSONL 事件标准化为 `progress`、`message.delta`、`tool.started`、
+`tool.completed`、`run.completed` 或 `run.failed`，写入 SQLite，并通过 SSE 流输出。一个实例同一
 时间串行处理任务，任务执行期间设置生命周期 `busy` 标记。
 
 用户、工作区、会话索引、任务和事件与实例、运行状态、网络租约及用户数据盘归属

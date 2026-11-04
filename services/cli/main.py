@@ -749,29 +749,29 @@ def render_task_events(
                 text_started = False
             stage = payload.get("stage", "处理中")
             console.system(f"任务状态：{stage}")
-        elif event_type == "text":
+        elif event_type == "message.delta":
             delta = payload.get("delta")
             if isinstance(delta, str) and delta:
                 if not text_started:
                     print(console.paint("Pi > ", "green"), end="", file=console.output, flush=True)
                     text_started = True
                 print(delta, end="", file=console.output, flush=True)
-        elif event_type == "tool_call":
+        elif event_type == "tool.started":
             if text_started:
                 print(file=console.output)
                 text_started = False
             console.tool(f"调用 {payload.get('toolName') or 'unknown'}")
-        elif event_type == "tool_result":
+        elif event_type == "tool.completed":
             if text_started:
                 print(file=console.output)
                 text_started = False
             state = "失败" if payload.get("isError") else "完成"
             console.tool(f"{payload.get('toolName') or 'unknown'} {state}")
-        elif event_type == "failed":
+        elif event_type == "run.failed":
             if text_started:
                 print(file=console.output)
             raise CliError(str(payload.get("error") or "Agent 任务失败"))
-        elif event_type == "completed":
+        elif event_type == "run.completed":
             if text_started:
                 print(file=console.output)
             elif isinstance(payload.get("output"), str):

@@ -228,7 +228,7 @@
 
 `GET /api/instances/{instance_id}/tasks/{task_id}/stream`
 
-- 返回 `text/event-stream`，逐条推送任务事件，遇到 `completed` / `failed` 后**服务端主动关闭连接**。
+- 返回 `text/event-stream`，逐条推送任务事件，遇到 `run.completed` / `run.failed` 后**服务端主动关闭连接**。
 - 支持断线续传：重连时带上 `Last-Event-ID: <sequence>`（或 `?after=<sequence>`），服务端只补发遗漏事件。
 
 帧格式：
@@ -236,7 +236,7 @@
 ```text
 id: 12
 event: task-event
-data: {"sequence":12,"type":"text","data":{"delta":"改好"},"createdAt":1750000000}
+data: {"sequence":12,"type":"message.delta","data":{"delta":"改好"},"createdAt":1750000000}
 
 : heartbeat
 ```
@@ -340,21 +340,21 @@ data: {"sequence":12,"type":"text","data":{"delta":"改好"},"createdAt":1750000
 | `type` | `data`（payload） | 含义 |
 |---|---|---|
 | `queued` | `{}` | 任务已入队 |
-| `started` | `{}` | 下层消费者已领取，开始执行 |
+| `run.started` | `{}` | 下层消费者已领取，开始执行 |
 | `startup_timing` | `{ outcome, totalMs, host:{...}, guest:{...} }` | （冷启动时的）启动耗时诊断，可忽略 |
 | `progress` | `{ "stage": "model_started" }` | 开始调模型 |
 | `progress` | `{ "stage": "retrying", "attempt": 1, "delayMs": 800 }` | 自动重试 |
-| `text` | `{ "delta": "改好" }` | 文本增量，**前端直接拼接展示** |
-| `tool_call` | `{ "toolCallId": "...", "toolName": "read", "arguments": {...} }` | Agent 开始调用工具 |
-| `tool_result` | `{ "toolCallId": "...", "toolName": "read", "isError": false, "preview": "...", "truncated": false }` | 工具返回（`preview` 截断至 2000 字符） |
-| `completed` | `{ "output": "最终完整回复文本" }` | 任务真正结束（收到即关闭连接） |
-| `failed` | `{ "error": "错误信息" }` | 任务失败（收到即关闭连接） |
+| `message.delta` | `{ "delta": "改好" }` | 文本增量，**前端直接拼接展示** |
+| `tool.started` | `{ "toolCallId": "...", "toolName": "read", "arguments": {...} }` | Agent 开始调用工具 |
+| `tool.completed` | `{ "toolCallId": "...", "toolName": "read", "isError": false, "preview": "...", "truncated": false }` | 工具返回（`preview` 截断至 2000 字符） |
+| `run.completed` | `{ "output": "最终完整回复文本" }` | 任务真正结束（收到即关闭连接） |
+| `run.failed` | `{ "error": "错误信息" }` | 任务失败（收到即关闭连接） |
 
 前端渲染要点：
 
-- 把每个 `text` 事件的 `delta` 依次追加到当前回答即可（流式打字效果）。
-- `tool_call` / `tool_result` 可作为「思考/工具执行过程」折叠展示。
-- `completed` 的 `output` 是最终完整文本，可用于兜底覆盖拼接结果。
+- 把每个 `message.delta` 事件的 `delta` 依次追加到当前回答即可（流式打字效果）。
+- `tool.started` / `tool.completed` 可作为「思考/工具执行过程」折叠展示。
+- `run.completed` 的 `output` 是最终完整文本，可用于兜底覆盖拼接结果。
 
 ---
 
@@ -438,9 +438,9 @@ const es = new EventSource(
 );
 es.addEventListener('task-event', (e) => {
   const ev = JSON.parse(e.data);
-  if (ev.type === 'text') appendText(ev.data.delta);
-  else if (ev.type === 'completed') console.log('完成:', ev.data.output);
-  else if (ev.type === 'failed') console.error(ev.data.error);
+  if (ev.type === 'message.delta') appendText(ev.data.delta);
+  else if (ev.type === 'run.completed') console.log('完成:', ev.data.output);
+  else if (ev.type === 'run.failed') console.error(ev.data.error);
 });
 ```
 

@@ -419,7 +419,7 @@ paths:
 
   /api/instances/{instanceId}/tasks/{taskId}/stream:
     get:
-      summary: SSE 流式订阅任务事件（收到 completed/failed 后关闭）
+      summary: SSE 流式订阅任务事件（收到 run.completed/run.failed 后关闭）
       parameters:
         - { $ref: "#/components/parameters/InstanceId" }
         - { $ref: "#/components/parameters/TaskId" }
@@ -584,7 +584,7 @@ components:
     TaskEvent:
       type: object
       description: |
-        type 取值：queued | started | startup_timing | progress | text | tool_call | tool_result | completed | failed
+        type 取值：queued | run.started | startup_timing | progress | message.delta | tool.started | tool.completed | run.completed | run.failed
         data 随 type 变化（见 docs/API契约.md §8）。
       properties:
         sequence: { type: integer }

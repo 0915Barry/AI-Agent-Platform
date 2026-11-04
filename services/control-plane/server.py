@@ -1020,14 +1020,14 @@ class ControlPlane:
             )
             # Agent 运行时只有收到 agent_settled 才会返回，因此这里的 completed 表示
             # 模型循环及其中的工具调用均已真正结束，而不只是收到最后一个文本块。
-            self.tasks.append_event(instance_id, task_id, "completed", {"output": output})
+            self.tasks.append_event(instance_id, task_id, "run.completed", {"output": output})
             self.runtime.heartbeat(instance_id)
         except Exception as error:
             try:
                 self.tasks.append_event(
                     instance_id,
                     task_id,
-                    "failed",
+                    "run.failed",
                     {"error": str(error)[:4000]},
                 )
             except TaskStoreError:
@@ -1166,7 +1166,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                     frame = f"id: {cursor}\nevent: task-event\ndata: {body}\n\n"
                     self.wfile.write(frame.encode("utf-8"))
                     self.wfile.flush()
-                    if event["type"] in {"completed", "failed"}:
+                    if event["type"] in {"run.completed", "run.failed"}:
                         self.close_connection = True
                         return
 

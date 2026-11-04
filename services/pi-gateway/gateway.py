@@ -218,7 +218,7 @@ class PiGateway:
                         if isinstance(update, dict) and update.get("type") == "text_delta":
                             delta = update.get("delta")
                             if isinstance(delta, str) and delta:
-                                on_event("text", {"delta": delta})
+                                on_event("message.delta", {"delta": delta})
                     elif record_type == "message_end":
                         # 暂存最终消息，但仍继续读取到 agent_settled；工具调用、自动
                         # 重试或后续模型轮次可能发生在某个 message_end 之后。
@@ -229,7 +229,7 @@ class PiGateway:
                         # 把 Pi 原生字段转换成平台统一事件名，Control Plane 无需理解
                         # Pi 的全部 RPC 结构即可保存并推送给不同客户端。
                         on_event(
-                            "tool_call",
+                            "tool.started",
                             {
                                 "toolCallId": record.get("toolCallId"),
                                 "toolName": record.get("toolName"),
@@ -237,7 +237,7 @@ class PiGateway:
                             },
                         )
                     elif record_type == "tool_execution_end":
-                        on_event("tool_result", self._safe_tool_result(record))
+                        on_event("tool.completed", self._safe_tool_result(record))
                     elif record_type == "auto_retry_start":
                         on_event(
                             "progress",

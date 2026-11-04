@@ -139,7 +139,7 @@ class FakePiGateway:
     ) -> str:
         self.calls.append((host, port, prompt, workspace_id, session_id))
         on_event("progress", {"stage": "model_started"})
-        on_event("text", {"delta": "自动"})
+        on_event("message.delta", {"delta": "自动"})
         return "自动完成"
 
     def get_messages(
@@ -447,7 +447,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.tasks.append_event(
             "agent-task",
             claimed["id"],
-            "completed",
+            "run.completed",
             {"output": "M11_OK"},
         )
 
@@ -455,7 +455,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(completed["output"], "M11_OK")
         event_types = [event["type"] for event in self.control.task_events("agent-task", claimed["id"])]
-        self.assertEqual(event_types, ["queued", "started", "completed"])
+        self.assertEqual(event_types, ["queued", "run.started", "run.completed"])
 
     def test_pi_gateway_automatically_dispatches_queued_task(self) -> None:
         """正式控制面应把任务主动发给 Guest Pi RPC，不再等待 Agent Bridge 领取。"""
@@ -479,7 +479,7 @@ class ControlPlaneTests(unittest.TestCase):
             event["type"]
             for event in self.control.task_events("agent-gateway", queued["id"])
         ]
-        self.assertEqual(event_types, ["queued", "started", "progress", "text", "completed"])
+        self.assertEqual(event_types, ["queued", "run.started", "progress", "message.delta", "run.completed"])
         self.assertIn(("busy_on", "agent-gateway"), self.runtime.calls)
         self.assertIn(("busy_off", "agent-gateway"), self.runtime.calls)
 
@@ -494,9 +494,9 @@ class ControlPlaneTests(unittest.TestCase):
         self.tasks.append_event(
             "agent-stream", claimed["id"], "progress", {"stage": "model_started"}
         )
-        self.tasks.append_event("agent-stream", claimed["id"], "text", {"delta": "hello"})
+        self.tasks.append_event("agent-stream", claimed["id"], "message.delta", {"delta": "hello"})
         self.tasks.append_event(
-            "agent-stream", claimed["id"], "completed", {"output": "hello"}
+            "agent-stream", claimed["id"], "run.completed", {"output": "hello"}
         )
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), SERVER.ControlPlaneHandler)
@@ -512,8 +512,8 @@ class ControlPlaneTests(unittest.TestCase):
                 body = response.read().decode("utf-8")
                 self.assertEqual(response.headers.get_content_type(), "text/event-stream")
             self.assertIn("event: task-event", body)
-            self.assertIn('"type":"text"', body)
-            self.assertIn('"type":"completed"', body)
+            self.assertIn('"type":"message.delta"', body)
+            self.assertIn('"type":"run.completed"', body)
             event_ids = [
                 int(line.removeprefix("id: "))
                 for line in body.splitlines()
@@ -528,9 +528,9 @@ class ControlPlaneTests(unittest.TestCase):
             with urllib.request.urlopen(resume_request, timeout=3) as response:
                 resumed = response.read().decode("utf-8")
             self.assertNotIn('"type":"queued"', resumed)
-            self.assertNotIn('"type":"started"', resumed)
+            self.assertNotIn('"type":"run.started"', resumed)
             self.assertIn('"type":"progress"', resumed)
-            self.assertIn('"type":"completed"', resumed)
+            self.assertIn('"type":"run.completed"', resumed)
         finally:
             server.shutdown()
             server.server_close()
@@ -564,7 +564,7 @@ class ControlPlaneTests(unittest.TestCase):
         claimed_first = self.tasks.claim_next("agent-chat")
         assert claimed_first is not None
         self.tasks.append_event(
-            "agent-chat", claimed_first["id"], "completed", {"output": "好的，我会记住。"}
+            "agent-chat", claimed_first["id"], "run.completed", {"output": "好的，我会记住。"}
         )
 
         second = self.control.create_conversation_message(
@@ -578,7 +578,7 @@ class ControlPlaneTests(unittest.TestCase):
         claimed_second = self.tasks.claim_next("agent-chat")
         assert claimed_second is not None
         self.tasks.append_event(
-            "agent-chat", claimed_second["id"], "completed", {"output": "你的代号是 Alpha。"}
+            "agent-chat", claimed_second["id"], "run.completed", {"output": "你的代号是 Alpha。"}
         )
 
         self.control.agent_runtime = gateway

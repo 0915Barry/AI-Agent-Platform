@@ -593,21 +593,21 @@ class TaskStore:
                 return None
             connection.execute(
                 "INSERT INTO task_events(task_id,event_type,payload,created_at) VALUES(?,?,?,?)",
-                (row["id"], "started", "{}", now),
+                (row["id"], "run.started", "{}", now),
             )
         return self.get(instance_id, row["id"])
 
     def append_event(self, instance_id: str, task_id: str, event_type: str, payload: dict[str, Any]) -> None:
-        """追加 guest 事件，并在 completed/failed 时同步任务终态。"""
+        """追加 guest 事件，并在 run.completed/run.failed 时同步任务终态。"""
 
         if event_type not in {
             "startup_timing",
             "progress",
-            "text",
-            "tool_call",
-            "tool_result",
-            "completed",
-            "failed",
+            "message.delta",
+            "tool.started",
+            "tool.completed",
+            "run.completed",
+            "run.failed",
         }:
             raise TaskStoreError(f"unsupported task event: {event_type}")
         task = self.get(instance_id, task_id)
@@ -620,7 +620,7 @@ class TaskStore:
                 "INSERT INTO task_events(task_id,event_type,payload,created_at) VALUES(?,?,?,?)",
                 (task_id, event_type, encoded, now),
             )
-            if event_type == "completed":
+            if event_type == "run.completed":
                 output = payload.get("output")
                 if not isinstance(output, str):
                     raise TaskStoreError("completed event requires string output")
@@ -653,7 +653,7 @@ class TaskStore:
                         "updated_at=? WHERE id=?",
                         (output, now, row["conversation_id"]),
                     )
-            elif event_type == "failed":
+            elif event_type == "run.failed":
                 error = payload.get("error")
                 if not isinstance(error, str):
                     raise TaskStoreError("failed event requires string error")
@@ -703,7 +703,7 @@ class TaskStore:
                 payload = json.dumps({"error": reason}, separators=(",", ":"))
                 connection.execute(
                     "INSERT INTO task_events(task_id,event_type,payload,created_at) VALUES(?,?,?,?)",
-                    (row["id"], "failed", payload, now),
+                    (row["id"], "run.failed", payload, now),
                 )
                 connection.execute(
                     "UPDATE tasks SET status='failed',error=?,updated_at=? WHERE id=?",

@@ -80,9 +80,9 @@ class MockControlPlane(BaseHTTPRequestHandler):
             return
         if parsed.path.endswith("/stream"):
             body = (
-                'id: 1\nevent: task-event\ndata: {"sequence":1,"type":"text",'
+                'id: 1\nevent: task-event\ndata: {"sequence":1,"type":"message.delta",'
                 '"data":{"delta":"你好"}}\n\n'
-                'id: 2\nevent: task-event\ndata: {"sequence":2,"type":"completed",'
+                'id: 2\nevent: task-event\ndata: {"sequence":2,"type":"run.completed",'
                 '"data":{"output":"你好"}}\n\n'
             ).encode("utf-8")
             self.send_response(200)
@@ -337,7 +337,7 @@ class AgentCtlTests(unittest.TestCase):
     def test_sse_events_are_decoded(self) -> None:
         events = list(cli.ApiClient(self.base_url, "aap_session=test-token").events("/stream"))
         self.assertEqual(events[0]["data"]["delta"], "你好")
-        self.assertEqual(events[-1]["type"], "completed")
+        self.assertEqual(events[-1]["type"], "run.completed")
 
     def test_session_file_is_private_and_removable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
