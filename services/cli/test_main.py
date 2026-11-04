@@ -200,31 +200,14 @@ class AgentCtlTests(unittest.TestCase):
         self.assertEqual(console.paint("错误", "red"), "\033[91m错误\033[0m")
         self.assertEqual(console.paint("启动", "pink"), "\033[95m启动\033[0m")
 
-    def test_startup_timing_is_rendered_one_item_per_line(self) -> None:
-        output = io.StringIO()
-        console = cli.Console(False, output)
+    def test_startup_timing_returns_total_ms(self) -> None:
         total_ms = cli.render_startup_timing(
-            {
-                "totalMs": 11754,
-                "host": {"guest_ready_ms": 11269},
-                "guest": {"kernel_to_init": 3060},
-            },
-            console,
+            {"totalMs": 11754, "host": {}, "guest": {}}
         )
         self.assertEqual(total_ms, 11754)
-        self.assertEqual(
-            output.getvalue().splitlines(),
-            [
-                "[microVM 启动耗时] 从「停止」到「microVM 就绪」",
-                "启动总耗时（宿主计时） = 11754 ms",
-                "宿主侧：",
-                "  等待Guest就绪 = 11269 ms",
-                "Guest 侧（内核时钟，与宿主计时口径不同）：",
-                "  内核启动并进入init = 3060 ms",
-            ],
-        )
+        self.assertIsNone(cli.render_startup_timing({}))
 
-    def test_pi_session_load_timing_is_rendered_before_history(self) -> None:
+    def test_history_renders_user_friendly_session_load(self) -> None:
         output = io.StringIO()
         console = cli.Console(False, output)
         cli.render_history(
@@ -238,9 +221,7 @@ class AgentCtlTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue().splitlines(),
             [
-                "[Pi 进程加载会话] 从「连接 Guest Pi RPC」到「历史返回」",
-                "Pi 进程冷启动并加载 Session = 4876 ms",
-                "（microVM 已就绪，本次未包含启动耗时）",
+                "[系统] 打开会话花费 4.9 秒",
                 "[警告] 该页没有消息",
             ],
         )
@@ -257,10 +238,7 @@ class AgentCtlTests(unittest.TestCase):
             },
             console,
         )
-        self.assertIn(
-            "microVM 启动 5011 ms + Pi 加载会话 7064 ms = 12075 ms",
-            output.getvalue(),
-        )
+        self.assertIn("[系统] 打开会话花费 12.1 秒", output.getvalue())
 
     def test_cold_start_baseline_is_persisted_per_instance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
