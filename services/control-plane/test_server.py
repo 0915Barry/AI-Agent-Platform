@@ -174,7 +174,7 @@ class ControlPlaneTests(unittest.TestCase):
     def test_workspace_groups_conversations_and_auto_starts_runtime(self) -> None:
         owner_id = "user-workspace"
         gateway = FakePiGateway()
-        self.control.pi_gateway = gateway
+        self.control.agent_runtime = gateway
         instance = self.store.create("agent-workspace", owner_id)
         self.assertEqual(instance["status"], "created")
         workspace = self.control.create_workspace(owner_id, {"name": "Project A"})
@@ -450,7 +450,7 @@ class ControlPlaneTests(unittest.TestCase):
         """正式控制面应把任务主动发给 Guest Pi RPC，不再等待 Agent Bridge 领取。"""
 
         gateway = FakePiGateway()
-        self.control.pi_gateway = gateway
+        self.control.agent_runtime = gateway
         self.control.create({"id": "agent-gateway"})
         self.control.start("agent-gateway")
         queued = self.control.create_task("agent-gateway", {"prompt": "执行任务"})
@@ -570,7 +570,7 @@ class ControlPlaneTests(unittest.TestCase):
             "agent-chat", claimed_second["id"], "completed", {"output": "你的代号是 Alpha。"}
         )
 
-        self.control.pi_gateway = gateway
+        self.control.agent_runtime = gateway
         gateway.messages = [
             {"role": "user", "content": "请记住我的代号是 Alpha", "timestamp": 1000},
             {

@@ -34,14 +34,18 @@ from urllib.parse import parse_qs, urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTANCE_MANAGER_DIR = REPO_ROOT / "services" / "instance-manager"
-PI_GATEWAY_DIR = REPO_ROOT / "services" / "pi-gateway"
+AGENT_RUNTIME_DIR = REPO_ROOT / "services" / "agent-runtime"
 sys.path.insert(0, str(INSTANCE_MANAGER_DIR))
-sys.path.insert(0, str(PI_GATEWAY_DIR))
+sys.path.insert(0, str(AGENT_RUNTIME_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from runtime import InstanceRuntime, RuntimeFailure  # noqa: E402
 from auth import AuthStore  # noqa: E402
-from gateway import PiGateway, PiGatewayError  # noqa: E402
+from agent_runtime import (  # noqa: E402
+    AgentRuntimeAdapter,
+    AgentRuntimeError,
+    PiRuntimeAdapter,
+)
 from task_store import TaskStore, TaskStoreError  # noqa: E402
 from workspace_store import WorkspaceStore, WorkspaceStoreError  # noqa: E402
 
@@ -257,8 +261,8 @@ class ControlPlane:
 
     InstanceStore 保存实例的产品状态；InstanceRuntime 实际创建 TAP、Jailer 和
     Firecracker；WorkspaceStore 与 TaskStore 保存工作区、会话、消息和任务；
-    PiGateway 则把已排队任务发送到 Guest。HTTP Handler 只负责协议适配，不直接
-    操作这些底层组件。
+    Agent Runtime 适配器则把已排队任务发送到 Guest。HTTP Handler 只负责协议
+    适配，不直接操作这些底层组件。
 
     同一实例的变更使用进程内锁串行化，防止两个并发 start/stop 请求互相覆盖。
     不同实例仍可由 ThreadingHTTPServer 并行处理。
@@ -269,13 +273,13 @@ class ControlPlane:
         store: InstanceStore,
         runtime: InstanceRuntime,
         tasks: TaskStore,
-        pi_gateway: PiGateway | None = None,
+        agent_runtime: AgentRuntimeAdapter | None = None,
         workspaces: WorkspaceStore | None = None,
     ) -> None:
         self.store = store
         self.runtime = runtime
         self.tasks = tasks
-        self.pi_gateway = pi_gateway
+        self.agent_runtime = agent_runtime
         self.workspaces = workspaces
         self._locks_guard = threading.Lock()
         self._locks: dict[str, threading.RLock] = {}
@@ -740,7 +744,7 @@ class ControlPlane:
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, int]]:
         """启动必要的计算资源，并通过 Pi RPC 读取数据盘中的原生 Session。"""
 
-        if self.pi_gateway is None:
+        if self.agent_runtime is None:
             # 纯本地单元测试或旧服务没有 Gateway 时保留兼容查询路径。
             return self.tasks.list_messages(instance_id, conversation["id"]), None, {}
         if self.tasks.instance_has_active_tasks(instance_id):
@@ -777,7 +781,7 @@ class ControlPlane:
             # 脚本、Pi 进程启动并加载原生 Session，直到 get_messages
             # 响应返回。它用于定位当前“打开旧会话”的等待时间。
             history_started_ns = time.monotonic_ns()
-            source = self.pi_gateway.get_messages(
+            source = self.agent_runtime.get_messages(
                 guest_ip, rpc_port, workspace_id, session_id
             )
             history_timing = {
@@ -786,7 +790,7 @@ class ControlPlane:
                 )
             }
             # PI_SESSION_TIMING_DIAGNOSTIC_END
-        except (PiGatewayError, RuntimeFailure, OSError) as error:
+        except (AgentRuntimeError, RuntimeFailure, OSError) as error:
             raise ApiError(502, "session_read_failed", str(error)) from error
 
         messages: list[dict[str, Any]] = []
@@ -930,7 +934,7 @@ class ControlPlane:
         最多一个消费者，既保持会话事件顺序，也避免两个任务同时修改同一数据盘。
         """
 
-        if self.pi_gateway is None:
+        if self.agent_runtime is None:
             # 单元测试和旧 smoke test 可以显式领取任务；正式服务总会注入 Gateway。
             return
         with self._dispatch_guard:
@@ -969,14 +973,14 @@ class ControlPlane:
                 self._dispatching.discard(instance_id)
 
     def _run_pi_task(self, instance_id: str, task: dict[str, Any]) -> None:
-        """解析 Guest 端点、执行一次 Pi RPC，并把事件写回 TaskStore。
+        """解析 Guest 端点、执行一次 Agent RPC，并把事件写回 TaskStore。
 
         TaskStore 提供 prompt 与 workspaceId，InstanceRuntime 提供 Guest IP 和 RPC
-        端口；PiGateway 产生的文本增量、工具事件和终态会被统一保存，供 SSE、CLI
-        或未来页面读取。
+        端口；Agent Runtime 产生的文本增量、工具事件和终态会被统一保存，供 SSE、
+        CLI 或未来页面读取。
         """
 
-        assert self.pi_gateway is not None
+        assert self.agent_runtime is not None
         task_id = task["id"]
         last_heartbeat = 0.0
 
@@ -993,15 +997,15 @@ class ControlPlane:
         try:
             runtime_status = self.runtime.status(instance_id)
             if runtime_status is None or not runtime_status.get("processAlive", False):
-                raise PiGatewayError("instance runtime is not alive")
+                raise AgentRuntimeError("instance runtime is not alive")
             guest_ip = runtime_status.get("guestIp")
             rpc_port = runtime_status.get("rpcPort")
             if not isinstance(guest_ip, str) or not isinstance(rpc_port, int):
-                raise PiGatewayError("instance runtime has no Pi RPC endpoint")
+                raise AgentRuntimeError("instance runtime has no Pi RPC endpoint")
             if hasattr(self.runtime, "busy"):
                 self.runtime.busy(instance_id, True)
             self.runtime.heartbeat(instance_id)
-            output = self.pi_gateway.execute(
+            output = self.agent_runtime.execute(
                 guest_ip,
                 rpc_port,
                 task["prompt"],
@@ -1009,7 +1013,7 @@ class ControlPlane:
                 task.get("workspaceId"),
                 task.get("piSessionId") if task.get("sessionBackend") == "pi-native" else None,
             )
-            # PiGateway 只有收到 agent_settled 才会返回，因此这里的 completed 表示
+            # Agent 运行时只有收到 agent_settled 才会返回，因此这里的 completed 表示
             # 模型循环及其中的工具调用均已真正结束，而不只是收到最后一个文本块。
             self.tasks.append_event(instance_id, task_id, "completed", {"output": output})
             self.runtime.heartbeat(instance_id)
@@ -1493,7 +1497,7 @@ def main() -> None:
         deepseek_credential=args.deepseek_credential,
         state_database=args.database,
     )
-    control = ControlPlane(store, runtime, tasks, PiGateway(), workspaces)
+    control = ControlPlane(store, runtime, tasks, PiRuntimeAdapter(), workspaces)
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), ControlPlaneHandler)
     server.control = control  # type: ignore[attr-defined]
     server.auth_store = auth_store  # type: ignore[attr-defined]
