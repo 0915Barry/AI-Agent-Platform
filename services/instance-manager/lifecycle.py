@@ -385,7 +385,11 @@ def command_status(args: argparse.Namespace) -> None:
 
 
 def command_watch(args: argparse.Namespace) -> None:
-    """持续观察单个实例，在进程退出或达到空闲阈值时完成回收。"""
+    """持续观察单个实例。
+
+    有属主实例的空闲生命周期（自动快照/停止）由控制面 monitor 线程负责，本
+    watcher 只做崩溃回收；无属主实例（smoke/临时）仍在空闲超时后直接停止。
+    """
     if os.geteuid() != 0:
         raise SystemExit("watch must run as root")
     instance_id = validate_instance_id(args.instance_id)
@@ -410,6 +414,10 @@ def command_watch(args: argparse.Namespace) -> None:
             print(f"INSTANCE_REAPED id={instance_id} reason=process_exited volume=preserved")
             return
         if busy_path.exists():
+            time.sleep(args.poll_interval)
+            continue
+        if getattr(args, "owner_id", None):
+            # 有属主实例的空闲生命周期由控制面 monitor 负责；本 watcher 只做崩溃回收。
             time.sleep(args.poll_interval)
             continue
         idle_seconds = time.time() - activity_path.stat().st_mtime
@@ -507,6 +515,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch = commands.add_parser("watch")
     watch.add_argument("instance_id")
     watch.add_argument("--poll-interval", default=0.25, type=float)
+    watch.add_argument("--owner-id")
     watch.set_defaults(handler=command_watch)
 
     stop = commands.add_parser("stop")

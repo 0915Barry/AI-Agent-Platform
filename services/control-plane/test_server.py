@@ -40,6 +40,7 @@ class FakeRuntime:
         # instances 保存运行时视角的当前状态；calls 便于后续断言调用顺序。
         self.instances: dict[str, dict] = {}
         self.calls: list[tuple[str, ...]] = []
+        self.idle_timeout_seconds = 1
 
     def start(self, instance_id: str, owner_id: str | None = None) -> dict:
         """模拟启动实例并返回与真实 Runtime 相同形状的状态数据。"""
@@ -293,6 +294,30 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(resumed["status"], "running")
         self.assertTrue(resumed["runtime"]["processAlive"])
         self.assertEqual(resumed["runtime"]["resumeTiming"]["loadMs"], 5)
+
+    def test_ensure_running_resumes_suspended_instance(self) -> None:
+        """suspended 实例在聊天时自动 resume，而不是冷启动或报错。"""
+
+        owner_id = "user-ensure"
+        self.control.create({"id": "agent-ensure"}, owner_id)
+        self.control.start("agent-ensure", owner_id)
+        self.control.suspend("agent-ensure", owner_id)
+
+        record = self.control.ensure_running("agent-ensure", owner_id)
+        self.assertEqual(record["status"], "running")
+        self.assertIn(("resume", "agent-ensure"), self.runtime.calls)
+
+    def test_lifecycle_tick_auto_suspends_idle_owned_instance(self) -> None:
+        """有属主实例空闲后，monitor 会自动快照暂停（而不是直接停止）。"""
+
+        owner_id = "user-auto"
+        self.control.create({"id": "agent-auto"}, owner_id)
+        self.control.start("agent-auto", owner_id)
+        self.runtime.instances["agent-auto"]["idleSeconds"] = 999
+
+        self.control._lifecycle_tick()
+        self.assertEqual(self.control.get("agent-auto")["status"], "suspended")
+        self.assertIn(("suspend", "agent-auto"), self.runtime.calls)
 
     def test_duplicate_and_invalid_ids_are_rejected(self) -> None:
         """ID 必须符合安全字符规则且在数据库中唯一。"""

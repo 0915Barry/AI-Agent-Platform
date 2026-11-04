@@ -741,6 +741,54 @@ class ControlPlane:
         ]
         return "".join(parts) or None
 
+    def ensure_running(self, instance_id: str, owner_id: str | None) -> dict[str, Any]:
+        """确保实例处于 running：suspended 则 resume，否则 start。返回校准后的记录。"""
+        record = self.get(instance_id)
+        if record["status"] == "running":
+            return record
+        if record["status"] == "suspended":
+            return self.resume(instance_id, owner_id)
+        return self.start(instance_id, owner_id)
+
+    def start_lifecycle_monitor(self) -> None:
+        """启动后台线程，负责有属主实例的自动快照与延迟停止。"""
+
+        def monitor_loop() -> None:
+            while True:
+                try:
+                    self._lifecycle_tick()
+                except Exception as error:
+                    print(f"LIFECYCLE_MONITOR_ERROR error={error}", file=sys.stderr)
+                time.sleep(5)
+
+        threading.Thread(target=monitor_loop, name="lifecycle-monitor", daemon=True).start()
+
+    def _lifecycle_tick(self) -> None:
+        """扫描一次：running 空闲则自动快照，suspended 过期则停止。"""
+        idle_timeout = self.runtime.idle_timeout_seconds
+        for instance in self.store.list():
+            owner_id = instance.get("ownerId")
+            if owner_id is None:
+                continue  # 无属主实例由 watcher 负责空闲停止。
+            instance_id = instance["id"]
+            record = self.reconcile(instance)
+            status = record["status"]
+            if status == "running":
+                runtime = record.get("runtime")
+                idle_seconds = runtime.get("idleSeconds") if isinstance(runtime, dict) else None
+                if isinstance(idle_seconds, int) and idle_seconds >= idle_timeout:
+                    if not self.tasks.instance_has_active_tasks(instance_id):
+                        try:
+                            self.suspend(instance_id, owner_id)
+                        except ApiError:
+                            pass
+            elif status == "suspended":
+                if time.time() - record["updatedAt"] >= idle_timeout:
+                    try:
+                        self.stop(instance_id)
+                    except ApiError:
+                        pass
+
     def _native_conversation_messages(
         self,
         instance_id: str,
@@ -757,7 +805,7 @@ class ControlPlane:
         record = self.get(instance_id)
         startup_timing = None
         if record["status"] != "running" and owner_id is not None:
-            record = self.start(instance_id, owner_id)
+            record = self.ensure_running(instance_id, owner_id)
             runtime = record.get("runtime")
             if isinstance(runtime, dict) and isinstance(runtime.get("startupTiming"), dict):
                 startup_timing = runtime["startupTiming"]
@@ -921,7 +969,7 @@ class ControlPlane:
         # 把实例生命周期隐藏在聊天接口后面：用户关注会话，Control Plane 负责确保
         # 承载该用户数据盘的 microVM 已经可用。
         if record["status"] != "running" and owner_id is not None:
-            record = self.start(instance_id, owner_id)
+            record = self.ensure_running(instance_id, owner_id)
             runtime = record.get("runtime")
             if isinstance(runtime, dict) and isinstance(runtime.get("startupTiming"), dict):
                 startup_timing = runtime["startupTiming"]
@@ -1522,6 +1570,7 @@ def main() -> None:
         state_database=args.database,
     )
     control = ControlPlane(store, runtime, tasks, PiRuntimeAdapter(), workspaces)
+    control.start_lifecycle_monitor()
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), ControlPlaneHandler)
     server.control = control  # type: ignore[attr-defined]
     server.auth_store = auth_store  # type: ignore[attr-defined]

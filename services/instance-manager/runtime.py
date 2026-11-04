@@ -702,23 +702,33 @@ class InstanceRuntime:
         raise RuntimeFailure("Firecracker API socket did not become ready")
 
     @staticmethod
-    def start_idle_watcher(manager: Path, state_root: Path, database: Path, instance_id: str, log: Path) -> None:
+    def start_idle_watcher(
+        manager: Path,
+        state_root: Path,
+        database: Path,
+        instance_id: str,
+        log: Path,
+        owner_id: str | None = None,
+    ) -> None:
         """启动独立空闲回收器；冷启动和快照恢复共用相同登记规则。"""
 
         reaper_handle = log.open("ab", buffering=0)
+        command = [
+            sys.executable,
+            str(manager),
+            "--state-root",
+            str(state_root),
+            "--database",
+            str(database),
+            "watch",
+            instance_id,
+            "--poll-interval",
+            "1",
+        ]
+        if owner_id:
+            command.extend(["--owner-id", owner_id])
         subprocess.Popen(
-            [
-                sys.executable,
-                str(manager),
-                "--state-root",
-                str(state_root),
-                "--database",
-                str(database),
-                "watch",
-                instance_id,
-                "--poll-interval",
-                "1",
-            ],
+            command,
             stdin=subprocess.DEVNULL,
             stdout=reaper_handle,
             stderr=subprocess.STDOUT,
@@ -929,6 +939,7 @@ class InstanceRuntime:
                 self.state_database,
                 instance_id,
                 paths["reaper"],
+                owner_id,
             )
             # 回收由本进程创建的 VMM 子进程，防止停止后留下 zombie。
             threading.Thread(target=process.wait, daemon=True).start()
@@ -1209,6 +1220,7 @@ class InstanceRuntime:
                 self.state_database,
                 instance_id,
                 paths["reaper"],
+                owner_id,
             )
             threading.Thread(target=process.wait, daemon=True).start()
             for sidecar in sidecars:

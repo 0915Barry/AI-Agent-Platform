@@ -54,6 +54,8 @@ Commands:
   cli-smoke-test         Verify authenticated agentctl lifecycle and resumed chat
   recovery-smoke-test    Verify Control Plane restart and Firecracker crash recovery
   snapshot-smoke-test    Verify full snapshot creation and Pi RPC restore
+  auto-snapshot-smoke-test
+                         Verify idle auto-snapshot and delayed stop
   control-plane-start    Start the loopback-only API in the Linux VM
   control-plane-stop     Stop the API; running instances remain managed
   control-plane-status   Show whether the API service is running
@@ -402,6 +404,18 @@ smoke_test_snapshot() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/snapshot-smoke-test.sh'"
 }
 
+smoke_test_auto_snapshot() {
+  sync_repo
+  echo "Building and testing idle auto-snapshot lifecycle in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/auto-snapshot-smoke-test.sh'"
+}
+
 control_plane_service() {
   action="$1"
   require_vm_host
@@ -524,6 +538,9 @@ case "${command}" in
     ;;
   snapshot-smoke-test)
     smoke_test_snapshot
+    ;;
+  auto-snapshot-smoke-test)
+    smoke_test_auto_snapshot
     ;;
   control-plane-start)
     control_plane_service start
