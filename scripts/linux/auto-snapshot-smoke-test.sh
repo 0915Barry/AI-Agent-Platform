@@ -110,6 +110,7 @@ python3 "${repo_dir}/services/control-plane/server.py" \
   --deepseek-credential "${credential_path}" \
   --state-root "${state_root}" \
   --idle-timeout "${AUTO_SNAPSHOT_SMOKE_IDLE_TIMEOUT_SECONDS}" \
+  --suspended-stop-timeout "${AUTO_SNAPSHOT_SMOKE_STOP_TIMEOUT_SECONDS}" \
   --require-auth \
   > "${log_path}" 2>&1 &
 server_pid=$!
@@ -180,4 +181,4 @@ if [[ ! -e "${volume_path}" ]]; then
 fi
 
 echo "PASS: owned instance auto-snapshotted on idle, then stopped after a second idle period"
-echo "AUTO_SNAPSHOT_READY idle=${AUTO_SNAPSHOT_SMOKE_IDLE_TIMEOUT_SECONDS}s snapshot=created discarded=on-stop volume=preserved"
+echo "AUTO_SNAPSHOT_READY idle=${AUTO_SNAPSHOT_SMOKE_IDLE_TIMEOUT_SECONDS}s stop=${AUTO_SNAPSHOT_SMOKE_STOP_TIMEOUT_SECONDS}s snapshot=created discarded=on-stop volume=preserved"

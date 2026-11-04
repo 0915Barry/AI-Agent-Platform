@@ -319,6 +319,32 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.control.get("agent-auto")["status"], "suspended")
         self.assertIn(("suspend", "agent-auto"), self.runtime.calls)
 
+    def test_lifecycle_tick_stops_expired_suspended_instance(self) -> None:
+        """suspended 实例度过二次空闲期后应被停止并丢弃快照，而不是继续保留。"""
+
+        owner_id = "user-auto-stop"
+        self.control.suspended_stop_timeout_seconds = 0  # 立即视为已过期
+        self.control.create({"id": "agent-auto-stop"}, owner_id)
+        self.control.start("agent-auto-stop", owner_id)
+        self.control.suspend("agent-auto-stop", owner_id)
+
+        self.control._lifecycle_tick()
+        self.assertEqual(self.control.get("agent-auto-stop")["status"], "stopped")
+        self.assertIn(("discard_snapshot", "agent-auto-stop"), self.runtime.calls)
+
+    def test_lifecycle_tick_keeps_fresh_suspended_instance(self) -> None:
+        """suspended 实例未度过二次空闲期时应保持 suspended，不被提前停止。"""
+
+        owner_id = "user-auto-fresh"
+        self.control.suspended_stop_timeout_seconds = 3600
+        self.control.create({"id": "agent-auto-fresh"}, owner_id)
+        self.control.start("agent-auto-fresh", owner_id)
+        self.control.suspend("agent-auto-fresh", owner_id)
+
+        self.control._lifecycle_tick()
+        self.assertEqual(self.control.get("agent-auto-fresh")["status"], "suspended")
+        self.assertNotIn(("stop", "agent-auto-fresh"), self.runtime.calls)
+
     def test_duplicate_and_invalid_ids_are_rejected(self) -> None:
         """ID 必须符合安全字符规则且在数据库中唯一。"""
 

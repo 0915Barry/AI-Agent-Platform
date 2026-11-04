@@ -275,12 +275,14 @@ class ControlPlane:
         tasks: TaskStore,
         agent_runtime: AgentRuntimeAdapter | None = None,
         workspaces: WorkspaceStore | None = None,
+        suspended_stop_timeout_seconds: int = 600,
     ) -> None:
         self.store = store
         self.runtime = runtime
         self.tasks = tasks
         self.agent_runtime = agent_runtime
         self.workspaces = workspaces
+        self.suspended_stop_timeout_seconds = suspended_stop_timeout_seconds
         self._locks_guard = threading.Lock()
         self._locks: dict[str, threading.RLock] = {}
         # 配额检查和状态写入必须形成一个临界区，否则两个不同实例的并发请求可能
@@ -766,6 +768,7 @@ class ControlPlane:
     def _lifecycle_tick(self) -> None:
         """扫描一次：running 空闲则自动快照，suspended 过期则停止。"""
         idle_timeout = self.runtime.idle_timeout_seconds
+        stop_timeout = self.suspended_stop_timeout_seconds
         for instance in self.store.list():
             owner_id = instance.get("ownerId")
             if owner_id is None:
@@ -783,7 +786,7 @@ class ControlPlane:
                         except ApiError:
                             pass
             elif status == "suspended":
-                if time.time() - record["updatedAt"] >= idle_timeout:
+                if time.time() - record["updatedAt"] >= stop_timeout:
                     try:
                         self.stop(instance_id)
                     except ApiError:
@@ -1539,6 +1542,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--deepseek-credential", type=Path)
     parser.add_argument("--idle-timeout", type=int, default=300)
+    parser.add_argument("--suspended-stop-timeout", type=int, default=600)
     parser.add_argument(
         "--require-auth",
         action="store_true",
@@ -1556,6 +1560,8 @@ def main() -> None:
         raise SystemExit("control plane only supports loopback listeners")
     if args.idle_timeout < 1:
         raise SystemExit("idle timeout must be at least one second")
+    if args.suspended_stop_timeout < 1:
+        raise SystemExit("suspended stop timeout must be at least one second")
 
     store = InstanceStore(args.database)
     auth_store = AuthStore(args.database) if args.require_auth else None
@@ -1569,14 +1575,22 @@ def main() -> None:
         deepseek_credential=args.deepseek_credential,
         state_database=args.database,
     )
-    control = ControlPlane(store, runtime, tasks, PiRuntimeAdapter(), workspaces)
+    control = ControlPlane(
+        store,
+        runtime,
+        tasks,
+        PiRuntimeAdapter(),
+        workspaces,
+        suspended_stop_timeout_seconds=args.suspended_stop_timeout,
+    )
     control.start_lifecycle_monitor()
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), ControlPlaneHandler)
     server.control = control  # type: ignore[attr-defined]
     server.auth_store = auth_store  # type: ignore[attr-defined]
     print(
         f"CONTROL_PLANE_READY bind={args.listen_host}:{args.listen_port} "
-        f"idle_timeout={args.idle_timeout}s auth={'session-cookie' if auth_store else 'disabled'}",
+        f"idle_timeout={args.idle_timeout}s suspended_stop_timeout={args.suspended_stop_timeout}s "
+        f"auth={'session-cookie' if auth_store else 'disabled'}",
         flush=True,
     )
     server.serve_forever()

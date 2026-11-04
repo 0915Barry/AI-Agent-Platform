@@ -93,6 +93,7 @@ start_service() {
     --deepseek-credential "${credential_path}" \
     --state-root /var/lib/fc \
     --idle-timeout "${INSTANCE_IDLE_TIMEOUT_SECONDS}" \
+    --suspended-stop-timeout "${INSTANCE_SUSPENDED_STOP_TIMEOUT_SECONDS}" \
     --require-auth \
     >> "${log_path}" 2>&1 &
   local process_pid=$!
@@ -117,7 +118,7 @@ start_service() {
     rm -f "${pid_path}"
     exit 1
   fi
-  echo "CONTROL_PLANE_SERVICE_STARTED pid=${process_pid} bind=${listen_host}:${listen_port} idle_timeout=${INSTANCE_IDLE_TIMEOUT_SECONDS}s"
+  echo "CONTROL_PLANE_SERVICE_STARTED pid=${process_pid} bind=${listen_host}:${listen_port} idle_timeout=${INSTANCE_IDLE_TIMEOUT_SECONDS}s suspended_stop_timeout=${INSTANCE_SUSPENDED_STOP_TIMEOUT_SECONDS}s"
 }
 
 stop_service() {
