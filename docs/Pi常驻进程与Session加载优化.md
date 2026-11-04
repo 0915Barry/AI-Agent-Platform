@@ -72,7 +72,7 @@ socat "TCP-LISTEN:${rpc_port},bind=${rpc_bind_ip},reuseaddr" EXEC:/usr/local/sbi
 
 `services/control-plane/server.py` 的 `_native_conversation_messages()` 用
 `pi_gateway.get_messages(guest_ip, rpc_port, workspace_id, session_id)` 读历史，
-其耗时被记为 `historyTiming.piSessionLoadMs`（即 CLI 显示的「Pi 进程加载会话」）。
+其耗时被记为 `historyTiming.piSessionLoadMs`（即 CLI 显示的「加载 Pi 会话花费 X.X 秒」）。
 
 数据库 `conversations` 表存的是 `pi_session_id`（= conversation id），**不存** session 文件路径。
 

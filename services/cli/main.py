@@ -73,9 +73,9 @@ class Console:
         print(self.paint(f"[错误] {message}", "red"), file=sys.stderr)
 
     def timing(self, message: str) -> None:
-        """用亮粉色展示临时启动性能诊断，避免与普通系统输出混淆。"""
+        """用亮粉色展示耗时提示，与普通 [系统] 信息在颜色上区分。"""
 
-        print(self.paint(message, "pink"), file=self.output)
+        print(self.paint(f"[系统] {message}", "pink"), file=self.output)
 
 
 class SessionStore:
@@ -442,7 +442,7 @@ def command_start(args: argparse.Namespace, store: SessionStore, console: Consol
         total_ms = render_startup_timing(runtime.get("startupTiming"))
         if total_ms is not None:
             store.remember_cold_start(args.instance_id, total_ms)
-            console.system(f"启动实例花费 {format_seconds(total_ms)} 秒")
+            console.timing(f"启动实例花费 {format_seconds(total_ms)} 秒")
     print_instance(instance, console)
 
 
@@ -586,9 +586,10 @@ def render_history(payload: dict[str, Any], console: Console) -> None:
         and isinstance(history_timing.get("piSessionLoadMs"), int)
         else None
     )
-    if startup_total is not None or session_ms is not None:
-        total_ms = (startup_total or 0) + (session_ms or 0)
-        console.system(f"打开会话花费 {format_seconds(total_ms)} 秒")
+    if startup_total is not None:
+        console.timing(f"启动实例花费 {format_seconds(startup_total)} 秒")
+    if session_ms is not None:
+        console.timing(f"加载 Pi 会话花费 {format_seconds(session_ms)} 秒")
     messages = payload.get("messages", [])
     if not messages:
         console.warning("该页没有消息")
@@ -622,7 +623,7 @@ def command_suspend(args: argparse.Namespace, store: SessionStore, console: Cons
     timing = instance.get("runtime", {}).get("snapshotTiming", {})
     console.success(f"实例已暂停：{instance['id']}")
     if isinstance(timing, dict) and isinstance(timing.get("totalMs"), int):
-        console.system(f"暂停实例花费 {format_seconds(timing['totalMs'])} 秒")
+        console.timing(f"暂停实例花费 {format_seconds(timing['totalMs'])} 秒")
 
 
 def command_resume(args: argparse.Namespace, store: SessionStore, console: Console) -> None:
@@ -632,7 +633,7 @@ def command_resume(args: argparse.Namespace, store: SessionStore, console: Conso
     timing = instance.get("runtime", {}).get("resumeTiming", {})
     console.success(f"实例已恢复：{instance['id']}")
     if isinstance(timing, dict) and isinstance(timing.get("totalMs"), int):
-        console.system(f"恢复实例花费 {format_seconds(timing['totalMs'])} 秒")
+        console.timing(f"恢复实例花费 {format_seconds(timing['totalMs'])} 秒")
     print_instance(instance, console)
 
 
@@ -658,7 +659,7 @@ def render_task_events(
         if event_type == "startup_timing":
             total_ms = render_startup_timing(payload)
             if total_ms is not None:
-                console.system(f"启动实例花费 {format_seconds(total_ms)} 秒")
+                console.timing(f"启动实例花费 {format_seconds(total_ms)} 秒")
         elif event_type == "progress":
             if text_started:
                 print(file=console.output)

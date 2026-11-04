@@ -207,7 +207,7 @@ class AgentCtlTests(unittest.TestCase):
         self.assertEqual(total_ms, 11754)
         self.assertIsNone(cli.render_startup_timing({}))
 
-    def test_history_renders_user_friendly_session_load(self) -> None:
+    def test_history_renders_session_load_timing(self) -> None:
         output = io.StringIO()
         console = cli.Console(False, output)
         cli.render_history(
@@ -221,12 +221,12 @@ class AgentCtlTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue().splitlines(),
             [
-                "[系统] 打开会话花费 4.9 秒",
+                "[系统] 加载 Pi 会话花费 4.9 秒",
                 "[警告] 该页没有消息",
             ],
         )
 
-    def test_history_renders_combined_total_from_startup_and_session(self) -> None:
+    def test_history_renders_startup_and_session_timing_separately(self) -> None:
         output = io.StringIO()
         console = cli.Console(False, output)
         cli.render_history(
@@ -238,7 +238,9 @@ class AgentCtlTests(unittest.TestCase):
             },
             console,
         )
-        self.assertIn("[系统] 打开会话花费 12.1 秒", output.getvalue())
+        lines = output.getvalue().splitlines()
+        self.assertIn("[系统] 启动实例花费 5.0 秒", lines)
+        self.assertIn("[系统] 加载 Pi 会话花费 7.1 秒", lines)
 
     def test_cold_start_baseline_is_persisted_per_instance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
