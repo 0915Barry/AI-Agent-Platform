@@ -418,7 +418,7 @@ class ControlPlane:
                     conversation["sessionBackend"] == "pi-native"
                     and hasattr(self.runtime, "delete_pi_session_data")
                 ):
-                    self.runtime.delete_pi_session_data(owner_id, conversation["piSessionId"])
+                    self.runtime.delete_pi_session_data(owner_id, conversation["nativeSessionId"])
                 deleted = self.tasks.delete_conversation(workspace_id, conversation_id)
             except TaskStoreError as error:
                 status = 409 if "正在" in str(error) else 404
@@ -467,7 +467,7 @@ class ControlPlane:
                 for conversation in conversations:
                     if conversation["sessionBackend"] == "pi-native":
                         self.runtime.delete_pi_session_data(
-                            owner_id, conversation["piSessionId"]
+                            owner_id, conversation["nativeSessionId"]
                         )
             if hasattr(self.runtime, "delete_workspace_data"):
                 self.runtime.delete_workspace_data(owner_id, workspace["directoryName"])
@@ -769,7 +769,7 @@ class ControlPlane:
         guest_ip = runtime_status.get("guestIp")
         rpc_port = runtime_status.get("rpcPort")
         workspace_id = conversation.get("workspaceId")
-        session_id = conversation.get("piSessionId")
+        session_id = conversation.get("nativeSessionId")
         if not all(
             (
                 isinstance(guest_ip, str),
@@ -1035,7 +1035,7 @@ class ControlPlane:
                 task["prompt"],
                 save_event,
                 task.get("workspaceId"),
-                task.get("piSessionId") if task.get("sessionBackend") == "pi-native" else None,
+                task.get("nativeSessionId") if task.get("sessionBackend") == "pi-native" else None,
             )
             # Agent 运行时只有收到 agent_settled 才会返回，因此这里的 completed 表示
             # 模型循环及其中的工具调用均已真正结束，而不只是收到最后一个文本块。

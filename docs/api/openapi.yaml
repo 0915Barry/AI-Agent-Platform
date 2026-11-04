@@ -536,7 +536,10 @@ components:
         id: { type: string }
         instanceId: { type: string }
         workspaceId: { type: string, nullable: true }
-        piSessionId: { type: string }
+        runtimeType: { type: string }
+        nativeSessionId: { type: string }
+        nativeSessionMetadata: { type: object }
+        piSessionId: { type: string, description: 兼容别名，等于 nativeSessionId }
         sessionBackend: { type: string, enum: [pi-native, database] }
         title: { type: string }
         preview: { type: string }
@@ -578,7 +581,10 @@ components:
         updatedAt: { type: integer }
         conversationId: { type: string, nullable: true }
         workspaceId: { type: string, nullable: true }
-        piSessionId: { type: string, nullable: true }
+        runtimeType: { type: string, nullable: true }
+        nativeSessionId: { type: string, nullable: true }
+        nativeSessionMetadata: { type: object, nullable: true }
+        piSessionId: { type: string, nullable: true, description: 兼容别名，等于 nativeSessionId }
         sessionBackend: { type: string, nullable: true }
 
     TaskEvent:

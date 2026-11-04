@@ -90,6 +90,9 @@ class TaskStore:
                     instance_id TEXT NOT NULL,
                     workspace_id TEXT,
                     pi_session_id TEXT,
+                    runtime_type TEXT NOT NULL DEFAULT 'pi',
+                    native_session_id TEXT,
+                    native_session_metadata TEXT NOT NULL DEFAULT '{}',
                     session_backend TEXT NOT NULL DEFAULT 'pi-native',
                     title TEXT NOT NULL,
                     preview TEXT NOT NULL DEFAULT '暂无消息',
@@ -107,6 +110,17 @@ class TaskStore:
                 connection.execute("ALTER TABLE conversations ADD COLUMN workspace_id TEXT")
             if "pi_session_id" not in conversation_columns:
                 connection.execute("ALTER TABLE conversations ADD COLUMN pi_session_id TEXT")
+            if "runtime_type" not in conversation_columns:
+                connection.execute(
+                    "ALTER TABLE conversations ADD COLUMN runtime_type TEXT NOT NULL DEFAULT 'pi'"
+                )
+            if "native_session_id" not in conversation_columns:
+                connection.execute("ALTER TABLE conversations ADD COLUMN native_session_id TEXT")
+            if "native_session_metadata" not in conversation_columns:
+                connection.execute(
+                    "ALTER TABLE conversations ADD COLUMN native_session_metadata "
+                    "TEXT NOT NULL DEFAULT '{}'"
+                )
             if "session_backend" not in conversation_columns:
                 # 已存在的会话还没有 Pi 原生 Session 文件，继续使用数据库历史拼接；
                 # 新建会话则直接采用上面表定义中的 pi-native 默认值。
@@ -133,6 +147,10 @@ class TaskStore:
                 )
             connection.execute(
                 "UPDATE conversations SET pi_session_id=id WHERE pi_session_id IS NULL"
+            )
+            connection.execute(
+                "UPDATE conversations SET native_session_id=COALESCE(pi_session_id,id) "
+                "WHERE native_session_id IS NULL"
             )
             connection.execute(
                 """
@@ -198,10 +216,10 @@ class TaskStore:
             connection.execute("ATTACH DATABASE ? AS legacy_tasks", (source,))
             connection.execute(
                 "INSERT OR IGNORE INTO conversations"
-                "(id,instance_id,workspace_id,pi_session_id,session_backend,title,preview,"
-                "message_count,created_at,updated_at) "
-                "SELECT id,instance_id,workspace_id,pi_session_id,session_backend,title,preview,"
-                "message_count,created_at,updated_at "
+                "(id,instance_id,workspace_id,pi_session_id,runtime_type,native_session_id,"
+                "native_session_metadata,session_backend,title,preview,message_count,created_at,updated_at) "
+                "SELECT id,instance_id,workspace_id,pi_session_id,runtime_type,native_session_id,"
+                "native_session_metadata,session_backend,title,preview,message_count,created_at,updated_at "
                 "FROM legacy_tasks.conversations"
             )
             connection.execute(
@@ -226,7 +244,32 @@ class TaskStore:
             )
 
     @staticmethod
+    def _session_fields(row: sqlite3.Row) -> dict[str, Any]:
+        """从会话行提取通用会话字段，缺失时回退到 Pi 专属字段。"""
+        native_session_id = row["native_session_id"] if "native_session_id" in row.keys() else None
+        if not native_session_id:
+            native_session_id = row["pi_session_id"] if "pi_session_id" in row.keys() else None
+        runtime_type = row["runtime_type"] if "runtime_type" in row.keys() else None
+        if not runtime_type:
+            runtime_type = "pi"
+        metadata_raw = row["native_session_metadata"] if "native_session_metadata" in row.keys() else "{}"
+        try:
+            native_session_metadata = (
+                json.loads(metadata_raw) if isinstance(metadata_raw, str) else metadata_raw
+            )
+        except (json.JSONDecodeError, TypeError):
+            native_session_metadata = {}
+        return {
+            "runtimeType": runtime_type,
+            "nativeSessionId": native_session_id,
+            "nativeSessionMetadata": native_session_metadata,
+            # 兼容旧字段：piSessionId 与 nativeSessionId 指向同一值。
+            "piSessionId": native_session_id,
+        }
+
+    @staticmethod
     def task_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        session_fields = TaskStore._session_fields(row)
         return {
             "id": row["id"],
             "instanceId": row["instance_id"],
@@ -238,7 +281,7 @@ class TaskStore:
             "updatedAt": row["updated_at"],
             "conversationId": row["conversation_id"],
             "workspaceId": row["workspace_id"] if "workspace_id" in row.keys() else None,
-            "piSessionId": row["pi_session_id"] if "pi_session_id" in row.keys() else None,
+            **session_fields,
             "sessionBackend": row["session_backend"] if "session_backend" in row.keys() else None,
         }
 
@@ -246,11 +289,12 @@ class TaskStore:
     def conversation_from_row(row: sqlite3.Row) -> dict[str, Any]:
         """把会话记录映射成稳定的 API 字段。"""
 
+        session_fields = TaskStore._session_fields(row)
         return {
             "id": row["id"],
             "instanceId": row["instance_id"],
             "workspaceId": row["workspace_id"],
-            "piSessionId": row["pi_session_id"],
+            **session_fields,
             "sessionBackend": row["session_backend"],
             "title": row["title"],
             "preview": row["preview"],
@@ -286,12 +330,14 @@ class TaskStore:
         with self.connect() as connection:
             connection.execute(
                 "INSERT INTO conversations"
-                "(id,instance_id,workspace_id,pi_session_id,session_backend,title,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
+                "(id,instance_id,workspace_id,pi_session_id,native_session_id,session_backend,"
+                "title,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     conversation_id,
                     instance_id,
                     workspace_id,
+                    conversation_id,
                     conversation_id,
                     "pi-native",
                     title,
@@ -579,6 +625,8 @@ class TaskStore:
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT t.*,c.workspace_id AS workspace_id,c.pi_session_id AS pi_session_id,"
+                "c.runtime_type AS runtime_type,c.native_session_id AS native_session_id,"
+                "c.native_session_metadata AS native_session_metadata,"
                 "c.session_backend AS session_backend FROM tasks t "
                 "LEFT JOIN conversations c ON c.id=t.conversation_id "
                 "WHERE t.id=? AND t.instance_id=?",
@@ -596,6 +644,8 @@ class TaskStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT t.*,c.workspace_id AS workspace_id,c.pi_session_id AS pi_session_id,"
+                "c.runtime_type AS runtime_type,c.native_session_id AS native_session_id,"
+                "c.native_session_metadata AS native_session_metadata,"
                 "c.session_backend AS session_backend FROM tasks t "
                 "LEFT JOIN conversations c ON c.id=t.conversation_id "
                 "WHERE t.instance_id=? AND t.status='queued' "

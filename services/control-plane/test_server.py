@@ -630,6 +630,26 @@ class ControlPlaneTests(unittest.TestCase):
         again = self.control.conversation_messages("agent-chat", conversation["id"])
         self.assertEqual([m["role"] for m in again], ["user", "assistant", "user"])
 
+    def test_session_fields_are_generalized_with_legacy_fallback(self) -> None:
+        """会话暴露通用会话字段，旧数据缺失时从 pi_session_id 回填。"""
+
+        self.control.create({"id": "agent-session"})
+        conversation = self.control.create_conversation("agent-session", {})
+        self.assertEqual(conversation["runtimeType"], "pi")
+        self.assertEqual(conversation["nativeSessionId"], conversation["id"])
+        self.assertEqual(conversation["nativeSessionMetadata"], {})
+        self.assertEqual(conversation["piSessionId"], conversation["nativeSessionId"])
+
+        # 模拟升级前的旧数据：清空 native_session_id，重新初始化应回填。
+        with self.tasks.connect() as connection:
+            connection.execute(
+                "UPDATE conversations SET native_session_id=NULL WHERE id=?",
+                (conversation["id"],),
+            )
+        self.tasks.initialize()
+        migrated = self.tasks.get_conversation("agent-session", conversation["id"])
+        self.assertEqual(migrated["nativeSessionId"], conversation["id"])
+
     def test_conversation_is_isolated_and_deleted_with_instance(self) -> None:
         """会话不能跨实例读取，显式销毁实例必须清除消息。"""
 

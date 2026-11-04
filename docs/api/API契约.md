@@ -167,6 +167,9 @@ Cookie时返回登录用户，否则返回`authenticated=false`。
       "id": "conversation-xxxxxxxxxxxxxxxx",
       "instanceId": "agent-xxxxxxxxxxxx",
       "workspaceId": "workspace-xxxxxxxxxxxxxxxx",
+      "runtimeType": "pi",
+      "nativeSessionId": "conversation-xxxxxxxxxxxxxxxx",
+      "nativeSessionMetadata": {},
       "piSessionId": "conversation-xxxxxxxxxxxxxxxx",
       "sessionBackend": "pi-native",
       "title": "帮我看看这段代码",
@@ -216,6 +219,9 @@ Cookie时返回登录用户，否则返回`authenticated=false`。
   "updatedAt": 1750000000,
   "conversationId": "conversation-xxxxxxxxxxxxxxxx",
   "workspaceId": "workspace-xxxxxxxxxxxxxxxx",
+  "runtimeType": "pi",
+  "nativeSessionId": "conversation-xxxxxxxxxxxxxxxx",
+  "nativeSessionMetadata": {},
   "piSessionId": "conversation-xxxxxxxxxxxxxxxx",
   "sessionBackend": "pi-native"
 }
@@ -367,7 +373,7 @@ data: {"sequence":12,"type":"message.delta","data":{"delta":"改好"},"createdAt
 
 ### 9.2 会话 conversation
 
-`id` `instanceId` `workspaceId` `piSessionId` `sessionBackend` `title` `preview` `messageCount` `createdAt` `updatedAt`
+`id` `instanceId` `workspaceId` `runtimeType` `nativeSessionId` `nativeSessionMetadata` `sessionBackend` `title` `preview` `messageCount` `createdAt` `updatedAt`（`piSessionId` 为兼容别名，等于 `nativeSessionId`）
 
 ### 9.3 消息 message
 
@@ -375,7 +381,7 @@ data: {"sequence":12,"type":"message.delta","data":{"delta":"改好"},"createdAt
 
 ### 9.4 任务 task
 
-`id` `instanceId` `prompt` `status`（`queued` / `running` / `completed` / `failed`） `output` `error` `createdAt` `updatedAt` `conversationId` `workspaceId` `piSessionId` `sessionBackend`
+`id` `instanceId` `prompt` `status`（`queued` / `running` / `completed` / `failed`） `output` `error` `createdAt` `updatedAt` `conversationId` `workspaceId` `runtimeType` `nativeSessionId` `nativeSessionMetadata` `sessionBackend`（`piSessionId` 为兼容别名）
 
 ### 9.5 事件 event
 
