@@ -79,7 +79,8 @@
 ## 2. 认证接口
 
 ### `GET /api/auth/session`
-查询当前登录状态（无需 Cookie）。
+查询当前登录状态。该路由本身不要求预先通过认证；请求携带有效会话
+Cookie时返回登录用户，否则返回`authenticated=false`。
 
 ```json
 // 200
@@ -444,7 +445,9 @@ es.addEventListener('task-event', (e) => {
 });
 ```
 
-> `EventSource` 会自动处理 `Last-Event-ID` 断线续传，但默认不支持 Cookie（走同源代理时同一站点可带上）；跨源时建议改用 `fetch` + 手动解析 SSE，或前端自行处理 `Authorization`（当前后端只认 Cookie，暂不支持 Bearer）。
+> `EventSource`会处理`Last-Event-ID`断线续传。当前推荐的同源代理方式会自动
+> 携带会话Cookie；跨源场景需要同时处理CORS凭据和Cookie属性，而当前
+> Control Plane没有提供Bearer Token认证。
 
 ---
 
