@@ -823,6 +823,32 @@ class ControlPlane:
             )
         return messages, startup_timing, history_timing
 
+    def _ensure_cached_messages(
+        self,
+        instance_id: str,
+        conversation: dict[str, Any],
+        owner_id: str | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, int] | None]:
+        """返回会话完整消息列表（sequence 为 SQLite 全局自增，可作稳定分页游标）。
+
+        pi-native 会话优先读 SQLite 缓存；缓存为空时才回 Pi 原生 Session 读取并回填。
+        startup_timing / history_timing 仅在触发了 Pi 冷启动读取时非空。
+        """
+        if conversation["sessionBackend"] == "pi-native":
+            cached = self.tasks.list_messages(instance_id, conversation["id"])
+            if cached:
+                return cached, None, None
+            native, startup_timing, history_timing = self._native_conversation_messages(
+                instance_id, conversation, owner_id
+            )
+            self.tasks.cache_native_messages(conversation["id"], native)
+            return (
+                self.tasks.list_messages(instance_id, conversation["id"]),
+                startup_timing,
+                history_timing,
+            )
+        return self.tasks.list_messages(instance_id, conversation["id"]), None, None
+
     def conversation_messages(
         self, instance_id: str, conversation_id: str, owner_id: str | None = None
     ) -> list[dict[str, Any]]:
@@ -830,12 +856,10 @@ class ControlPlane:
         self.store.get(instance_id)
         try:
             conversation = self.tasks.get_conversation(instance_id, conversation_id)
-            if conversation["sessionBackend"] == "pi-native":
-                messages, _, _ = self._native_conversation_messages(
-                    instance_id, conversation, owner_id
-                )
-                return messages
-            return self.tasks.list_messages(instance_id, conversation_id)
+            messages, _, _ = self._ensure_cached_messages(
+                instance_id, conversation, owner_id
+            )
+            return messages
         except TaskStoreError as error:
             raise ApiError(404, "conversation_not_found", str(error)) from error
 
@@ -858,12 +882,7 @@ class ControlPlane:
         self.store.get(instance_id)
         try:
             conversation = self.tasks.get_conversation(instance_id, conversation_id)
-            if conversation["sessionBackend"] == "database":
-                messages, next_before = self.tasks.list_messages_page(
-                    instance_id, conversation_id, limit, before_sequence
-                )
-                return messages, next_before, None, None
-            messages, startup_timing, history_timing = self._native_conversation_messages(
+            messages, startup_timing, history_timing = self._ensure_cached_messages(
                 instance_id, conversation, owner_id
             )
             eligible = [

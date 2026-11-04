@@ -549,10 +549,9 @@ class ControlPlaneTests(unittest.TestCase):
             self.control.create_task("agent-idle", {"prompt": "   "})
         self.assertEqual(empty_prompt.exception.status, 400)
 
-    def test_native_conversation_uses_pi_session_without_message_cache(self) -> None:
-        """新会话只发送本轮输入，历史展示也从 Pi Session 获取。"""
+    def test_native_conversation_caches_messages_and_reads_cache_first(self) -> None:
+        """pi-native 会话也写 SQLite 缓存，读历史优先走缓存、不冷启动 Pi。"""
 
-        gateway = FakePiGateway()
         self.control.create({"id": "agent-chat"})
         self.control.start("agent-chat")
         # 实例级兼容入口不附带 workspace_id，应回落到 Guest 的 /workspace。
@@ -570,18 +569,48 @@ class ControlPlaneTests(unittest.TestCase):
         second = self.control.create_conversation_message(
             "agent-chat", conversation["id"], {"content": "我的代号是什么？"}
         )
-        self.assertEqual(second["conversationId"], conversation["id"])
+        # pi-native 只发送本轮输入，不拼接数据库历史。
         self.assertEqual(second["prompt"], "我的代号是什么？")
-        self.assertEqual(second["piSessionId"], conversation["id"])
         self.assertEqual(second["sessionBackend"], "pi-native")
-        self.assertNotEqual(first["id"], second["id"])
         claimed_second = self.tasks.claim_next("agent-chat")
         assert claimed_second is not None
         self.tasks.append_event(
             "agent-chat", claimed_second["id"], "run.completed", {"output": "你的代号是 Alpha。"}
         )
 
+        # 消息已在任务生命周期中写入缓存：读历史不再触发 Pi 冷启动。
+        messages = self.control.conversation_messages("agent-chat", conversation["id"])
+        self.assertEqual(
+            [message["role"] for message in messages],
+            ["user", "assistant", "user", "assistant"],
+        )
+        self.assertEqual(messages[1]["content"], "好的，我会记住。")
+        self.assertEqual(messages[3]["content"], "你的代号是 Alpha。")
+
+        page, next_before, startup_timing, history_timing = self.control.conversation_messages_page(
+            "agent-chat", conversation["id"], 2, None
+        )
+        self.assertEqual([message["role"] for message in page], ["user", "assistant"])
+        self.assertIsInstance(next_before, int)
+        self.assertIsNone(startup_timing)
+        self.assertIsNone(history_timing)  # 缓存命中，未读 Pi
+
+        older, final_cursor, _, _ = self.control.conversation_messages_page(
+            "agent-chat", conversation["id"], 2, next_before
+        )
+        self.assertEqual([message["role"] for message in older], ["user", "assistant"])
+        self.assertIsNone(final_cursor)
+        listed = self.control.list_conversations("agent-chat")
+        self.assertEqual(listed[0]["title"], "请记住我的代号是 Alpha")
+
+    def test_native_conversation_falls_back_to_pi_and_backfills_cache(self) -> None:
+        """缓存为空时回 Pi 原生 Session 读取并回填，之后走缓存。"""
+
+        gateway = FakePiGateway()
         self.control.agent_runtime = gateway
+        self.control.create({"id": "agent-chat"})
+        self.control.start("agent-chat")
+        conversation = self.tasks.create_conversation("agent-chat", "新会话")
         gateway.messages = [
             {"role": "user", "content": "请记住我的代号是 Alpha", "timestamp": 1000},
             {
@@ -591,25 +620,15 @@ class ControlPlaneTests(unittest.TestCase):
             },
             {"role": "user", "content": "我的代号是什么？", "timestamp": 3000},
         ]
+
+        # 首次读取：缓存为空，回 Pi 读取。
         messages = self.control.conversation_messages("agent-chat", conversation["id"])
-        self.assertEqual([message["role"] for message in messages], ["user", "assistant", "user"])
-        self.assertEqual(messages[1]["content"], "好的，我会记住。")
-        page, next_before, startup_timing, history_timing = self.control.conversation_messages_page(
-            "agent-chat", conversation["id"], 2, None
-        )
-        self.assertEqual([message["role"] for message in page], ["assistant", "user"])
-        self.assertIsInstance(next_before, int)
-        self.assertIsNone(startup_timing)
-        self.assertIsInstance(history_timing.get("piSessionLoadMs"), int)
-        older, final_cursor, startup_timing, history_timing = self.control.conversation_messages_page(
-            "agent-chat", conversation["id"], 2, next_before
-        )
-        self.assertEqual([message["role"] for message in older], ["user"])
-        self.assertIsNone(final_cursor)
-        self.assertIsNone(startup_timing)
-        self.assertIsInstance(history_timing.get("piSessionLoadMs"), int)
-        listed = self.control.list_conversations("agent-chat")
-        self.assertEqual(listed[0]["title"], "请记住我的代号是 Alpha")
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user"])
+
+        # 清空 gateway，二次读取仍返回同样消息，证明已回填缓存、未再走 Pi。
+        gateway.messages = []
+        again = self.control.conversation_messages("agent-chat", conversation["id"])
+        self.assertEqual([m["role"] for m in again], ["user", "assistant", "user"])
 
     def test_conversation_is_isolated_and_deleted_with_instance(self) -> None:
         """会话不能跨实例读取，显式销毁实例必须清除消息。"""

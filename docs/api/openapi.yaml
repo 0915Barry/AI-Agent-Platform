@@ -330,7 +330,7 @@ paths:
       - { $ref: "#/components/parameters/InstanceId" }
       - { $ref: "#/components/parameters/ConversationId" }
     get:
-      summary: 分页读取会话历史（可能触发冷启动）
+      summary: 分页读取会话历史（缓存命中不冷启动，缓存缺失时回 Pi 原生 Session）
       parameters:
         - name: limit
           in: query

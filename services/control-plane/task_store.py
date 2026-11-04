@@ -435,6 +435,26 @@ class TaskStore:
             ).fetchall()
         return [self.message_from_row(row) for row in rows]
 
+    def cache_native_messages(
+        self, conversation_id: str, messages: list[dict[str, Any]]
+    ) -> None:
+        """把 Pi 原生 Session 读到的消息回填到 SQLite 缓存（幂等，靠唯一 id）。"""
+        with self.connect() as connection:
+            for message in messages:
+                connection.execute(
+                    "INSERT OR IGNORE INTO messages"
+                    "(id,conversation_id,role,content,task_id,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (
+                        message["id"],
+                        conversation_id,
+                        message["role"],
+                        message["content"],
+                        message.get("taskId"),
+                        message["createdAt"],
+                    ),
+                )
+
     def list_messages_page(
         self,
         instance_id: str,
@@ -522,12 +542,11 @@ class TaskStore:
                 "INSERT INTO task_events(task_id,event_type,payload,created_at) VALUES(?,?,?,?)",
                 (task_id, "queued", "{}", now),
             )
-            if conversation["sessionBackend"] == "database":
-                connection.execute(
-                    "INSERT INTO messages(id,conversation_id,role,content,task_id,created_at) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (message_id, conversation_id, "user", content, task_id, now),
-                )
+            connection.execute(
+                "INSERT INTO messages(id,conversation_id,role,content,task_id,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (message_id, conversation_id, "user", content, task_id, now),
+            )
             connection.execute(
                 "UPDATE conversations SET title=?,preview=?,message_count=message_count+1,"
                 "updated_at=? WHERE id=?",
@@ -634,20 +653,19 @@ class TaskStore:
                     (task_id,),
                 ).fetchone()
                 if row is not None and row["conversation_id"]:
-                    if row["session_backend"] == "database":
-                        connection.execute(
-                            "INSERT OR IGNORE INTO messages"
-                            "(id,conversation_id,role,content,task_id,created_at) "
-                            "VALUES(?,?,?,?,?,?)",
-                            (
-                                f"message-{uuid.uuid4().hex[:16]}",
-                                row["conversation_id"],
-                                "assistant",
-                                output,
-                                task_id,
-                                now,
-                            ),
-                        )
+                    connection.execute(
+                        "INSERT OR IGNORE INTO messages"
+                        "(id,conversation_id,role,content,task_id,created_at) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (
+                            f"message-{uuid.uuid4().hex[:16]}",
+                            row["conversation_id"],
+                            "assistant",
+                            output,
+                            task_id,
+                            now,
+                        ),
+                    )
                     connection.execute(
                         "UPDATE conversations SET preview=?,message_count=message_count+1,"
                         "updated_at=? WHERE id=?",

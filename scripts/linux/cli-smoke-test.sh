@@ -244,7 +244,7 @@ grep -Fq "Pi > ${first_marker}" <<< "${second_output}"
 history_output="$("${cli[@]}" history "${instance_id}" "${conversation_id}" --limit 20)"
 grep -Fq "Pi > ${first_marker}" <<< "${history_output}"
 
-# 新会话只在 SQLite 保存索引与预览，完整消息必须以 Pi 原生 Session 为唯一来源。
+# 新会话把消息同时写入 SQLite 作为读取缓存，Pi 原生 Session 仍是权威来源。
 python3 - "${database_path}" "${conversation_id}" <<'PY'
 import sqlite3
 import sys
@@ -260,7 +260,7 @@ with sqlite3.connect(database) as connection:
     assert conversation[1] >= 4, "conversation metadata did not count persisted messages"
     assert connection.execute(
         "SELECT COUNT(*) FROM messages WHERE conversation_id=?", (conversation_id,)
-    ).fetchone()[0] == 0, "native conversation messages were duplicated into SQLite"
+    ).fetchone()[0] >= 4, "native conversation messages were not cached into SQLite"
 PY
 
 "${cli[@]}" stop "${instance_id}" >/dev/null

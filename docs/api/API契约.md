@@ -269,7 +269,7 @@ data: {"sequence":12,"type":"message.delta","data":{"delta":"改好"},"createdAt
 
 - `limit`：1–100，默认 50；`before`：传上一条 `nextBefore` 向前翻页（传 `null` 表示取最新一页）。
 - `nextBefore` 非 `null` 表示还有更早消息，取下一页时把它作为 `before`。
-- 读历史可能触发冷启动，`startupTiming` / `historyTiming` 是下层性能诊断字段，上层可忽略。
+- 读历史通常直接命中 SQLite 缓存、不触发冷启动；仅当缓存缺失时才会回 Pi 原生 Session 读取，此时 `startupTiming` / `historyTiming` 非空，是下层性能诊断字段，上层可忽略。
 
 ### 5.4 一个完整聊天时序
 

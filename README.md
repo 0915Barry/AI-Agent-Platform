@@ -393,9 +393,10 @@ Pi RPC。它将 Pi 原生 JSONL 事件标准化为 `progress`、`message.delta`�
 用户、工作区、会话索引、任务和事件与实例、运行状态、网络租约及用户数据盘归属
 统一保存在 Ubuntu 宿主的 `/var/lib/fc/control-plane.db` 中。新会话以平台
 `conversation_id` 作为 Pi `--session-id`，完整原生 Session 由 Pi 保存到用户数据盘；
-数据库只保存标题、预览、消息数量和 Session 定位信息，完整历史通过 Pi RPC 从原生
-Session 读取。模型上下文也由 Pi Session 自行恢复，不再由控制面重复拼接。升级前已有
-会话暂时继续使用数据库上下文模式，避免原历史丢失。
+数据库同时把用户与助手消息写入 `messages` 表作为**读取缓存**：打开旧会话优先直接
+读 SQLite，缓存缺失时才通过 Pi RPC 读原生 Session 并回填。因此读历史通常不再触发
+microVM 冷启动，microVM 停止后仍可查看历史。模型上下文仍由 Pi Session 自行恢复，
+不再由控制面重复拼接。升级前已有会话暂时继续使用数据库上下文模式，避免原历史丢失。
 升级前的 `/var/lib/fc/tasks/tasks.db` 会在服务首次启动时自动导入，原文件暂时保留作为备份。
 
 ## 网络与数据边界
