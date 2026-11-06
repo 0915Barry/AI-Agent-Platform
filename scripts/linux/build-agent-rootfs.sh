@@ -42,6 +42,7 @@ pi_archive="pi-coding-agent-${PI_VERSION}.tgz"
 pi_cache_path="${cache_dir}/${pi_archive}"
 guest_init="${repo_dir}/scripts/guest/agent-init.sh"
 guest_pi_rpc_session="${repo_dir}/scripts/guest/pi-rpc-session.sh"
+guest_prewarm_activate="${repo_dir}/scripts/guest/prewarm-activate.sh"
 
 build_id="$(
   {
@@ -50,6 +51,7 @@ build_id="$(
     sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}'
     sha256sum "${guest_init}" | awk '{print $1}'
     sha256sum "${guest_pi_rpc_session}" | awk '{print $1}'
+    sha256sum "${guest_prewarm_activate}" | awk '{print $1}'
   } | sha256sum | awk '{print $1}'
 )"
 
@@ -67,6 +69,9 @@ install_project_runtime_files() {
   install -o root -g root -m 0755 \
     "${guest_pi_rpc_session}" \
     "${root}/usr/local/sbin/pi-rpc-session"
+  install -o root -g root -m 0755 \
+    "${guest_prewarm_activate}" \
+    "${root}/usr/local/sbin/prewarm-activate"
 
   # 旧 Agent Bridge/JSON Worker/Workspace Worker 已退出正式架构。离线刷新旧镜像时
   # 同步移除残留文件，确保系统盘只保留 Pi RPC 会话入口。

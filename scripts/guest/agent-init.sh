@@ -68,12 +68,19 @@ runtime_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH="${runtime_path}"
 
 data_disk="$(cmdline_value agent_data_disk || true)"
+prewarm="$(cmdline_value agent_prewarm || true)"
 if [[ "${data_disk}" == "1" ]]; then
   mount_if_needed /run tmpfs tmpfs
   mount_if_needed /tmp tmpfs tmpfs
   mount -t ext4 /dev/vdb /mnt/agent-data
   mount --bind /mnt/agent-data/workspace /workspace
   mount --bind /mnt/agent-data/pi-state /home/pi/.pi
+fi
+# 预热模式不设 agent_data_disk=1，故上面不会挂用户盘；但仍需 /run 与 /tmp
+# 供一次性激活状态机使用。此块为纯新增，不影响上面的冷启动分支。
+if [[ "${prewarm}" == "1" ]]; then
+  mount_if_needed /run tmpfs tmpfs
+  mount_if_needed /tmp tmpfs tmpfs
 fi
 
 persistence_test="$(cmdline_value agent_persistence_test || true)"
@@ -83,7 +90,11 @@ if [[ "${persistence_test}" == "1" ]]; then
 fi
 
 mkdir -p /workspace /home/pi/.pi/agent
-chown -R pi:pi /workspace /home/pi/.pi
+# 预热模式未挂用户卷，/workspace 与 /home/pi/.pi 仍在只读系统盘上，不能 chown；
+# 冷启动（prewarm 未设）保持原行为不变。
+if [[ "${prewarm}" != "1" ]]; then
+  chown -R pi:pi /workspace /home/pi/.pi
+fi
 guest_timing_mark data_mount  # GUEST_STARTUP_TIMING_DIAGNOSTIC
 
 network_test="$(cmdline_value agent_network_test || true)"
@@ -91,7 +102,8 @@ gateway_test="$(cmdline_value agent_gateway_test || true)"
 deepseek_e2e_test="$(cmdline_value agent_deepseek_e2e_test || true)"
 managed_runtime="$(cmdline_value agent_managed_runtime || true)"
 if [[ "${network_test}" == "1" || "${gateway_test}" == "1" \
-  || "${deepseek_e2e_test}" == "1" || "${managed_runtime}" == "1" ]]; then
+  || "${deepseek_e2e_test}" == "1" || "${managed_runtime}" == "1" \
+  || "${prewarm}" == "1" ]]; then
   guest_ip_cidr="$(cmdline_value agent_ip)"
   guest_gateway="$(cmdline_value agent_gateway)"
   guest_dns="$(cmdline_value agent_dns)"
@@ -99,7 +111,7 @@ if [[ "${network_test}" == "1" || "${gateway_test}" == "1" \
   ip link set dev eth0 up
   ip address replace "${guest_ip_cidr}" dev eth0
   ip route replace default via "${guest_gateway}" dev eth0
-  if [[ "${data_disk}" == "1" ]]; then
+  if [[ "${data_disk}" == "1" || "${prewarm}" == "1" ]]; then
     printf 'nameserver %s\noptions timeout:2 attempts:2\n' "${guest_dns}" > /run/resolv.conf
     mount --bind /run/resolv.conf /etc/resolv.conf
   else
@@ -239,8 +251,11 @@ guest_timing_mark version_check  # GUEST_STARTUP_TIMING_DIAGNOSTIC
 
 # 系统盘所有权、shadow 与 /usr/local 权限已在 rootfs 构建时验证。启动时只保留
 # 与本次数据盘挂载有关的动态检查，确保 /workspace 确实可由 pi 用户写入。
-runuser -u pi -- sh -c \
-  'probe=/workspace/.pi-permission-probe; : > "${probe}"; rm -f "${probe}"'
+# 预热模式未挂用户卷，跳过此写探测；激活挂载后再执行等价检查。
+if [[ "${prewarm}" != "1" ]]; then
+  runuser -u pi -- sh -c \
+    'probe=/workspace/.pi-permission-probe; : > "${probe}"; rm -f "${probe}"'
+fi
 guest_timing_mark security_check  # GUEST_STARTUP_TIMING_DIAGNOSTIC
 
 echo "AGENT_RUNTIME_READY node=${node_version} pi=${pi_version} uid=${pi_uid} verification=${runtime_verification}"
@@ -362,6 +377,37 @@ elif [[ "${gateway_test}" == "1" || "${deepseek_e2e_test}" == "1" || "${managed_
   echo "Networking is restricted to the host Tool Gateway; model credentials remain outside the microVM."
 else
   echo "The runtime image contains no model credentials and networking is not configured yet."
+fi
+
+if [[ "${prewarm}" == "1" ]]; then
+  activate_port="$(cmdline_value agent_activate_port)"
+  activate_bind_ip="${guest_ip_cidr%/*}"
+
+  # 预热等待期：仅监听一次性激活入口（root 持有，因为挂载需要 root），
+  # 不启动业务 Pi RPC。fork 允许 Host 在响应丢失后重连查询状态。
+  # 此块为纯新增，不改动上面的 managed_runtime socat 监听循环。
+  (
+    while true; do
+      socat "TCP-LISTEN:${activate_port},bind=${activate_bind_ip},reuseaddr,fork" \
+        EXEC:/usr/local/sbin/prewarm-activate
+      echo "PREWARM_ACTIVATE_LISTENER_CLOSED"
+      sleep 1
+    done
+  ) &
+
+  activate_ready=false
+  for _ in $(seq 1 50); do
+    if ss -lntH | awk -v port=":${activate_port}" '$4 ~ port "$" { found=1 } END { exit !found }'; then
+      activate_ready=true
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ "${activate_ready}" != true ]]; then
+    echo "PREWARM_FAILURE activate_listener_not_ready" >&2
+    exit 1
+  fi
+  echo "WARM_READY activate_address=${activate_bind_ip}:${activate_port} transport=tcp protocol=activate-v1"
 fi
 
 trap 'poweroff -f' TERM INT

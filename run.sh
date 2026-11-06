@@ -56,6 +56,7 @@ Commands:
   snapshot-smoke-test    Verify full snapshot creation and Pi RPC restore
   auto-snapshot-smoke-test
                          Verify idle auto-snapshot and delayed stop
+  prewarm-smoke-test     Verify blank-guest PATCH hot-swap and one-shot activation
   control-plane-start    Start the loopback-only API in the Linux VM
   control-plane-stop     Stop the API; running instances remain managed
   control-plane-status   Show whether the API service is running
@@ -416,6 +417,18 @@ smoke_test_auto_snapshot() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/auto-snapshot-smoke-test.sh'"
 }
 
+smoke_test_prewarm() {
+  sync_repo
+  echo "Building and testing the blank-guest prewarm probe in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/prewarm-smoke-test.sh'"
+}
+
 control_plane_service() {
   action="$1"
   require_vm_host
@@ -541,6 +554,9 @@ case "${command}" in
     ;;
   auto-snapshot-smoke-test)
     smoke_test_auto_snapshot
+    ;;
+  prewarm-smoke-test)
+    smoke_test_prewarm
     ;;
   control-plane-start)
     control_plane_service start

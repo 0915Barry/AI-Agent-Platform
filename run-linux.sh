@@ -41,6 +41,7 @@ Commands:
   snapshot-smoke-test   Verify full snapshot creation and Pi RPC restore
   auto-snapshot-smoke-test
                         Verify idle auto-snapshot and delayed stop
+  prewarm-smoke-test    Verify blank-guest PATCH hot-swap and one-shot activation
   control-plane-start   Start the loopback-only HTTP API
   control-plane-stop    Stop the API; running instances remain managed
   control-plane-status  Show whether the API service is running
@@ -162,6 +163,10 @@ case "${command}" in
   auto-snapshot-smoke-test)
     build_rootfs
     sudo "${repo_dir}/scripts/linux/auto-snapshot-smoke-test.sh"
+    ;;
+  prewarm-smoke-test)
+    build_rootfs
+    sudo "${repo_dir}/scripts/linux/prewarm-smoke-test.sh"
     ;;
   control-plane-start)
     build_rootfs
