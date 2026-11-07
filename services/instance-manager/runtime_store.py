@@ -150,6 +150,23 @@ class RuntimeStore:
                 )
                 """
             )
+            # 逻辑实例 → 物理 runtime_id 的绑定。阶段 2 冷启动时无绑定，物理 ID
+            # 恒等于逻辑 ID；预热领取落地后才写入非恒等绑定。两个唯一约束分别
+            # 保证：一个逻辑实例至多一个物理运行、一个 runtime_id 至多给一个逻辑实例。
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_bindings (
+                    logical_instance_id TEXT PRIMARY KEY,
+                    runtime_id TEXT NOT NULL UNIQUE,
+                    user_id TEXT NOT NULL,
+                    volume_path TEXT NOT NULL,
+                    activation_id TEXT,
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS runtime_instances_status "
                 "ON runtime_instances(status,created_at)"
@@ -281,6 +298,84 @@ class RuntimeStore:
     def delete(self, instance_id: str) -> None:
         with self.connect() as connection:
             connection.execute("DELETE FROM runtime_instances WHERE instance_id=?", (instance_id,))
+
+    def resolve_runtime_id(self, logical_instance_id: str) -> str:
+        """逻辑实例 → 物理 runtime_id。
+
+        阶段 2（预热关闭）没有绑定时恒返回逻辑 ID 本身，行为与现状完全一致；
+        预热领取落地写入绑定后，这里才返回真正的物理 ID。
+        """
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT runtime_id FROM runtime_bindings WHERE logical_instance_id=?",
+                (logical_instance_id,),
+            ).fetchone()
+        return logical_instance_id if row is None else row["runtime_id"]
+
+    def get_binding(self, logical_instance_id: str) -> dict | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_bindings WHERE logical_instance_id=?",
+                (logical_instance_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "logicalInstanceId": row["logical_instance_id"],
+            "runtimeId": row["runtime_id"],
+            "userId": row["user_id"],
+            "volumePath": row["volume_path"],
+            "activationId": row["activation_id"],
+            "status": row["status"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def save_binding(self, binding: dict) -> dict:
+        """写入或更新一条绑定；违反唯一约束时抛 RuntimeStoreError。"""
+        now = int(time.time())
+        values = (
+            str(binding["logicalInstanceId"]),
+            str(binding["runtimeId"]),
+            str(binding["userId"]),
+            str(binding["volumePath"]),
+            binding.get("activationId"),
+            str(binding["status"]),
+            int(binding.get("createdAt", now)),
+            now,
+        )
+        try:
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO runtime_bindings(
+                        logical_instance_id,runtime_id,user_id,volume_path,activation_id,
+                        status,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(logical_instance_id) DO UPDATE SET
+                        runtime_id=excluded.runtime_id,
+                        user_id=excluded.user_id,
+                        volume_path=excluded.volume_path,
+                        activation_id=excluded.activation_id,
+                        status=excluded.status,
+                        updated_at=excluded.updated_at
+                    """,
+                    values,
+                )
+        except sqlite3.IntegrityError as error:
+            raise RuntimeStoreError("runtime binding violates a uniqueness constraint") from error
+        stored = self.get_binding(str(binding["logicalInstanceId"]))
+        if stored is None:
+            raise RuntimeStoreError("runtime binding disappeared after save")
+        return stored
+
+    def delete_binding(self, logical_instance_id: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM runtime_bindings WHERE logical_instance_id=?",
+                (logical_instance_id,),
+            )
 
     def load_legacy(self, legacy_path: Path, instance_id: str) -> dict | None:
         """首次升级时把旧 JSON 元数据导入 SQLite，成功后删除旧文件。"""

@@ -261,22 +261,35 @@ class InstanceRuntime:
                 raise RuntimeFailure(f"DeepSeek credential is missing: {self.deepseek_credential}")
         return account.pw_uid, account.pw_gid, gateway_account.pw_uid, gateway_account.pw_gid
 
+    def _resolve_runtime_id(self, instance_id: str) -> str:
+        """逻辑实例 ID → 物理 runtime_id。
+
+        阶段 2（预热关闭）没有绑定时恒等于逻辑 ID，行为与现状完全一致；
+        预热领取落地写入 runtime_bindings 后，这里才返回真正的物理 ID。
+        """
+        return self.runtime_store.resolve_runtime_id(validate_instance_id(instance_id))
+
     def paths(self, instance_id: str, volume_owner_id: str | None = None) -> dict[str, Path]:
-        """集中生成实例所有路径，确保它们只能落在固定根目录。"""
+        """集中生成实例所有路径，确保它们只能落在固定根目录。
+
+        物理资源（jail/state/snapshot/activity）按 runtime_id 定位，用户数据盘
+        按 volume_owner_id（user_id 或无属主时的逻辑 ID）定位。
+        """
         instance_id = validate_instance_id(instance_id)
+        runtime_id = self.runtime_store.resolve_runtime_id(instance_id)
         volume_owner_id = validate_instance_id(volume_owner_id or instance_id)
-        jail_path = FIRECRACKER_JAIL_ROOT / instance_id
-        expected_jail = (FIRECRACKER_JAIL_ROOT / instance_id).resolve()
+        jail_path = FIRECRACKER_JAIL_ROOT / runtime_id
+        expected_jail = (FIRECRACKER_JAIL_ROOT / runtime_id).resolve()
         if jail_path.resolve() != expected_jail:
             raise RuntimeFailure("invalid jail path")
-        state_dir = self.state_root / "control-plane" / instance_id
+        state_dir = self.state_root / "control-plane" / runtime_id
         return {
             "jail": jail_path,
             "chroot": jail_path / "root",
             "socket": jail_path / "root" / "firecracker.socket",
             "volume": self.volume_root / f"{volume_owner_id}.ext4",
-            "metadata": self.state_root / "instances" / f"{instance_id}.json",
-            "activity": self.state_root / "activity" / instance_id,
+            "metadata": self.state_root / "instances" / f"{runtime_id}.json",
+            "activity": self.state_root / "activity" / runtime_id,
             "state": state_dir,
             "console": state_dir / "console.log",
             "reaper": state_dir / "reaper.log",
@@ -284,8 +297,8 @@ class InstanceRuntime:
             "gateway_log": state_dir / "sidecars" / "gateway.log",
             "gateway_audit": state_dir / "sidecars" / "gateway.audit.jsonl",
             "credential": state_dir / "sidecars" / "deepseek-api-key",
-            "snapshot": self.snapshot_root / instance_id,
-            "snapshot_next": self.snapshot_root / f"{instance_id}.next",
+            "snapshot": self.snapshot_root / runtime_id,
+            "snapshot_next": self.snapshot_root / f"{runtime_id}.next",
         }
 
     def adopt_legacy_volume(
@@ -737,13 +750,15 @@ class InstanceRuntime:
         reaper_handle.close()
 
     def snapshot_manifest(self, instance_id: str) -> dict:
+        instance_id = validate_instance_id(instance_id)
+        runtime_id = self.runtime_store.resolve_runtime_id(instance_id)
         paths = self.paths(instance_id)
         manifest_path = paths["snapshot"] / "manifest.json"
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
             raise RuntimeFailure(f"valid snapshot manifest is missing: {instance_id}") from error
-        if manifest.get("instanceId") != instance_id or manifest.get("version") != 1:
+        if manifest.get("instanceId") != runtime_id or manifest.get("version") != 1:
             raise RuntimeFailure(f"invalid snapshot manifest: {instance_id}")
         return manifest
 
@@ -759,6 +774,7 @@ class InstanceRuntime:
         watcher 仍会在 5 分钟无活动后回收计算资源。
         """
         instance_id = validate_instance_id(instance_id)
+        runtime_id = self.runtime_store.resolve_runtime_id(instance_id)
         # STARTUP_TIMING_DIAGNOSTIC: 启动链路计时从进入 runtime.start() 开始。
         timing = StartupTimingDiagnostic(instance_id)
         uid, gid, gateway_uid, gateway_gid = self.ensure_host()
@@ -789,7 +805,7 @@ class InstanceRuntime:
         sidecars: list[subprocess.Popen[bytes]] = []
         if self.deepseek_credential is not None:
             try:
-                network = self.network_manager.allocate(instance_id)
+                network = self.network_manager.allocate(runtime_id)
                 timing.mark("network_allocate_ms")  # STARTUP_TIMING_DIAGNOSTIC
                 self.configure_agent_volume(paths["volume"], str(network["host_ip"]))
                 timing.mark("volume_config_ms")  # STARTUP_TIMING_DIAGNOSTIC
@@ -818,7 +834,7 @@ class InstanceRuntime:
                     self.terminate_process(sidecar)
                 if network is not None:
                     try:
-                        self.network_manager.release(instance_id)
+                        self.network_manager.release(runtime_id)
                     except NetworkFailure:
                         pass
                 timing.emit("failed")  # STARTUP_TIMING_DIAGNOSTIC
@@ -836,7 +852,7 @@ class InstanceRuntime:
         command = [
             "/usr/local/bin/jailer",
             "--id",
-            instance_id,
+            runtime_id,
             "--exec-file",
             "/usr/local/bin/firecracker",
             "--uid",
@@ -893,7 +909,7 @@ class InstanceRuntime:
 
             register_arguments = [
                 "register",
-                instance_id,
+                runtime_id,
                 "--pid",
                 str(process.pid),
                 "--idle-timeout",
@@ -906,7 +922,7 @@ class InstanceRuntime:
                 str(paths["volume"]),
             ]
             if network is not None:
-                self.network_manager.activate(instance_id)
+                self.network_manager.activate(runtime_id)
                 register_arguments.extend(
                     [
                         "--tap-name",
@@ -937,7 +953,7 @@ class InstanceRuntime:
                 self.manager,
                 self.state_root,
                 self.state_database,
-                instance_id,
+                runtime_id,
                 paths["reaper"],
                 owner_id,
             )
@@ -965,7 +981,7 @@ class InstanceRuntime:
                 self.terminate_process(sidecar)
             if network is not None:
                 try:
-                    self.network_manager.release(instance_id)
+                    self.network_manager.release(runtime_id)
                 except NetworkFailure:
                     pass
             shutil.rmtree(paths["jail"], ignore_errors=True)
@@ -979,12 +995,13 @@ class InstanceRuntime:
 
         instance_id = validate_instance_id(instance_id)
         owner_id = validate_instance_id(owner_id)
+        runtime_id = self.runtime_store.resolve_runtime_id(instance_id)
         uid, _, _, _ = self.ensure_host()
         paths = self.paths(instance_id, owner_id)
         metadata = self.status(instance_id)
         if metadata is None or metadata.get("status") != "running" or not metadata.get("processAlive"):
             raise RuntimeFailure(f"instance is not running: {instance_id}")
-        lease = self.network_manager.store.get(instance_id)
+        lease = self.network_manager.store.get(runtime_id)
         if lease is None:
             raise RuntimeFailure(f"network lease is missing: {instance_id}")
 
@@ -1022,7 +1039,7 @@ class InstanceRuntime:
             os.replace(source_snapshot, paths["snapshot_next"])
             self.lifecycle(
                 "stop",
-                instance_id,
+                runtime_id,
                 "--reason",
                 "suspended",
                 "--skip-guest-shutdown",
@@ -1034,7 +1051,7 @@ class InstanceRuntime:
             build_id_path = ARTIFACT_ROOT / "agent-rootfs.build-id"
             manifest = {
                 "version": 1,
-                "instanceId": instance_id,
+                "instanceId": runtime_id,
                 "ownerId": owner_id,
                 "createdAt": int(time.time()),
                 "rootfsBuildId": build_id_path.read_text(encoding="utf-8").strip(),
@@ -1075,6 +1092,7 @@ class InstanceRuntime:
 
         instance_id = validate_instance_id(instance_id)
         owner_id = validate_instance_id(owner_id)
+        runtime_id = self.runtime_store.resolve_runtime_id(instance_id)
         started_at = time.monotonic()
         uid, gid, gateway_uid, gateway_gid = self.ensure_host()
         paths = self.paths(instance_id, owner_id)
@@ -1096,7 +1114,7 @@ class InstanceRuntime:
         process: subprocess.Popen[bytes] | None = None
         try:
             network = self.network_manager.reserve_snapshot_lease(
-                instance_id, manifest["network"]
+                runtime_id, manifest["network"]
             )
             self.network_manager.setup(network, uid, (GATEWAY_PORT,))
 
@@ -1131,7 +1149,7 @@ class InstanceRuntime:
                 [
                     "/usr/local/bin/jailer",
                     "--id",
-                    instance_id,
+                    runtime_id,
                     "--exec-file",
                     "/usr/local/bin/firecracker",
                     "--uid",
@@ -1178,10 +1196,10 @@ class InstanceRuntime:
             self.firecracker_api(paths["socket"], "PATCH", "/vm", {"state": "Resumed"})
             resume_api_ms = round((time.monotonic() - resumed_at) * 1000)
 
-            self.network_manager.activate(instance_id)
+            self.network_manager.activate(runtime_id)
             register_arguments = [
                 "register",
-                instance_id,
+                runtime_id,
                 "--pid",
                 str(process.pid),
                 "--idle-timeout",
@@ -1218,7 +1236,7 @@ class InstanceRuntime:
                 self.manager,
                 self.state_root,
                 self.state_database,
-                instance_id,
+                runtime_id,
                 paths["reaper"],
                 owner_id,
             )
@@ -1247,7 +1265,7 @@ class InstanceRuntime:
                 self.terminate_process(sidecar)
             if network is not None:
                 try:
-                    self.network_manager.release(instance_id)
+                    self.network_manager.release(runtime_id)
                 except NetworkFailure:
                     pass
             shutil.rmtree(paths["jail"], ignore_errors=True)
@@ -1258,9 +1276,10 @@ class InstanceRuntime:
     def status(self, instance_id: str) -> dict | None:
         """读取生命周期元数据，并实时计算进程存活与空闲时间。"""
         instance_id = validate_instance_id(instance_id)
+        runtime_id = self.runtime_store.resolve_runtime_id(instance_id)
         paths = self.paths(instance_id)
         try:
-            metadata = self.runtime_store.load_legacy(paths["metadata"], instance_id)
+            metadata = self.runtime_store.load_legacy(paths["metadata"], runtime_id)
         except RuntimeStoreError as error:
             raise RuntimeFailure(f"invalid lifecycle metadata for {instance_id}") from error
         if metadata is None:
@@ -1272,7 +1291,8 @@ class InstanceRuntime:
 
     def heartbeat(self, instance_id: str) -> dict:
         """刷新实例活动时间，并返回刷新后的运行状态。"""
-        self.lifecycle("heartbeat", validate_instance_id(instance_id))
+        runtime_id = self.runtime_store.resolve_runtime_id(validate_instance_id(instance_id))
+        self.lifecycle("heartbeat", runtime_id)
         status = self.status(instance_id)
         if status is None:
             raise RuntimeFailure(f"instance is not registered: {instance_id}")
@@ -1281,12 +1301,14 @@ class InstanceRuntime:
     def busy(self, instance_id: str, enabled: bool) -> None:
         """执行任务期间设置 busy 标记，防止空闲回收器中途关闭实例。"""
 
-        self.lifecycle("busy", validate_instance_id(instance_id), "on" if enabled else "off")
+        runtime_id = self.runtime_store.resolve_runtime_id(validate_instance_id(instance_id))
+        self.lifecycle("busy", runtime_id, "on" if enabled else "off")
 
     def stop(self, instance_id: str, reason: str = "api") -> dict:
         """停止计算资源但保留实例记录和持久化数据盘。"""
         instance_id = validate_instance_id(instance_id)
-        self.lifecycle("stop", instance_id, "--reason", reason)
+        runtime_id = self.runtime_store.resolve_runtime_id(instance_id)
+        self.lifecycle("stop", runtime_id, "--reason", reason)
         self.discard_snapshot(instance_id)
         status = self.status(instance_id)
         if status is None:
@@ -1301,9 +1323,10 @@ class InstanceRuntime:
         实例是否有 owner 决定。
         """
         instance_id = validate_instance_id(instance_id)
+        runtime_id = self.runtime_store.resolve_runtime_id(instance_id)
         paths = self.paths(instance_id)
         if self.status(instance_id) is not None:
-            arguments = ["destroy", instance_id]
+            arguments = ["destroy", runtime_id]
             if preserve_volume:
                 arguments.append("--preserve-volume")
             self.lifecycle(*arguments)

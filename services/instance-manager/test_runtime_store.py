@@ -71,6 +71,53 @@ class RuntimeStoreTests(unittest.TestCase):
         self.assertFalse(legacy.exists())
         self.assertEqual(self.store.get("agent-old")["status"], "running")
 
+    def test_resolve_runtime_id_is_identity_without_binding(self) -> None:
+        """阶段 2 冷启动无绑定时，物理 runtime_id 恒等于逻辑实例 ID。"""
+
+        self.assertEqual(self.store.resolve_runtime_id("agent-one"), "agent-one")
+
+    def test_binding_maps_logical_instance_to_physical_runtime(self) -> None:
+        binding = {
+            "logicalInstanceId": "agent-one",
+            "runtimeId": "warm-00000001",
+            "userId": "user-one",
+            "volumePath": "/srv/fc/volumes/users/user-one.ext4",
+            "activationId": "activation-abc",
+            "status": "assigned",
+        }
+        self.store.save_binding(binding)
+        self.assertEqual(self.store.resolve_runtime_id("agent-one"), "warm-00000001")
+        self.assertEqual(self.store.get_binding("agent-one")["runtimeId"], "warm-00000001")
+
+    def test_delete_binding_restores_identity(self) -> None:
+        self.store.save_binding(
+            {
+                "logicalInstanceId": "agent-one",
+                "runtimeId": "warm-00000001",
+                "userId": "user-one",
+                "volumePath": "/srv/fc/volumes/users/user-one.ext4",
+                "status": "assigned",
+            }
+        )
+        self.store.delete_binding("agent-one")
+        self.assertEqual(self.store.resolve_runtime_id("agent-one"), "agent-one")
+
+    def test_binding_rejects_duplicate_runtime_id(self) -> None:
+        """一个 runtime_id 至多分配给一个逻辑实例。"""
+
+        base = {
+            "userId": "user-one",
+            "volumePath": "/srv/fc/volumes/users/user-one.ext4",
+            "status": "assigned",
+        }
+        self.store.save_binding(
+            {**base, "logicalInstanceId": "agent-one", "runtimeId": "warm-00000001"}
+        )
+        with self.assertRaises(RuntimeStoreError):
+            self.store.save_binding(
+                {**base, "logicalInstanceId": "agent-two", "runtimeId": "warm-00000001"}
+            )
+
     def test_user_has_one_stable_volume_binding(self) -> None:
         volumes = UserVolumeStore(self.database)
         first_path = Path(self.temporary.name) / "users" / "user-one.ext4"
