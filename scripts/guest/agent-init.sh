@@ -280,7 +280,9 @@ if [[ "${managed_runtime}" == "1" ]]; then
           PI_TELEMETRY=0 \
           PI_RPC_PROVIDER="${rpc_provider}" \
           PI_RPC_MODEL="${rpc_model}" \
-          socat \
+          # -t 30：连接关闭后给 pi 退出 + 刷盘留足时间。socat 默认 -t 0.5 秒，
+          # 超时会显式杀掉 EXEC 子进程，导致 Session 只进页缓存却来不及 sync。
+          socat -t 30 \
             "TCP-LISTEN:${rpc_port},bind=${rpc_bind_ip},reuseaddr" \
             EXEC:/usr/local/sbin/pi-rpc-session; then
         exit_status=0

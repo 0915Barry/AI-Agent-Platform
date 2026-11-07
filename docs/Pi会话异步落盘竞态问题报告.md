@@ -16,9 +16,12 @@ AssertionError: native Session does not contain a user message
 
 抓到的现场是：用户数据盘上的 **Pi 原生 session JSONL 文件是 0 字节（空文件）**。
 
-**根因**：Pi（`@earendil-works/pi-coding-agent@1.0.0`）的 RPC **关闭路径有缺陷**——`shutdown()` 一开始就摘掉 SIGTERM/SIGHUP 处理器，且第二次 `shutdown()` 调用直接 `process.exit()`，于是关闭期间任何「再次触发的信号或关闭请求」都会把 `await runtimeHost.dispose()` 拦腰截断，尚未落盘的会话写随之丢失。上游已在 `ace560c3`（2026-11-03，**尚未发版**）修复。取证见 §9 / §10。
+**根因**：Guest 里 `socat` 默认 `-t 0.5`——客户端关闭连接后，socat 只等 0.5 秒就**显式杀掉 EXEC 子进程**（`pi-rpc-session.sh`）。而这个 wrapper 要在 `pi` 退出后完成 dispose + 探针 + `sync`，常常超过 0.5 秒；被杀时 `sync` 还没跑，session 只留在 Guest 页缓存里，于是数据盘上剩下一个 0 字节空文件。
 
-**归属**：这是 Pi 进程内部的时序问题，不是本平台代码的确定性 bug。
+- **直接原因**：socat `-t` 超时太短（平台侧，可修）。
+- **放大器**：Pi 1.0.0 的 RPC 关闭路径本身也有缺陷（`ace560c3` 上游修复未发版，见 §9 / §10），dispose 偏慢时更容易撞上 0.5 秒。
+
+**修复**：`socat -t 30`（已改 `agent-init.sh` / `prewarm-activate.sh`），让 wrapper 有充足时间刷盘。
 
 ---
 
@@ -305,7 +308,7 @@ async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
 
 补充核查：`rpc-mode.ts`、`agent-session-runtime.ts`、`session-manager.ts` 在 1.0.0 与 1.5.0 之间基本一致（后者仅 Windows 路径比较与 fork 写句柄的优化），**所以问题的分界线不是版本号，而是 main 上这两个未发布的修复提交**。
 
-### E1：Guest 侧退出探针（已埋点，待跑）
+### E1：Guest 侧退出探针（已跑，结果指向 socat）
 
 在 `scripts/guest/pi-rpc-session.sh` 里，`pi` 退出后与 `sync` 后各输出一行：
 
@@ -316,18 +319,34 @@ SESSION_PROBE stage=after_sync    session=<id> files=<n> max_size=<bytes> pi_exi
 
 同时追加写入数据盘 `/home/pi/.pi/session-probe.log`（与 Session 文件同盘、同一次 `sync`），`cli-smoke-test.sh` 挂盘时会打印 `SESSION_PROBE_LOG_BEGIN … END`。
 
+**实测结果（一次失败样本）**：
+
+```text
+SESSION_PROBE_LOG_MISSING: Guest 侧未写出探针日志（数据盘上不存在）
+SESSION_FILE_CONTENT_BEGIN path=.../conversation-79d945790e254ed0.jsonl
+SESSION_FILE_CONTENT_END                ← 0 字节
+WARN: Pi native session file is empty (async write flake)
+```
+
+关键判读：**同一个 `sync`、同一块盘，session 文件在（0 字节），但探针日志连文件都没有**——说明 wrapper 根本没跑到探针/`sync`，或者被中途杀掉。结合 socat 手册：
+
+> `-t<timeout>`：Default is 0.5 seconds。
+> `end-close` 选项说明：when an address of type EXEC … is ended, socat usually will explicitly kill the sub process。
+
+→ 根因坐实为 **socat `-t 0.5` 在 `sync` 前杀掉 wrapper**。修复：`socat -t 30`。
+
 判读表：
 
 | 现象 | 含义 |
 |---|---|
-| `pi_exit=143`（或 `129`）| **Pi 被 SIGTERM/SIGHUP 打断在 dispose 中途** → 正是 `ace560c3` 修的缺陷 |
+| `pi_exit=143`（或 `129`）| Pi 被 SIGTERM/SIGHUP 打断在 dispose 中途 → `ace560c3` 修的缺陷 |
 | `pi_exit=0` 且 `max_size=0` | Pi 正常退出却没写任何内容 → 另一类问题 |
-| `pi_exit=0` 且 `max_size>0`，但挂盘读到 0 字节 | 写进了 Guest 页缓存但没落盘 → 刷盘/宿主侧问题 |
-| 探针日志整体缺失 | 连 bash 的写都没落地 → VM 停得太早或盘没刷 |
+| `pi_exit=0` 且 `max_size>0`，但挂盘读到 0 字节 | 写进 Guest 页缓存但没落盘 → 刷盘/宿主侧问题 |
+| **探针日志整体缺失** | **wrapper 被 socat 提前杀掉，`sync` 没跑** → 本次实况 |
 
-### E2：不杀 VM 对照（备选）
+### E2：不杀 VM 对照（已不必要）
 
-若 E1 指向「写进页缓存却没落盘」，再做：闭嘴 stdin 后等待 30s 再 `stop`，对比 session 是否补上。
+E1 已定位到 socat 杀子进程，E2 的「不杀 VM」对照不再需要。
 
 ---
 
@@ -343,15 +362,18 @@ SESSION_PROBE stage=after_sync    session=<id> files=<n> max_size=<bytes> pi_exi
 
 ---
 
-## 12. 后续建议与修复方案
+## 12. 修复方案与结论
 
-根因已经定性为 **Pi 1.0.0 关闭路径的清理被打断**（§10 E4），修复有三条路，按推荐度排序：
+根因最终定位为 **socat `-t 0.5` 在 `sync` 前杀掉 wrapper**（§10 E1 实测），不是 Pi 内部缺陷的直接触发。修复已实施：
 
-| 方案 | 做法 | 优点 | 风险 |
-|---|---|---|---|
-| **S1 等上游发版后升级** | 盯住 `PI_VERSION`，1.6.0（含 `ace560c3` + `b2cb6292`）发布后升级并跑全量 smoke | 官方修复、最干净 | 需等发版；跨版本可能带其他 breaking change |
-| **S2 构建期打补丁** | 在 `build-agent-rootfs.sh` 的 `npm install` 之后，对 `dist/` 里 `shutdown()` 打最小补丁（信号处理器保留到退出、二次调用直接返回） | 立刻可用、不动版本 | 改的是打包产物，上游一变就失效，需固定 tar 校验 |
-| **S3 平台侧消除二次触发** | 若 E1 证实 `pi_exit=143`，就定位是谁在关闭时发信号（socat/runuser/连接关闭路径），从源头不发 | 不动 Pi | 只在「二次触发」确实存在时有效 |
+**✅ 已修**：`socat -t 30`（`agent-init.sh` 的 managed_runtime 监听、`prewarm-activate.sh` 的一次性激活监听），让 wrapper 在 `pi` 退出后有 30 秒完成 dispose + 探针 + `sync`；wrapper 一旦退出，socat 立即结束、外层循环随即恢复监听，不会真的等满 30 秒。
+
+**遗留/后续**：
+
+| 事项 | 说明 |
+|---|---|
+| Pi 1.0.0 关闭路径缺陷（`ace560c3`）| 本次的直接触发是 socat 杀 wrapper，而非该缺陷；但该缺陷仍可能在未来（例如有人直接 SIGTERM）复现，建议 1.6.0 发版后升级 `PI_VERSION` |
+| 验证 | 重建 rootfs 后连跑 `cli-smoke-test` 数次，确认 `SESSION_PROBE_LOG_BEGIN` 出现、`pi_exit=0`、`max_size>0`，且不再有 `WARN: ... empty` |
 
 无论走哪条，短期兜底保持不变：
 

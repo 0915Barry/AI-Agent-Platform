@@ -91,7 +91,8 @@ case "${command}" in
             PI_TELEMETRY=0 \
             PI_RPC_PROVIDER="${rpc_provider}" \
             PI_RPC_MODEL="${rpc_model}" \
-            socat \
+            # -t 30：与 managed_runtime 一致，避免 socat 默认 0.5 秒后杀掉刷盘中的子进程。
+            socat -t 30 \
               "TCP-LISTEN:${rpc_port},bind=${rpc_bind_ip},reuseaddr" \
               EXEC:/usr/local/sbin/pi-rpc-session; then
           exit_status=0
