@@ -87,7 +87,34 @@ set +e
 } | /usr/local/bin/pi "${pi_args[@]}"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
+
+# 临时诊断探针：统计当前会话 JSONL 的文件数与最大字节数。
+# 输出走 stderr（串口 → Host console.log），不污染 stdout 的 RPC 协议流。
+session_probe() {
+  local stage="$1" matches=0 max_size=-1 candidate size line
+  shopt -s nullglob globstar
+  for candidate in /home/pi/.pi/agent/sessions/**/*_"${session_id}".jsonl; do
+    size="$(stat -c '%s' "${candidate}" 2>/dev/null || echo 0)"
+    matches=$((matches + 1))
+    if (( size > max_size )); then max_size="${size}"; fi
+  done
+  shopt -u nullglob globstar
+  line="SESSION_PROBE stage=${stage} session=${session_id} files=${matches} max_size=${max_size} pi_exit=${pipeline_status[1]:-none}"
+  printf '%s\n' "${line}" >&2
+  # 同时写进数据盘：与 Session 文件同块盘、同一次 sync，命运一致，便于 Host 挂盘取证。
+  printf '%s\n' "${line}" >> /home/pi/.pi/session-probe.log 2>/dev/null || true
+}
+
+if [[ -n "${session_id}" ]]; then
+  session_probe after_pi_exit
+fi
+
 # Pi 的 Session 位于可写数据盘。显式刷盘后再退出，Host 看到监听器重新建立时
 # 即可确认本轮 JSONL Session 已经持久化，而不是仍停留在 Guest 页缓存中。
 sync
+
+if [[ -n "${session_id}" ]]; then
+  session_probe after_sync
+fi
+
 exit "${pipeline_status[1]}"

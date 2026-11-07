@@ -203,6 +203,17 @@ chat_and_check_session() {
   local check_mount check_file ok=0
   check_mount="$(mktemp -d /var/tmp/cli-session-check.XXXXXX)"
   mount -o loop,ro "${volume_path}" "${check_mount}"
+
+  # 诊断：Guest 侧探针记录（Pi 退出后 / sync 后的文件数与大小、Pi 退出码）。
+  # 放在 session 文件查找之前，因为「文件不存在」这种 flake 也要能看到探针。
+  if [[ -f "${check_mount}/pi-state/session-probe.log" ]]; then
+    echo "SESSION_PROBE_LOG_BEGIN" >&2
+    tail -n 8 "${check_mount}/pi-state/session-probe.log" >&2
+    echo "SESSION_PROBE_LOG_END" >&2
+  else
+    echo "SESSION_PROBE_LOG_MISSING: Guest 侧未写出探针日志（数据盘上不存在）" >&2
+  fi
+
   check_file="$(
     find "${check_mount}/pi-state/agent/sessions" -type f \
       -name "*_${conversation_id}.jsonl" -print -quit 2>/dev/null || true

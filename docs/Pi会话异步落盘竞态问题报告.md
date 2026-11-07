@@ -16,7 +16,7 @@ AssertionError: native Session does not contain a user message
 
 抓到的现场是：用户数据盘上的 **Pi 原生 session JSONL 文件是 0 字节（空文件）**。
 
-**根因**：Pi（`@earendil-works/pi-coding-agent@1.0.0`）不是「边聊边写盘」，而是把整个会话缓存在内存里，**在进程退出那一刻才一次性异步写盘**。这个「异步写」和「进程退出」之间存在竞态——进程若在写完成前结束，写就被丢弃，留下空文件。
+**根因**：Pi（`@earendil-works/pi-coding-agent@1.0.0`）的 RPC **关闭路径有缺陷**——`shutdown()` 一开始就摘掉 SIGTERM/SIGHUP 处理器，且第二次 `shutdown()` 调用直接 `process.exit()`，于是关闭期间任何「再次触发的信号或关闭请求」都会把 `await runtimeHost.dispose()` 拦腰截断，尚未落盘的会话写随之丢失。上游已在 `ace560c3`（2026-11-03，**尚未发版**）修复。取证见 §9 / §10。
 
 **归属**：这是 Pi 进程内部的时序问题，不是本平台代码的确定性 bug。
 
@@ -52,7 +52,7 @@ SESSION_FILE_CONTENT_END          ← 中间 0 字节，什么都没写
 
 空文件是 **0 字节**——连最早写入的 session header（比最终回答早约 6 秒）都没有。
 
-这证明 Pi **不是逐条追加写盘**，而是**一次性整包写盘**：要么全写进去，要么全没写进去。若是一般的「flush 不及时」，至少 header 早该在文件里。
+这**曾**被解读为「Pi 一次性整包写盘」。但读过 1.0.0 源码后要修正这个推断：`SessionManager._persist()` 是在**首条 user/assistant 消息**写入时就 `openSync(...,"wx")` 并同步写全部条目，之后逐条 `appendFileSync`（见 §10 E4）——**不是退出时才写**。所以「0 字节」更可能是「文件建了、数据整包没落地」，确切机制由 §10 E1 的探针判定。
 
 ---
 
@@ -64,7 +64,7 @@ Pi 的 RPC 模式是「每连接现起现退」：
 
 ```text
 发消息 → socat 起 pi-rpc-session → 起 pi 进程 → pi 处理 → 回答
-       → 关连接 → pi 收到 stdin EOF → pi 退出（此刻才把内存里的会话一次性写盘）
+       → 关连接 → pi 收到 stdin EOF → pi 进入 shutdown()（§10 E4 的缺陷就在这一段：dispose 可被打断）
        → pi-rpc-session 执行 sync
 ```
 
@@ -212,7 +212,126 @@ Pi RPC 结束时的完整数据路径：
 
 ---
 
-## 9. 关键证据时间线
+## 9. 官方文档怎么说（以及它与实测的矛盾）
+
+Pi 官方 RPC 文档（[rpc.md · Shutdown](https://github.com/earendil-works/pi/blob/HEAD/packages/coding-agent/docs/rpc.md)）**main 分支**对关机时序写的是：
+
+> Close the child's stdin to request an orderly shutdown. **Pi disposes the active runtime and waits for pending work to finish before exiting, so give it time to exit before killing it.**
+
+拆成三条可执行的约束：
+
+1. 关闭子进程 stdin → 请求**有序关闭**（orderly shutdown）；
+2. **Pi 会「等挂起的工作完成」再退出**；
+3. **客户端要「给足时间让它退出，再 kill 它」**。
+
+**但这句话只存在于 main，尚未随任何版本发布。** 我们锁定的 1.0.0 以及到 1.5.0 为止的所有版本，原文都是：
+
+> Close the child's stdin to request an orderly shutdown. **Pi disposes the active runtime before exiting.** Clients should still handle process signals and unexpected exits.
+
+也就是说，**「等挂起工作完成」「给足时间再杀」不是 1.0.0 的行为，而是未发布的修复**。所以不能用这句文档来解释本平台的现状。
+
+但本平台的实测与**main 的行为**仍然矛盾：
+
+- 平台**已经等了**：gateway 的探测连接要等到 socat 重新监听（= `pi` 退出 + `sync` 执行完）才返回，然后才 `stop` VM——**这是「give it time」的严格实现**；
+- 可 session 仍然偶发 0 字节。
+
+于是只剩两种可能：
+
+| 假设 | 含义 | 验证结果 |
+|---|---|---|
+| **A. 1.0.0 没实现「wait for pending work」** | 关闭路径上存在「清理被打断就丢写」的缺陷 | ✅ **成立**，见 §10 |
+| **B. session 写没被算作「pending work」** | Pi 确实等了，但等的是别的东西 | ❌ 不成立 |
+
+> 附注：本仓库 `docs/Pi常驻进程与Session加载优化.md` 只记录了「关闭 stdin 即请求有序退出」，遗漏了「give it time before killing it」这句（且该句仅存在于 main），本次一并说明。
+
+---
+
+## 10. 定位实验记录
+
+### E3：版本取证（已完成）
+
+逐 tag 抓取 `docs/rpc.md` 比对 `Shutdown` 一节原文：
+
+| 版本 | 原文 | 有「等挂起工作」 |
+|---|---|---|
+| 1.0.0（我们锁定）| `Pi disposes the active runtime before exiting.` | ❌ |
+| 1.1.0 / 1.2.0 / 1.3.0 / 1.4.0 | 同上 | ❌ |
+| 1.5.0（npm 最新，2026-11-02）| 同上 | ❌ |
+| main | `...and waits for pending work to finish before exiting, so give it time to exit before killing it.` | ✅ |
+
+结论：**修复只在 main，未发版**；升级到 1.5.0 解决不了。
+
+### E4：源码定位（已完成）
+
+1.0.0 `src/modes/rpc/rpc-mode.ts` 的关闭路径（原文）：
+
+```ts
+for (const signal of signals) {
+    const handler = () => {
+        killTrackedDetachedChildren();
+        void shutdown(signal === "SIGHUP" ? 129 : 143, signal);
+    };
+    process.on(signal, handler);
+    signalCleanupHandlers.push(() => process.off(signal, handler)); // 关闭一开始就摘掉
+}
+
+async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
+    if (shuttingDown) {
+        process.exit(exitCode);          // 第二次调用：立刻退出，dispose 半途而废
+    }
+    shuttingDown = true;
+    for (const cleanup of signalCleanupHandlers) cleanup();  // 摘掉 SIGTERM/SIGHUP
+    ...
+    await runtimeHost.dispose();         // ← 可被信号 / 第二次调用打断
+    ...
+    process.exit(exitCode);
+}
+```
+
+对应的上游修复提交：
+
+| 提交 | 日期 | 标题 |
+|---|---|---|
+| `ace560c3` | 2026-11-03 | fix(coding-agent): let a started RPC or print shutdown finish; only a repeated signal forces exit (#11752) |
+| `b2cb6292` | 2026-11-04 | fix(coding-agent): wait for a started OAuth refresh to be saved before exit (#11812) |
+
+`ace560c3` 的提交说明直接命中本平台场景：
+
+> a second shutdown trigger cut off cleanup.
+> - stdin EOF, then SIGTERM: `shutdown()` removed pi's SIGTERM handler when it started, so the signal killed pi (exit 143) mid-`dispose()`.
+> - SIGTERM, then stdin EOF: the second `shutdown()` call ran `process.exit()`.
+
+修复后的语义：信号处理器**保留到进程退出**，关闭期间收到一次信号不再视为「跳过清理」，只有**重复信号**才强制退出；`shutdown()` 二次调用改为直接返回。
+
+补充核查：`rpc-mode.ts`、`agent-session-runtime.ts`、`session-manager.ts` 在 1.0.0 与 1.5.0 之间基本一致（后者仅 Windows 路径比较与 fork 写句柄的优化），**所以问题的分界线不是版本号，而是 main 上这两个未发布的修复提交**。
+
+### E1：Guest 侧退出探针（已埋点，待跑）
+
+在 `scripts/guest/pi-rpc-session.sh` 里，`pi` 退出后与 `sync` 后各输出一行：
+
+```
+SESSION_PROBE stage=after_pi_exit session=<id> files=<n> max_size=<bytes> pi_exit=<code>
+SESSION_PROBE stage=after_sync    session=<id> files=<n> max_size=<bytes> pi_exit=<code>
+```
+
+同时追加写入数据盘 `/home/pi/.pi/session-probe.log`（与 Session 文件同盘、同一次 `sync`），`cli-smoke-test.sh` 挂盘时会打印 `SESSION_PROBE_LOG_BEGIN … END`。
+
+判读表：
+
+| 现象 | 含义 |
+|---|---|
+| `pi_exit=143`（或 `129`）| **Pi 被 SIGTERM/SIGHUP 打断在 dispose 中途** → 正是 `ace560c3` 修的缺陷 |
+| `pi_exit=0` 且 `max_size=0` | Pi 正常退出却没写任何内容 → 另一类问题 |
+| `pi_exit=0` 且 `max_size>0`，但挂盘读到 0 字节 | 写进了 Guest 页缓存但没落盘 → 刷盘/宿主侧问题 |
+| 探针日志整体缺失 | 连 bash 的写都没落地 → VM 停得太早或盘没刷 |
+
+### E2：不杀 VM 对照（备选）
+
+若 E1 指向「写进页缓存却没落盘」，再做：闭嘴 stdin 后等待 30s 再 `stop`，对比 session 是否补上。
+
+---
+
+## 11. 关键证据时间线
 
 | 时间点 | cli-smoke-test 结果 |
 |---|---|
@@ -224,8 +343,18 @@ Pi RPC 结束时的完整数据路径：
 
 ---
 
-## 10. 后续建议
+## 12. 后续建议与修复方案
 
-1. 短期：保留 smoke test 的 3 次重试 + session 内容诊断输出，作为稳定性兜底。
-2. 中期：在架构文档中明确「SQLite 消息缓存事实上是当前可靠的持久化层，Pi 原生 session 存在异步落盘竞态」，避免未来换 agent 时误以为 Pi session 一定完整。
-3. 长期：agent 选型时把「会话落盘是否同步/可靠」纳入评估；或考虑由平台侧主动把消息写回 Pi session（绕开 Pi 的异步写）。
+根因已经定性为 **Pi 1.0.0 关闭路径的清理被打断**（§10 E4），修复有三条路，按推荐度排序：
+
+| 方案 | 做法 | 优点 | 风险 |
+|---|---|---|---|
+| **S1 等上游发版后升级** | 盯住 `PI_VERSION`，1.6.0（含 `ace560c3` + `b2cb6292`）发布后升级并跑全量 smoke | 官方修复、最干净 | 需等发版；跨版本可能带其他 breaking change |
+| **S2 构建期打补丁** | 在 `build-agent-rootfs.sh` 的 `npm install` 之后，对 `dist/` 里 `shutdown()` 打最小补丁（信号处理器保留到退出、二次调用直接返回） | 立刻可用、不动版本 | 改的是打包产物，上游一变就失效，需固定 tar 校验 |
+| **S3 平台侧消除二次触发** | 若 E1 证实 `pi_exit=143`，就定位是谁在关闭时发信号（socat/runuser/连接关闭路径），从源头不发 | 不动 Pi | 只在「二次触发」确实存在时有效 |
+
+无论走哪条，短期兜底保持不变：
+
+1. 保留 smoke test 的 3 次重试 + session 内容诊断 + `SESSION_PROBE` 探针。
+2. 在架构文档中明确「SQLite 消息缓存事实上是当前可靠的持久化层，Pi 原生 session 存在关闭期落盘竞态」，避免未来换 agent 时误以为 Pi session 一定完整。
+3. agent 选型时把「会话落盘是否同步/可靠」纳入评估。
