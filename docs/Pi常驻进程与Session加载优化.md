@@ -29,20 +29,23 @@
 Host Pi Gateway (gateway.py)
   └─ 每发一次请求，建一条 TCP 连接到 Guest 8080
        └─ Guest socat TCP-LISTEN:8080 EXEC:/usr/local/sbin/pi-rpc-session
-            └─ 每接受一条连接，socat 就 fork + exec 一个 pi-rpc-session.sh
+            └─ 每接受一条连接，socat 就 exec 一个 pi-rpc-session.sh（外层 while 循环保持监听）
                  └─ 脚本 exec 一个全新的 pi --mode rpc 进程
-                      └─ 连接关闭 → pi 收到 EOF → 退出、被回收
+                      └─ 连接关闭 → pi 收到 EOF → 退出 → wrapper 执行 sync 刷盘后退出
 ```
 
 关键点：**一个 TCP 连接 = 一个 pi 进程，用完即退**。因此「读历史」和「发消息」每次都要重新付一遍 Node.js + Pi 的冷启动。
 
 ### 2.1 Guest 侧脚本
 
-`scripts/guest/agent-init.sh`（启动 socat 监听，每连接 EXEC）：
+`scripts/guest/agent-init.sh`（以 `runuser -u pi` 启动 socat 监听，每连接 EXEC）：
 
 ```bash
-socat "TCP-LISTEN:${rpc_port},bind=${rpc_bind_ip},reuseaddr" EXEC:/usr/local/sbin/pi-rpc-session
+socat -t 30 "TCP-LISTEN:${rpc_port},bind=${rpc_bind_ip},reuseaddr" EXEC:/usr/local/sbin/pi-rpc-session
 ```
+
+> `-t 30`：连接关闭后给 wrapper 最多 30 秒做 `pi` 退出 + `sync` 刷盘。socat 默认 `-t 0.5`，
+> 曾在刷盘前杀掉 wrapper 导致 Session 偶发空文件，详见 `Pi会话异步落盘竞态问题报告.md`。
 
 `scripts/guest/pi-rpc-session.sh`（每连接执行一次）：
 
@@ -121,7 +124,8 @@ Guest 里有一个正在运行的 pi 进程，它是可以被冻结进快照、r
 - 启动：`pi --mode rpc --no-session`。
 - 会话相关 CLI 选项：`--provider`、`--model`、`--name`、`--no-session`、`--session-dir`。
 - 每条命令可带可选 `id`，响应会回带同 `id`；命令处理是**异步**的，按 id 关联而非按顺序。
-- 关闭方式：**关闭子进程 stdin** 即请求有序退出。
+- 关闭方式：**关闭子进程 stdin** 即请求有序退出。1.0.0 的 rpc.md 原文是
+  「`Pi disposes the active runtime before exiting`」；「`…and waits for pending work to finish before exiting, so give it time to exit before killing it`」这句只存在于 main（尚未随任何版本发布）。本平台通过 wrapper 末尾的 `sync` + socat `-t 30` 提供这段收尾时间，见 `Pi会话异步落盘竞态问题报告.md`。
 
 ### 4.2 rpc-commands.md 完整命令表（按官方章节）
 
