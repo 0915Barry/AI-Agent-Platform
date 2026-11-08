@@ -191,14 +191,17 @@ chat_and_check_session() {
   "${cli[@]}" stop "${instance_id}" >/dev/null
 
   # 诊断：抓取 Guest 串口日志（Pi stderr、socat 关闭状态），定位连接为何提前关闭。
-  local console_log
-  console_log="$(ls -t /var/lib/fc/control-plane/*/console.log 2>/dev/null | head -1)"
+  # smoke test 用自己的 state_root=/var/lib/fc/cli-smoke，与生产 /var/lib/fc 隔离。
+  local console_log="/var/lib/fc/cli-smoke/control-plane/${instance_id}/console.log"
+  if [[ ! -f "${console_log}" ]]; then
+    console_log="$(ls -t /var/lib/fc/cli-smoke/control-plane/*/console.log 2>/dev/null | head -1)"
+  fi
   if [[ -n "${console_log}" && -f "${console_log}" ]]; then
     echo "GUEST_CONSOLE_BEGIN path=${console_log}" >&2
     tail -n 80 "${console_log}" >&2
     echo "GUEST_CONSOLE_END" >&2
   else
-    echo "GUEST_CONSOLE_MISSING: /var/lib/fc/control-plane/*/console.log 不存在" >&2
+    echo "GUEST_CONSOLE_MISSING: 找不到 /var/lib/fc/cli-smoke/control-plane/*/console.log" >&2
   fi
 
   # Firecracker 停止后 ext4 可能仍带待确认 journal；只读挂载无法回放，
