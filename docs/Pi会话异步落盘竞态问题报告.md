@@ -21,7 +21,7 @@ AssertionError: native Session does not contain a user message
 - **直接原因**：socat `-t` 超时太短（平台侧，可修）。
 - **放大器**：Pi 1.0.0 的 RPC 关闭路径本身也有缺陷（`ace560c3` 上游修复未发版，见 §9 / §10），dispose 偏慢时更容易撞上 0.5 秒。
 
-**修复**：`socat -t 30`（已改 `agent-init.sh` / `prewarm-activate.sh`），让 wrapper 有充足时间刷盘。
+**修复**：`socat -t 30`（已改 `agent-init.sh` / `prewarm-activate.sh`），让 wrapper 有充足时间刷盘。**已修复并验证**：连续 7 次 `cli-smoke-test` 全 PASS（详见 §12）。
 
 ---
 
@@ -364,16 +364,20 @@ E1 已定位到 socat 杀子进程，E2 的「不杀 VM」对照不再需要。
 
 ## 12. 修复方案与结论
 
-根因最终定位为 **socat `-t 0.5` 在 `sync` 前杀掉 wrapper**（§10 E1 实测），不是 Pi 内部缺陷的直接触发。修复已实施：
+根因最终定位为 **socat `-t 0.5` 在 `sync` 前杀掉 wrapper**（§10 E1 实测），不是 Pi 内部缺陷的直接触发。修复已实施并验证：
 
 **✅ 已修**：`socat -t 30`（`agent-init.sh` 的 managed_runtime 监听、`prewarm-activate.sh` 的一次性激活监听），让 wrapper 在 `pi` 退出后有 30 秒完成 dispose + 探针 + `sync`；wrapper 一旦退出，socat 立即结束、外层循环随即恢复监听，不会真的等满 30 秒。
+
+**✅ 已验证**：连续 7 次 `cli-smoke-test` 全 PASS。每次探针均输出 `pi_exit=0`、`max_size>0`（`after_pi_exit` 与 `after_sync` 一致），挂盘读到完整 `entries=6 / messages=3`，不再出现空文件。原 flake 概率约 50%，若修复无效而纯靠运气连过 7 次的概率约 0.8%，因此结论为**已修复**。
+
+> 排查期间曾引入一个回归：为 `-t 30` 添加的 `#` 注释插在 `\` 续行链中间，把 `runuser -u pi -- env … socat` 劈成两条命令，导致 socat 以 root 运行、wrapper 因「不得以 root 运行」拒绝启动、Pi 从未被拉起（表现为 `Pi RPC connection closed before agent_settled` + session 不存在）。已随本次一并修正（提交 `4345637`）。
 
 **遗留/后续**：
 
 | 事项 | 说明 |
 |---|---|
 | Pi 1.0.0 关闭路径缺陷（`ace560c3`）| 本次的直接触发是 socat 杀 wrapper，而非该缺陷；但该缺陷仍可能在未来（例如有人直接 SIGTERM）复现，建议 1.6.0 发版后升级 `PI_VERSION` |
-| 验证 | 重建 rootfs 后连跑 `cli-smoke-test` 数次，确认 `SESSION_PROBE_LOG_BEGIN` 出现、`pi_exit=0`、`max_size>0`，且不再有 `WARN: ... empty` |
+| Firecracker `cache_type=Unsafe` | 数据落到宿主页缓存而非物理盘，宿主掉电才可能丢；与本次「挂盘读到空文件」无关，暂不处理 |
 
 无论走哪条，短期兜底保持不变：
 
