@@ -40,6 +40,8 @@ Commands:
   agent-task-smoke-test Verify host Pi Gateway with a real DeepSeek task
   cli-smoke-test        Verify the authenticated agentctl lifecycle and resumed chat
   recovery-smoke-test   Verify Control Plane restart and Firecracker crash recovery
+  recovery-stress-test [cycles]
+                        Repeat Firecracker crashes and probe recovery cleanup
   snapshot-smoke-test   Verify full snapshot creation and Pi RPC restore
   auto-snapshot-smoke-test
                         Verify idle auto-snapshot and delayed stop
@@ -162,6 +164,11 @@ case "${command}" in
   recovery-smoke-test)
     build_rootfs
     sudo "${repo_dir}/scripts/linux/recovery-smoke-test.sh"
+    ;;
+  recovery-stress-test)
+    cycles="${2:-30}"
+    build_rootfs
+    sudo "${repo_dir}/scripts/linux/recovery-stress-test.sh" "${cycles}"
     ;;
   snapshot-smoke-test)
     build_rootfs

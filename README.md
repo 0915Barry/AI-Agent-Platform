@@ -310,6 +310,7 @@ CLI 默认连接 `http://127.0.0.1:18090`，也可使用 `--base-url` 或 `AAP_B
 | Host Pi Gateway | `./run.sh agent-task-smoke-test` | `./run-linux.sh agent-task-smoke-test` |
 | 终端完整链路 | `./run.sh cli-smoke-test` | `./run-linux.sh cli-smoke-test` |
 | 异常恢复 | `./run.sh recovery-smoke-test` | `./run-linux.sh recovery-smoke-test` |
+| 异常恢复压力测试 | `./run.sh recovery-stress-test 30` | `./run-linux.sh recovery-stress-test 30` |
 | 快照恢复 | `./run.sh snapshot-smoke-test` | `./run-linux.sh snapshot-smoke-test` |
 
 网络租约成功标志：
@@ -350,6 +351,15 @@ CLI_SMOKE_READY auth=session lifecycle=create,start,stop,restart,destroy convers
 PASS: lifecycle stress test completed 100 start/stop cycles without leaked resources
 LIFECYCLE_STRESS_READY cycles=100 ... process_generation=verified lease=verified tap=clean nft=clean watcher=clean volume=destroyed
 ```
+
+异常恢复压力测试会在每轮启动后直接强制终止 Firecracker，并验证 watcher 能够校准 SQLite 状态、回收 Sidecar 和全部临时网络资源。测试开始前会在临时数据盘写入唯一内容标记；每次崩溃后执行 `e2fsck`、只读挂载并核对标记，再使用同一数据盘启动下一代实例。建议先验证 3 轮，再执行默认的 30 轮：
+
+```bash
+./run.sh recovery-stress-test 3
+./run.sh recovery-stress-test 30
+```
+
+失败时会输出 `FAIL_STAGE`、失败轮次、数据库记录、进程和网络快照及相关日志，并保留 `/var/lib/fc/recovery-stress` 诊断目录。该测试不提交 Agent 任务，不调用模型 API。
 
 恢复链路成功标志：
 

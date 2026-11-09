@@ -55,6 +55,8 @@ Commands:
   agent-task-smoke-test  Verify host Pi Gateway with a real DeepSeek task
   cli-smoke-test         Verify authenticated agentctl lifecycle and resumed chat
   recovery-smoke-test    Verify Control Plane restart and Firecracker crash recovery
+  recovery-stress-test [cycles]
+                         Repeatedly crash Firecracker and probe recovery cleanup
   snapshot-smoke-test    Verify full snapshot creation and Pi RPC restore
   auto-snapshot-smoke-test
                          Verify idle auto-snapshot and delayed stop
@@ -412,6 +414,23 @@ smoke_test_recovery() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/recovery-smoke-test.sh'"
 }
 
+stress_test_recovery() {
+  cycles="${1:-30}"
+  if [[ ! "${cycles}" =~ ^[1-9][0-9]*$ ]] || (( cycles > 1000 )); then
+    echo "Cycle count must be an integer between 1 and 1000" >&2
+    exit 1
+  fi
+  sync_repo
+  echo "Stress-testing ${cycles} Firecracker crash recovery cycles in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/recovery-stress-test.sh' '${cycles}'"
+}
+
 smoke_test_snapshot() {
   sync_repo
   echo "Building and testing Firecracker snapshot restore in ${VM_USER}@${VM_HOST}..."
@@ -570,6 +589,9 @@ case "${command}" in
     ;;
   recovery-smoke-test)
     smoke_test_recovery
+    ;;
+  recovery-stress-test)
+    stress_test_recovery "${2:-30}"
     ;;
   snapshot-smoke-test)
     smoke_test_snapshot
