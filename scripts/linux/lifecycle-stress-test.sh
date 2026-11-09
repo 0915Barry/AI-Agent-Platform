@@ -6,6 +6,8 @@ repo_dir="$(cd "${script_dir}/../.." && pwd)"
 
 # shellcheck disable=SC1091
 . "${repo_dir}/config/lifecycle.env"
+# shellcheck disable=SC1091
+. "${repo_dir}/scripts/linux/proc-stat.sh"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this test with sudo" >&2
@@ -274,7 +276,7 @@ for current_cycle in $(seq 1 "${cycles}"); do
 
   failure_stage="running_process_probe"
   kill -0 "${current_pid}"
-  observed_ticks="$(awk '{print $22}' "/proc/${current_pid}/stat")"
+  observed_ticks="$(process_start_ticks "${current_pid}")"
   [[ "${observed_ticks}" == "${current_start_ticks}" ]]
   if [[ -n "${previous_pid}" && "${current_pid}:${current_start_ticks}" == "${previous_pid}:${previous_start_ticks}" ]]; then
     echo "Process generation did not change across restart" >&2

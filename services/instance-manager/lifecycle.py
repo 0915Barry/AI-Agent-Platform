@@ -54,6 +54,7 @@ def stop_intent_path(state_root: Path, instance_id: str) -> Path:
     """返回显式停止意图标记的固定路径。"""
     return state_root / "stop-intents" / instance_id
 
+
 def load_metadata(store: RuntimeStore, state_root: Path, instance_id: str) -> dict:
     """从 SQLite 读取运行元数据，并在首次升级时兼容导入旧 JSON。"""
     legacy_path, _, _ = paths(state_root, instance_id)
@@ -66,24 +67,52 @@ def load_metadata(store: RuntimeStore, state_root: Path, instance_id: str) -> di
     return metadata
 
 
+def parse_process_stat(stat_text: str) -> tuple[str, int]:
+    """解析 ``/proc/<pid>/stat``，返回进程状态和启动时钟。
+
+    stat 的第二个字段 ``comm`` 被括号包围，但内容允许包含空格和括号，因此
+    不能直接对整行调用 ``split()``。Linux 在 comm 的最后一个右括号之后依次
+    输出 state（字段 3）到 starttime（字段 22）；先从最后一个右括号处分割，
+    才能稳定取得这两个字段。
+    """
+    command_start = stat_text.find("(")
+    command_end = stat_text.rfind(")")
+    if command_start <= 0 or command_end <= command_start:
+        raise ValueError("invalid /proc stat command field")
+
+    remaining_fields = stat_text[command_end + 1 :].split()
+    starttime_index = 22 - 3
+    if len(remaining_fields) <= starttime_index:
+        raise ValueError("incomplete /proc stat fields")
+
+    state = remaining_fields[0]
+    if len(state) != 1:
+        raise ValueError("invalid /proc stat process state")
+    return state, int(remaining_fields[starttime_index])
+
+
+def read_process_stat(pid: int) -> tuple[str, int] | None:
+    """读取并解析一个进程的状态；进程消失或内容异常时返回 ``None``。"""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return parse_process_stat(stat_text)
+    except (OSError, ValueError):
+        return None
+
+
 def process_start_ticks(pid: int) -> int | None:
     """读取 Linux 进程启动时钟，用于抵御 PID 被系统复用的问题。"""
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
-        return int(fields[21])
-    except (FileNotFoundError, IndexError, ValueError, PermissionError):
-        return None
+    process_stat = read_process_stat(pid)
+    return None if process_stat is None else process_stat[1]
 
 
 def process_matches(metadata: dict) -> bool:
     """确认 PID 仍存活且确实是登记时的那个进程，而不是复用同 PID 的新进程。"""
     pid = int(metadata["pid"])
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
-        state = fields[2]
-        start_ticks = int(fields[21])
-    except (FileNotFoundError, IndexError, ValueError, PermissionError):
+    process_stat = read_process_stat(pid)
+    if process_stat is None:
         return False
+    state, start_ticks = process_stat
     return state != "Z" and start_ticks == int(metadata["processStartTicks"])
 
 

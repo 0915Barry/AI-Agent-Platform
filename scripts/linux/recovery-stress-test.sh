@@ -5,6 +5,8 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "${script_dir}/../.." && pwd)"
 # shellcheck disable=SC1091
 . "${repo_dir}/config/lifecycle.env"
+# shellcheck disable=SC1091
+. "${repo_dir}/scripts/linux/proc-stat.sh"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this test with sudo" >&2
@@ -258,7 +260,7 @@ for current_cycle in $(seq 1 "${cycles}"); do
   generation="${current_pid}:${start_ticks}"
   [[ "${generation}" != "${previous_generation}" ]]
   kill -0 "${current_pid}"
-  [[ "$(awk '{print $22}' "/proc/${current_pid}/stat")" == "${start_ticks}" ]]
+  [[ "$(process_start_ticks "${current_pid}")" == "${start_ticks}" ]]
   for pid in "${current_sidecar_pids[@]}"; do kill -0 "${pid}"; done
   ip link show dev "${current_tap}" >/dev/null
   nft list table "${current_nft_family}" "${current_nft_table}" >/dev/null
