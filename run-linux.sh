@@ -29,6 +29,8 @@ Commands:
                          Verify read-only rootfs and persistent data
   gateway-smoke-test    Verify host-side credential injection
   lifecycle-smoke-test  Verify idle reaping and restart persistence
+  lifecycle-stress-test [cycles]
+                        Repeat start/stop cycles and probe resource cleanup
   configure-deepseek    Securely save a DeepSeek API key outside the repo
   configure-user        Create a local login user and claim legacy instances
   auth-smoke-test       Verify sessions, ownership, and quotas
@@ -125,6 +127,11 @@ case "${command}" in
   lifecycle-smoke-test)
     build_rootfs
     sudo "${repo_dir}/scripts/linux/lifecycle-smoke-test.sh"
+    ;;
+  lifecycle-stress-test)
+    cycles="${2:-100}"
+    build_rootfs
+    sudo "${repo_dir}/scripts/linux/lifecycle-stress-test.sh" "${cycles}"
     ;;
   configure-deepseek)
     "${repo_dir}/scripts/linux/configure-deepseek.sh"

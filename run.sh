@@ -44,6 +44,8 @@ Commands:
                          Verify read-only rootfs and persistent data volume
   gateway-smoke-test     Verify host-side credential injection and audit logs
   lifecycle-smoke-test   Verify heartbeat, idle reaping, restart, and destroy
+  lifecycle-stress-test [cycles]
+                         Repeatedly start/stop one microVM and probe resource cleanup
   configure-deepseek     Securely save a DeepSeek API key in the Linux VM
   configure-user         Create a local login user and claim legacy instances
   auth-smoke-test        Verify sessions, ownership, and quotas
@@ -357,6 +359,23 @@ smoke_test_network_lease() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/network-lease-smoke-test.sh'"
 }
 
+stress_test_lifecycle() {
+  cycles="${1:-100}"
+  if [[ ! "${cycles}" =~ ^[1-9][0-9]*$ ]] || (( cycles > 1000 )); then
+    echo "Cycle count must be an integer between 1 and 1000" >&2
+    exit 1
+  fi
+  sync_repo
+  echo "Stress-testing ${cycles} managed microVM lifecycle cycles in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/lifecycle-stress-test.sh' '${cycles}'"
+}
+
 smoke_test_agent_task() {
   sync_repo
   echo "Building and testing the host Pi Gateway task path in ${VM_USER}@${VM_HOST}..."
@@ -524,6 +543,9 @@ case "${command}" in
     ;;
   lifecycle-smoke-test)
     smoke_test_lifecycle
+    ;;
+  lifecycle-stress-test)
+    stress_test_lifecycle "${2:-100}"
     ;;
   configure-deepseek)
     configure_deepseek

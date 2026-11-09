@@ -304,6 +304,7 @@ CLI 默认连接 `http://127.0.0.1:18090`，也可使用 `--base-url` 或 `AAP_B
 | 持久化数据盘 | `./run.sh persistence-smoke-test` | `./run-linux.sh persistence-smoke-test` |
 | Tool Gateway | `./run.sh gateway-smoke-test` | `./run-linux.sh gateway-smoke-test` |
 | 空闲回收 | `./run.sh lifecycle-smoke-test` | `./run-linux.sh lifecycle-smoke-test` |
+| 生命周期压力测试 | `./run.sh lifecycle-stress-test 100` | `./run-linux.sh lifecycle-stress-test 100` |
 | 认证与归属 | `./run.sh auth-smoke-test` | `./run-linux.sh auth-smoke-test` |
 | HTTP 实例控制 | `./run.sh control-plane-smoke-test` | `./run-linux.sh control-plane-smoke-test` |
 | Host Pi Gateway | `./run.sh agent-task-smoke-test` | `./run-linux.sh agent-task-smoke-test` |
@@ -331,6 +332,23 @@ CLI 完整链路成功标志：
 ```text
 PASS: agentctl completed authenticated lifecycle, chat, restart, and cleanup
 CLI_SMOKE_READY auth=session lifecycle=create,start,stop,restart,destroy conversation=preserved cleanup=verified
+```
+
+生命周期压力测试会反复启动和停止同一个受管实例。建议先运行 3 轮确认探针本身可用，再运行 100 轮：
+
+```bash
+./run.sh stop
+./run.sh lifecycle-stress-test 3
+./run.sh lifecycle-stress-test 100
+```
+
+每轮都会检查 Firecracker 与 Sidecar 进程、进程启动代数、SQLite 运行记录和网络租约、TAP、nftables、Jailer、API Socket、生命周期 watcher 及数据盘状态。任一检查失败时测试立即停止，输出 `FAIL_STAGE`、失败轮次、数据库记录、进程与网络快照和相关日志尾部；此时不要立即重跑，以免覆盖保留在 `/var/lib/fc/lifecycle-stress` 的故障现场。
+
+完整通过的标志为：
+
+```text
+PASS: lifecycle stress test completed 100 start/stop cycles without leaked resources
+LIFECYCLE_STRESS_READY cycles=100 ... process_generation=verified lease=verified tap=clean nft=clean watcher=clean volume=destroyed
 ```
 
 恢复链路成功标志：

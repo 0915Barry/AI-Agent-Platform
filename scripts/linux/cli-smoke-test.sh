@@ -59,6 +59,49 @@ instance_created=false
 tap_name=""
 session_mount=""
 
+dump_chat_failure_diagnostics() {
+  echo "TASK_DATABASE_DIAGNOSTICS_BEGIN instance=${instance_id}" >&2
+  python3 - "${database_path}" "${instance_id}" <<'PY' >&2 || true
+import json
+import sqlite3
+import sys
+
+database, instance_id = sys.argv[1:]
+with sqlite3.connect(database) as connection:
+    connection.row_factory = sqlite3.Row
+    tasks = connection.execute(
+        "SELECT id,status,error,created_at,updated_at FROM tasks "
+        "WHERE instance_id=? ORDER BY created_at,id",
+        (instance_id,),
+    ).fetchall()
+    if not tasks:
+        print("TASK_DATABASE_EMPTY")
+    for task in tasks:
+        print("TASK " + json.dumps(dict(task), ensure_ascii=False, separators=(",", ":")))
+        events = connection.execute(
+            "SELECT sequence,event_type,payload,created_at FROM task_events "
+            "WHERE task_id=? ORDER BY sequence",
+            (task["id"],),
+        ).fetchall()
+        for event in events:
+            print("EVENT " + json.dumps(dict(event), ensure_ascii=False, separators=(",", ":")))
+PY
+  echo "TASK_DATABASE_DIAGNOSTICS_END" >&2
+
+  if [[ -f "${log_path}" ]]; then
+    echo "CONTROL_PLANE_LOG_BEGIN path=${log_path}" >&2
+    tail -n 160 "${log_path}" >&2
+    echo "CONTROL_PLANE_LOG_END" >&2
+  fi
+
+  local console_log="${state_root}/control-plane/${instance_id}/console.log"
+  if [[ -f "${console_log}" ]]; then
+    echo "GUEST_CONSOLE_BEGIN path=${console_log}" >&2
+    tail -n 120 "${console_log}" >&2
+    echo "GUEST_CONSOLE_END" >&2
+  fi
+}
+
 cli=(
   "${repo_dir}/agentctl"
   --base-url "${base_url}"
@@ -79,9 +122,14 @@ cleanup() {
     kill "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
   fi
-  python3 "${repo_dir}/services/instance-manager/lifecycle.py" \
-    --state-root "${state_root}" --database "${database_path}" \
-    destroy "${instance_id}" >/dev/null 2>&1 || true
+  # 只有实例尚未被主流程销毁时才执行兜底清理。成功路径已经
+  # 删除 state_root；此时再调用 lifecycle 会让 RuntimeStore 重建一份
+  # 只含运行时表的空 SQLite 数据库，造成误导性的测试残留。
+  if [[ "${instance_created}" == true ]]; then
+    python3 "${repo_dir}/services/instance-manager/lifecycle.py" \
+      --state-root "${state_root}" --database "${database_path}" \
+      destroy "${instance_id}" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${volume_path}" ]]; then
     rm -f "${volume_path}"
   fi
@@ -172,23 +220,35 @@ print(row[0])
 PY
 )"
 
-# 一次「chat → 停止 → 读原生 Session 文件」并校验包含 user/assistant 消息。
-# Pi 是在退出时异步一次性落盘 Session，偶发空文件；返回 1 表示需要重试。
+# 一次「chat → 停止 → 读原生 Session 文件」并严格校验包含 user/assistant
+# 消息。文件缺失、空文件或消息不完整都属于落盘回归，本轮立即失败，不重试、
+# 不允许 SQLite 缓存掩盖原生 Session 问题。
 chat_and_check_session() {
   local marker="$1" output
-  output="$(printf '请只回复 %s，不要添加其他内容。\n/exit\n' "${marker}" \
-    | timeout 300 "${cli[@]}" chat "${instance_id}")"
+  if ! output="$(printf '请只回复 %s，不要添加其他内容。\n/exit\n' "${marker}" \
+    | timeout 300 "${cli[@]}" chat "${instance_id}")"; then
+    echo "FAIL_STAGE=initial_chat_transport reason=agentctl_chat_failed" >&2
+    dump_chat_failure_diagnostics
+    exit 1
+  fi
   printf '%s\n' "${output}"
-  grep -Fq "Pi > ${marker}" <<< "${output}"
+  if ! grep -Fq "Pi > ${marker}" <<< "${output}"; then
+    echo "FAIL_STAGE=initial_chat_response expected=${marker}" >&2
+    exit 1
+  fi
 
   conversation_id="$(grep -Eo 'conversation-[0-9a-f]{16}' \
     <<< "$("${cli[@]}" conversations "${instance_id}")" | head -n1)"
   if [[ -z "${conversation_id}" ]]; then
-    echo "FAIL: agentctl did not return a conversation ID" >&2
+    echo "FAIL_STAGE=conversation_lookup reason=missing_conversation_id" >&2
     exit 1
   fi
 
-  "${cli[@]}" stop "${instance_id}" >/dev/null
+  if ! "${cli[@]}" stop "${instance_id}" >/dev/null; then
+    echo "FAIL_STAGE=pre_session_disk_stop reason=instance_stop_failed" >&2
+    dump_chat_failure_diagnostics
+    exit 1
+  fi
 
   # 诊断：抓取 Guest 串口日志（Pi stderr、socat 关闭状态），定位连接为何提前关闭。
   # smoke test 用自己的 state_root=/var/lib/fc/cli-smoke，与生产 /var/lib/fc 隔离。
@@ -209,12 +269,12 @@ chat_and_check_session() {
   local filesystem_status=0 filesystem_check
   filesystem_check="$(e2fsck -f -y "${volume_path}" 2>&1)" || filesystem_status="$?"
   if (( filesystem_status > 1 )); then
-    echo "FAIL: user data disk check failed before Session verification" >&2
+    echo "FAIL_STAGE=filesystem_check status=${filesystem_status}" >&2
     printf '%s\n' "${filesystem_check}" >&2
     exit 1
   fi
 
-  local check_mount check_file ok=0
+  local check_mount check_file
   check_mount="$(mktemp -d /var/tmp/cli-session-check.XXXXXX)"
   mount -o loop,ro "${volume_path}" "${check_mount}"
 
@@ -234,8 +294,8 @@ chat_and_check_session() {
   )"
   if [[ -z "${check_file}" ]]; then
     umount "${check_mount}"; rmdir "${check_mount}"
-    echo "WARN: Pi native session file was not found on disk (async write flake)" >&2
-    return 1
+    echo "FAIL_STAGE=session_file_lookup reason=file_not_found conversation=${conversation_id}" >&2
+    exit 1
   fi
 
   # 诊断：无论断言成败都输出原始 Session 内容，定位偶发缺消息的根因。
@@ -243,11 +303,11 @@ chat_and_check_session() {
   cat "${check_file}" >&2
   echo "SESSION_FILE_CONTENT_END" >&2
 
-  # 0 字节空文件 = Pi 退出时异步写被丢弃（flake），重试即可。
+  # 0 字节空文件说明原生 Session 未可靠持久化，严格验收必须立即失败。
   if [[ ! -s "${check_file}" ]]; then
     umount "${check_mount}"; rmdir "${check_mount}"
-    echo "WARN: Pi native session file is empty (async write flake)" >&2
-    return 1
+    echo "FAIL_STAGE=session_file_content reason=empty_file path=${check_file}" >&2
+    exit 1
   fi
 
   # 有内容却解析不出 user/assistant = 真正的回归（格式变了/写坏了），硬失败。
@@ -272,71 +332,47 @@ if "user" in roles and "assistant" in roles:
 sys.exit(1)
 PY
   then
-    ok=0
+    :
   else
     umount "${check_mount}"; rmdir "${check_mount}"
-    echo "FAIL: Pi native session has content but no user/assistant message" >&2
+    echo "FAIL_STAGE=session_jsonl_validation reason=missing_user_or_assistant path=${check_file}" >&2
     exit 1
   fi
   umount "${check_mount}"
   rmdir "${check_mount}"
-  return "${ok}"
 }
 
-# Pi 偶发空文件（异步一次性落盘竞态），读出来为空则重新启动并重试。
-session_ok=false
-for attempt in 1 2 3; do
-  if [[ "${attempt}" -eq 1 ]]; then
-    first_marker="CLI_FIRST_${suffix}"
-  else
-    first_marker="CLI_FIRST_${suffix}_${attempt}"
-  fi
-  if chat_and_check_session "${first_marker}"; then
-    session_ok=true
-    break
-  fi
-  # 重试前重新启动实例；最后一次失败后不再重启。
-  if [[ "${attempt}" -lt 3 ]]; then
-    "${cli[@]}" start "${instance_id}" >/dev/null
-  fi
-done
-# Pi 原生 session 偶发空文件（退出时异步一次性落盘的竞态），这是第三方 Pi 的
-# 行为、平台代码修不了，且平台有 SQLite 消息缓存兜底。因此把「Pi 原生 session」
-# 相关校验降级为警告，不让 smoke test 被这个竞态卡住；SQLite 校验仍保留为硬失败。
-if [[ "${session_ok}" != true ]]; then
-  echo "WARN: Pi native session was empty after 3 attempts (async write flake);" >&2
-  echo "WARN: SQLite message cache is the reliable persistence layer, continuing." >&2
-  pi_session_flaky=true
-else
-  pi_session_flaky=false
-fi
+# 单次严格验收：任何原生 Session 落盘异常都会由函数直接终止测试。
+first_marker="CLI_FIRST_${suffix}"
+chat_and_check_session "${first_marker}"
 
 "${cli[@]}" start "${instance_id}" >/dev/null
 
-if [[ "${pi_session_flaky}" != true ]]; then
-  # 只有 Pi 原生 session 非空时，「重启后 Pi 能否记住」才有意义。
-  second_output="$(
-    printf '上一次要求你只回复的标记是什么？请仍然只回复该标记。\n/exit\n' \
-      | timeout 300 "${cli[@]}" chat "${instance_id}" --conversation "${conversation_id}"
-  )"
-  printf '%s\n' "${second_output}"
-  grep -Fq "Pi > ${first_marker}" <<< "${second_output}"
-else
-  echo "WARN: skipping Pi-native continuation check (session was empty)" >&2
+# 重启后必须能够从同一原生 Session 恢复上下文；失败同样属于硬失败。
+if ! second_output="$(
+  printf '上一次要求你只回复的标记是什么？请仍然只回复该标记。\n/exit\n' \
+    | timeout 300 "${cli[@]}" chat "${instance_id}" --conversation "${conversation_id}"
+)"; then
+  echo "FAIL_STAGE=session_resume_transport reason=agentctl_chat_failed conversation=${conversation_id}" >&2
+  dump_chat_failure_diagnostics
+  exit 1
+fi
+printf '%s\n' "${second_output}"
+if ! grep -Fq "Pi > ${first_marker}" <<< "${second_output}"; then
+  echo "FAIL_STAGE=session_resume_context expected=${first_marker} conversation=${conversation_id}" >&2
+  exit 1
 fi
 
 # History 读取走 SQLite 缓存，是可靠的持久化层，始终校验。
 history_output="$("${cli[@]}" history "${instance_id}" "${conversation_id}" --limit 20)"
-grep -Fq "Pi > ${first_marker}" <<< "${history_output}"
+if ! grep -Fq "Pi > ${first_marker}" <<< "${history_output}"; then
+  echo "FAIL_STAGE=sqlite_history_cache expected=${first_marker} conversation=${conversation_id}" >&2
+  exit 1
+fi
 
 # 新会话把消息同时写入 SQLite 作为读取缓存，Pi 原生 Session 仍是权威来源。
-# 期望消息数：continuation 跑过 = 两轮 user+assistant（4 条）；因 flake 跳过
-# continuation 时只有第一轮（2 条）。
-if [[ "${pi_session_flaky}" != true ]]; then
-  expected_messages=4
-else
-  expected_messages=2
-fi
+# 两轮 user+assistant 均为必测路径，因此至少应有 4 条消息。
+expected_messages=4
 
 python3 - "${database_path}" "${conversation_id}" "${expected_messages}" <<'PY'
 import sqlite3
@@ -356,7 +392,11 @@ with sqlite3.connect(database) as connection:
     ).fetchone()[0] >= expected, "native conversation messages were not cached into SQLite"
 PY
 
-"${cli[@]}" stop "${instance_id}" >/dev/null
+if ! "${cli[@]}" stop "${instance_id}" >/dev/null; then
+  echo "FAIL_STAGE=final_stop reason=instance_stop_failed" >&2
+  dump_chat_failure_diagnostics
+  exit 1
+fi
 "${cli[@]}" destroy "${instance_id}" --yes >/dev/null
 instance_created=false
 "${cli[@]}" logout >/dev/null

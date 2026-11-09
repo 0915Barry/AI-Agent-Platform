@@ -31,6 +31,7 @@ from runtime_store import RuntimeStore, RuntimeStoreError
 DEFAULT_STATE_ROOT = Path("/var/lib/fc")
 INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 RESOURCE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+STOP_INTENT_TIMEOUT_SECONDS = 30
 
 
 def validate_instance_id(instance_id: str) -> str:
@@ -47,6 +48,11 @@ def paths(state_root: Path, instance_id: str) -> tuple[Path, Path, Path]:
         state_root / "instances" / f"{instance_id}.busy",
         state_root / "activity" / instance_id,
     )
+
+
+def stop_intent_path(state_root: Path, instance_id: str) -> Path:
+    """返回显式停止意图标记的固定路径。"""
+    return state_root / "stop-intents" / instance_id
 
 def load_metadata(store: RuntimeStore, state_root: Path, instance_id: str) -> dict:
     """从 SQLite 读取运行元数据，并在首次升级时兼容导入旧 JSON。"""
@@ -250,18 +256,27 @@ def stop_instance(
 ) -> dict:
     """停止实例、清理临时资源，并保留可供重启的数据盘和元数据。"""
     metadata = load_metadata(store, state_root, instance_id)
-    stop_method = stop_process(metadata, guest_shutdown=guest_shutdown)
-    stop_sidecars(metadata)
-    cleanup_ephemeral(metadata, state_root)
-    metadata.update(
-        {
-            "status": "stopped",
-            "stopReason": reason,
-            "stopMethod": stop_method,
-            "stoppedAt": int(time.time()),
-        }
-    )
-    stopped = store.save(metadata)
+    # runtime_instances.status 的存储契约只接受 running/stopped，因此使用
+    # 独立标记告诉 watcher：进程退出是显式 stop，不是意外崩溃。
+    stop_intent = stop_intent_path(state_root, instance_id)
+    stop_intent.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stop_intent.touch()
+    os.chmod(stop_intent, 0o600)
+    try:
+        stop_method = stop_process(metadata, guest_shutdown=guest_shutdown)
+        stop_sidecars(metadata)
+        cleanup_ephemeral(metadata, state_root)
+        metadata.update(
+            {
+                "status": "stopped",
+                "stopReason": reason,
+                "stopMethod": stop_method,
+                "stoppedAt": int(time.time()),
+            }
+        )
+        stopped = store.save(metadata)
+    finally:
+        stop_intent.unlink(missing_ok=True)
     if reason != "suspended":
         snapshot_root = Path("/srv/fc/snapshots/instances")
         for candidate in (
@@ -338,6 +353,7 @@ def command_register(args: argparse.Namespace) -> None:
     store.save(metadata)
     legacy_path.unlink(missing_ok=True)
     busy_path.unlink(missing_ok=True)
+    stop_intent_path(state_root, instance_id).unlink(missing_ok=True)
     activity_path.touch()
     os.chown(activity_path, args.activity_uid, -1)
     os.chmod(activity_path, 0o600)
@@ -400,6 +416,25 @@ def command_watch(args: argparse.Namespace) -> None:
         if metadata.get("status") != "running":
             return
         if not process_matches(metadata):
+            stop_intent = stop_intent_path(args.state_root, instance_id)
+            if stop_intent.exists():
+                # stop 命令会在完成后删除标记并写入 stopped。若命令
+                # 意外终止，标记超时后 watcher 会继续崩溃回收，避免永久泄漏。
+                age = max(0.0, time.time() - stop_intent.stat().st_mtime)
+                if age < STOP_INTENT_TIMEOUT_SECONDS:
+                    time.sleep(args.poll_interval)
+                    continue
+            # 进程退出和显式 stop 可能同时被观察到。清理前重读一次：
+            # - stopped 表示 stop 路径已完成；
+            # - PID 或 start ticks 改变表示新一代实例已登记。
+            # 旧 watcher 在这两种情况下都必须退出，不能触碰新租约。
+            latest = load_metadata(store, args.state_root, instance_id)
+            same_generation = (
+                latest.get("pid") == metadata.get("pid")
+                and latest.get("processStartTicks") == metadata.get("processStartTicks")
+            )
+            if latest.get("status") != "running" or not same_generation:
+                return
             stop_sidecars(metadata)
             cleanup_ephemeral(metadata, args.state_root)
             metadata.update(
