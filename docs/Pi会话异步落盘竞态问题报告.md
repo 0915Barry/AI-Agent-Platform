@@ -2,7 +2,7 @@
 
 > 状态：**已解决**。2026-11-09 完成严格、无重试的 30 轮端到端连续验收。
 >
-> 关联：`docs/Pi常驻进程与Session加载优化.md`、`docs/microVM预热池开发计划.md`。
+> 关联：`docs/Pi常驻进程与Session加载优化.md`、`docs/microVM预热池设计与实施方案.md`。
 
 ---
 
