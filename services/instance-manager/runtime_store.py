@@ -85,6 +85,158 @@ class UserVolumeStore:
         return stored
 
 
+class VolumeAttachmentStore:
+    """数据盘独占附件：一块盘同一时刻最多一个活动属主。
+
+    普通冷启动、预热激活和快照恢复都必须先取得附件独占权；运行实例和暂停快照
+    持续持盘，只有完全停止或删除快照才释放。``error`` 状态保持独占，防止确认
+    不了是否仍挂载时被自动释放。
+    """
+
+    def __init__(self, database_path: Path) -> None:
+        self.database_path = database_path.resolve()
+        self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+        with self.connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS volume_attachments (
+                    volume_path TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    logical_instance_id TEXT NOT NULL,
+                    runtime_id TEXT NOT NULL,
+                    operation_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN (
+                        'reserved','attached','suspended','releasing','error'
+                    )),
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    last_error TEXT
+                )
+                """
+            )
+        os.chmod(self.database_path, 0o600)
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.database_path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield connection
+        except Exception:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+        finally:
+            connection.close()
+
+    def reserve(
+        self,
+        volume_path: str,
+        owner_id: str,
+        logical_instance_id: str,
+        runtime_id: str,
+        operation_id: str,
+    ) -> dict:
+        """预留一块盘；该盘已有活动附件时抛 RuntimeStoreError。"""
+        now = int(time.time())
+        try:
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO volume_attachments(
+                        volume_path,owner_id,logical_instance_id,runtime_id,operation_id,
+                        status,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        volume_path,
+                        owner_id,
+                        logical_instance_id,
+                        runtime_id,
+                        operation_id,
+                        "reserved",
+                        now,
+                        now,
+                    ),
+                )
+        except sqlite3.IntegrityError as error:
+            raise RuntimeStoreError(
+                f"volume already has an active attachment: {volume_path}"
+            ) from error
+        stored = self.get(volume_path)
+        if stored is None:
+            raise RuntimeStoreError(f"volume attachment disappeared after reserve: {volume_path}")
+        return stored
+
+    def get(self, volume_path: str) -> dict | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM volume_attachments WHERE volume_path=?", (volume_path,)
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def transition(
+        self,
+        volume_path: str,
+        expected_status: str,
+        operation_id: str,
+        new_status: str,
+        *,
+        error: str | None = None,
+    ) -> bool:
+        """条件转换：仅当 status 与 operation_id 都匹配时更新。"""
+        now = int(time.time())
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE volume_attachments
+                SET status=?, updated_at=?, last_error=?
+                WHERE volume_path=? AND status=? AND operation_id=?
+                """,
+                (new_status, now, error, volume_path, expected_status, operation_id),
+            )
+        return cursor.rowcount == 1
+
+    def mark_attached(self, volume_path: str, operation_id: str) -> bool:
+        return self.transition(volume_path, "reserved", operation_id, "attached")
+
+    def mark_suspended(self, volume_path: str, operation_id: str) -> bool:
+        return self.transition(volume_path, "attached", operation_id, "suspended")
+
+    def mark_resumed(self, volume_path: str, operation_id: str) -> bool:
+        return self.transition(volume_path, "suspended", operation_id, "attached")
+
+    def mark_error(self, volume_path: str, operation_id: str, error: str) -> bool:
+        """挂载状态无法确认时转 error，继续保持独占。"""
+        now = int(time.time())
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE volume_attachments
+                SET status='error', updated_at=?, last_error=?
+                WHERE volume_path=? AND operation_id=? AND status IN ('reserved','attached','suspended')
+                """,
+                (now, error, volume_path, operation_id),
+            )
+        return cursor.rowcount == 1
+
+    def release(self, volume_path: str, operation_id: str) -> bool:
+        """释放附件：仅当仍属于本 operation_id 时删除，防止旧代次误删新附件。"""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "DELETE FROM volume_attachments WHERE volume_path=? AND operation_id=?",
+                (volume_path, operation_id),
+            )
+        return cursor.rowcount == 1
+
+
 class RuntimeStore:
     """保存 VMM 进程、jail、数据盘和网络端点等实际运行状态。"""
 
