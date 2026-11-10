@@ -79,7 +79,16 @@
 | `operation_id` | 一次启动、领取、恢复或停止操作的代次 | 单次操作期间 |
 | `activation_id` | 一次预热 Guest 与用户盘绑定的代次 | 预热领取至实例清理 |
 
-任何异步回调、超时处理和清理操作都必须校验 `operation_id` 或 `activation_id`，避免旧操作覆盖新一代实例状态。
+代次校验按职责分开，不能互相替代：
+
+| 校验信息 | 使用位置 | 防止的问题 |
+|---|---|---|
+| `operation_id` | 业务实例状态更新、启动超时与补偿 | 旧启动操作覆盖新一代业务状态 |
+| `activation_id` | 预热激活、重连查询与提交 | 重复激活、响应重放或迟到响应 |
+| `runtime_id + PID + process_start_ticks` | VMM、Sidecar、Watcher 与清理 | PID 复用后误判或误杀新进程 |
+
+不要求所有现有生命周期调用机械地携带 `operation_id`。业务状态的异步更新必须校验
+`operation_id`，物理进程操作继续使用已有的 PID 代次校验；两个层面同时存在。
 
 ### 4.2 三种启动策略
 
@@ -123,6 +132,20 @@
 - 条件状态转换；
 - 保存健康检查、超时和错误信息；
 - 防止同一 `runtime_id` 被重复领取。
+
+状态更新必须集中为条件转换方法，而不是由各调用点自行执行无条件 `UPDATE`。建议提供：
+
+```python
+transition_if_current(
+    runtime_id,
+    expected_status,
+    operation_id,
+    new_status,
+)
+```
+
+返回值必须明确表示“本代操作完成转换”或“记录已被其他代次修改”。启动协调器、超时回调、
+Worker 和 Reconcile 共用同一套条件转换，避免每个调用点各自实现代次判断。
 
 ### 5.3 PrewarmManager：单项编排
 
@@ -232,15 +255,44 @@ Guest 继续使用现有 `scripts/guest/prewarm-activate.sh`，不得接受任�
 
 该表用于审计与代次隔离，不代替业务实例状态。
 
-### 6.4 数据盘独占
+必须通过唯一约束或等价的条件事务，保证同一 `logical_instance_id` 同时最多存在一个
+`deciding/executing/committing/compensating` 操作。`succeeded/failed` 为历史终态，不阻止
+后续新操作。业务实例状态更新时必须同时匹配 `logical_instance_id + operation_id + 预期状态`；
+这与 §5.2 的 `transition_if_current` 是同一套条件转换，仅键从 `runtime_id` 换成
+`logical_instance_id`，建议提供对称 helper 统一实现，避免业务侧各自手写条件更新。
 
-仅有 `user_volumes` 归属关系不足以阻止同一块盘被两台 Guest 同时挂载。建议增加活动附件记录，或给现有绑定增加等价的独占约束：
+### 6.4 新增 volume_attachments：数据盘独占
+
+明确采用独立 `volume_attachments` 表，不使用“给 `runtime_bindings` 增加唯一约束”的替代方案。
+原因是 `runtime_bindings` 主要表达预热领取后的逻辑/物理绑定，不能完整覆盖普通冷启动和已经
+停止 Firecracker 进程的暂停快照。
+
+建议字段：
+
+| 字段 | 说明 |
+|---|---|
+| `volume_path` | 主键，一块盘最多存在一条活动附件 |
+| `owner_id` | 数据盘所属用户 |
+| `logical_instance_id` | 占用该盘的业务实例 |
+| `runtime_id` | 当前或最近一次物理运行时 |
+| `operation_id` | 建立或改变附件状态的操作代次 |
+| `status` | `reserved/attached/suspended/releasing/error` |
+| `created_at/updated_at` | 创建与更新时间 |
+| `last_error` | 最近一次附件错误 |
+
+状态语义：
 
 ```text
-volume_path → logical_instance_id → runtime_id → operation_id
+启动或领取前：reserved
+Guest已挂载：attached
+快照暂停后：suspended
+完全停止/删除快照：releasing → 删除
+无法确认是否仍挂载：error（继续保持独占）
 ```
 
-运行实例和暂停快照都继续持有数据盘所有权。只有实例明确销毁或快照被放弃后才能释放。快照恢复失败时不能自动让预热机挂载同一块盘。
+普通冷启动、预热激活和快照恢复必须通过同一个附件存储取得数据盘独占权。运行实例和暂停
+快照都继续占有数据盘；只有实例明确停止且不再保留快照，或者实例销毁后才能释放。快照恢复
+失败时仍保持 `suspended`，不能自动让预热或冷启动绕过独占记录挂载同一块盘。
 
 ## 7. 状态机
 
@@ -329,6 +381,8 @@ Control Plane取得逻辑实例启动权
 ```
 
 Host 数据库才是最终归属依据，Guest 的 `BOUND_READY` 只是激活已完成的证据。
+「取得数据盘独占权」到「写 runtime_bindings」之间，`volume_attachments` 与
+`prewarm_items.volume_path` 必须随同一 `operation_id` 一起更新，避免两表脱节。
 
 ### 8.3 没有 ready 项
 
@@ -363,6 +417,17 @@ Host 数据库才是最终归属依据，Guest 的 `BOUND_READY` 只是激活已
 - Worker 统计空闲槽位时必须排除快照保留项。
 
 该策略会占用地址槽位，但避免修改快照内 Guest 网络和恢复竞争。单机 `/16` 切 `/30` 有较多槽位，第一版优先保证正确性。后续如果暂停实例规模导致槽位压力，再设计 Guest 恢复后的网络重配置。
+
+网络预算不能只看地址池的理论容量。`172.29.0.0/16` 按 `/30` 理论上可划分 16384 个槽位，
+但实际容量还受内存、TAP、nftables、进程和文件描述符限制。所有以下状态都会消耗槽位：
+
+```text
+运行中的用户实例
++ 暂停快照保留的reserved槽位
++ preparing/ready/claiming预热项
+```
+
+因此自动补池必须设置“用户请求保底槽位”，预热 Worker 不能使用这部分余量。
 
 ### 9.3 启动决策互斥
 
@@ -433,6 +498,7 @@ running复用 → 有效快照恢复 → ready预热领取 → 冷启动
 - `PREWARM_BUILD_CONCURRENCY`：并行补池上限；
 - `PREWARM_TTL_SECONDS`：空白项最大等待时间；
 - `PREWARM_MIN_AVAILABLE_MIB`：补池前最低可用内存；
+- `PREWARM_MIN_FREE_NETWORK_SLOTS`：补池后仍须留给冷启动和恢复的最小空闲槽位（计划新增）；
 - `PREWARM_CLAIM_TIMEOUT_SECONDS`：领取事务超时；
 - `PREWARM_ACTIVATE_TIMEOUT_SECONDS`：Guest 激活超时。
 
@@ -442,13 +508,17 @@ Worker 的计算原则（两个公式分开）：
 ready缺额 = max(0, target_ready - (ready + preparing))
 可创建数 = min(ready缺额,
               max_total - (preparing + ready + claiming),
-              并发余量, 内存预算, 网络槽位)
+              并发余量,
+              内存预算,
+              max(0, free_network_slots - min_free_network_slots))
 ```
 
 - `ready缺额` 不抵消 `claiming`：一台 `ready` 进入 `claiming` 后已不能再服务其他用户，
   Worker 应立即开始补位，而不是等 `claiming` 结束后才补，否则会降低连续请求的命中率。
 - `PREWARM_MAX_TOTAL` 计入 `claiming`：`preparing + ready + claiming` 共同受总项数上限约束，
   防止领取高峰时无限并行创建。
+- `free_network_slots = 总槽位 − (运行中用户实例 + 快照保留 reserved + preparing/ready/claiming 预热项)`；
+  Worker 只能使用扣除用户保底后的这部分余量。
 
 用户启动、快照恢复、rootfs 构建或 Host 高负载时暂停补池。预热池只移动启动成本，不增加服务器能承载的用户总量。
 
@@ -490,21 +560,34 @@ prewarm_activate_seconds
 
 ### 阶段 1：纯数据库状态机
 
-- 实现 `prewarm_items`、`startup_operations` 和数据盘独占记录；
+- 实现 `prewarm_items`、`startup_operations` 和 `volume_attachments`；
 - 实现条件状态转换和原子领取；
+- 提供统一的 `operation_id` 条件转换 helper；
 - 用模拟 runtime 做并发测试；
 - 不接 Control Plane，不启动 VMM。
 
-验收：多线程/多进程争抢同一项时只有一个成功；旧 operation 无法更新新代次；同卷双挂被拒绝。
+验收：多线程/多进程争抢同一项时只有一个成功；同一逻辑实例不能建立两个未完成启动操作；
+旧 operation 无法更新新代次；同卷双挂被拒绝；附件处于 `error` 时保持锁定而不是自动释放。
 
 ### 阶段 2：统一启动协调器
 
 - 引入 StartupCoordinator；
 - 先只路由现有快照与冷启动；
 - 行为必须与当前版本一致；
-- 修复快照网络槽位保留规则。
 
-验收：关闭预热时所有 API 和 CLI 行为无变化，快照恢复不会与其他租约冲突。
+验收：关闭预热时，冷启动和快照的 API、CLI 语义及资源清理行为与当前版本一致。
+
+### 阶段 2A：快照网络槽位保留
+
+- 暂停时删除 TAP、路由和 nftables，但把原租约保留为 `reserved`；
+- 快照恢复复用已有租约，不再插入第二条相同槽位记录；
+- 完全停止、删除快照或销毁实例时才释放槽位；
+- Reconcile 能区分有效快照预留和网络泄漏；
+- 增加 `PREWARM_MIN_FREE_NETWORK_SLOTS` 配置解析与容量单测；
+- 此阶段预热仍保持关闭。
+
+验收：快照暂停期间其他冷启动不能取得其原槽位；恢复、停止、销毁和异常重启后租约状态正确；
+快照、冷启动、生命周期及恢复压力测试全部通过。
 
 ### 阶段 3：单台人工预热接管
 
@@ -553,7 +636,7 @@ prewarm_activate_seconds
 | `services/instance-manager/prewarm_worker.py` | 新增，补池与巡检 |
 | `services/instance-manager/startup_coordinator.py` | 新增，统一策略仲裁 |
 | `services/instance-manager/prewarm_activation.py` | 建议新增，Host 激活协议客户端 |
-| `services/instance-manager/runtime_store.py` | 扩展绑定、附件和代次约束 |
+| `services/instance-manager/runtime_store.py` | 新增 `volume_attachments`，扩展绑定和代次约束 |
 | `services/instance-manager/network_manager.py` | 增加快照槽位保留及预热容量查询 |
 | `services/control-plane/server.py` | 只接 StartupCoordinator，不内嵌池细节 |
 | `scripts/guest/agent-init.sh` | 已有预热分支，后续只做必要修正 |
@@ -585,6 +668,6 @@ PREWARM_ENABLED=0
 
 ## 18. 下一项开发任务
 
-下一步只实施阶段 1：`prewarm_items + startup_operations + 数据盘独占 + 原子领取单元测试`。
+下一步只实施阶段 1：`prewarm_items + startup_operations + volume_attachments + 原子领取与代次校验单元测试`。
 
 本阶段不启动自动 Worker、不创建真实预热机、不修改用户启动行为。只有数据库状态机和并发约束经过验证后，才进入统一启动协调器和单台人工接管。
