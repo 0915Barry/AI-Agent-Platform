@@ -436,12 +436,19 @@ running复用 → 有效快照恢复 → ready预热领取 → 冷启动
 - `PREWARM_CLAIM_TIMEOUT_SECONDS`：领取事务超时；
 - `PREWARM_ACTIVATE_TIMEOUT_SECONDS`：Guest 激活超时。
 
-Worker 的计算原则：
+Worker 的计算原则（两个公式分开）：
 
 ```text
-缺额 = target_ready - (ready + preparing)
-可创建数 = min(缺额, max_total - 当前总项数, 并发余量, 内存预算, 网络槽位)
+ready缺额 = max(0, target_ready - (ready + preparing))
+可创建数 = min(ready缺额,
+              max_total - (preparing + ready + claiming),
+              并发余量, 内存预算, 网络槽位)
 ```
+
+- `ready缺额` 不抵消 `claiming`：一台 `ready` 进入 `claiming` 后已不能再服务其他用户，
+  Worker 应立即开始补位，而不是等 `claiming` 结束后才补，否则会降低连续请求的命中率。
+- `PREWARM_MAX_TOTAL` 计入 `claiming`：`preparing + ready + claiming` 共同受总项数上限约束，
+  防止领取高峰时无限并行创建。
 
 用户启动、快照恢复、rootfs 构建或 Host 高负载时暂停补池。预热池只移动启动成本，不增加服务器能承载的用户总量。
 
