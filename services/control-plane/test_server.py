@@ -295,6 +295,24 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertTrue(resumed["runtime"]["processAlive"])
         self.assertEqual(resumed["runtime"]["resumeTiming"]["loadMs"], 5)
 
+    def test_start_and_resume_record_startup_operations(self) -> None:
+        """冷启动与快照恢复都要在 startup_operations 留下代次审计记录。"""
+
+        owner_id = "user-op-record"
+        self.control.create({"id": "agent-op-record"}, owner_id)
+        self.control.start("agent-op-record", owner_id)
+        self.control.suspend("agent-op-record", owner_id)
+        self.control.resume("agent-op-record", owner_id)
+
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                "SELECT strategy,status FROM startup_operations WHERE logical_instance_id=?",
+                ("agent-op-record",),
+            ).fetchall()
+        pairs = sorted((row["strategy"], row["status"]) for row in rows)
+        self.assertEqual(pairs, [("cold", "succeeded"), ("snapshot", "succeeded")])
+
     def test_ensure_running_resumes_suspended_instance(self) -> None:
         """suspended 实例在聊天时自动 resume，而不是冷启动或报错。"""
 

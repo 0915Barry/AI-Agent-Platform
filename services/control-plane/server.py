@@ -48,6 +48,8 @@ from agent_runtime import (  # noqa: E402
 )
 from task_store import TaskStore, TaskStoreError  # noqa: E402
 from workspace_store import WorkspaceStore, WorkspaceStoreError  # noqa: E402
+from startup_store import StartupStore  # noqa: E402
+from startup_coordinator import StartupCoordinator  # noqa: E402
 
 
 INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -283,6 +285,10 @@ class ControlPlane:
         self.agent_runtime = agent_runtime
         self.workspaces = workspaces
         self.suspended_stop_timeout_seconds = suspended_stop_timeout_seconds
+        # 统一启动协调器：记录每次启动操作的代次，并路由冷启动/快照（预热阶段 3 接入）。
+        self.startup_coordinator = StartupCoordinator(
+            StartupStore(self.store.database_path), runtime
+        )
         self._locks_guard = threading.Lock()
         self._locks: dict[str, threading.RLock] = {}
         # 配额检查和状态写入必须形成一个临界区，否则两个不同实例的并发请求可能
@@ -546,11 +552,13 @@ class ControlPlane:
                     # 在释放配额锁之前写入 starting；下一请求会把它计入配额。
                     self.store.update(instance_id, "starting")
             try:
-                runtime_status = self.runtime.start(instance_id, owner_id)
+                result = self.startup_coordinator.run_cold(instance_id, owner_id)
             except (RuntimeFailure, OSError, subprocess.SubprocessError) as error:
                 self.store.update(instance_id, "failed", str(error)[-4000:])
                 raise ApiError(500, "instance_start_failed", str(error)) from error
-            return {**self.store.update(instance_id, "running"), "runtime": runtime_status}
+            updated = self.store.update(instance_id, "running")
+            self.startup_coordinator.commit_success(result.operation_id)
+            return {**updated, "runtime": result.runtime}
 
     def stop(self, instance_id: str) -> dict[str, Any]:
         """执行 running → stopping → stopped；停止不会删除数据盘。"""
@@ -615,11 +623,13 @@ class ControlPlane:
                     )
                 self.store.update(instance_id, "resuming")
             try:
-                runtime_status = self.runtime.resume(instance_id, owner_id)
+                result = self.startup_coordinator.run_snapshot(instance_id, owner_id)
             except (RuntimeFailure, OSError, subprocess.SubprocessError) as error:
                 self.store.update(instance_id, "suspended", str(error)[-4000:])
                 raise ApiError(500, "instance_resume_failed", str(error)) from error
-            return {**self.store.update(instance_id, "running"), "runtime": runtime_status}
+            updated = self.store.update(instance_id, "running")
+            self.startup_coordinator.commit_success(result.operation_id)
+            return {**updated, "runtime": result.runtime}
 
     def heartbeat(self, instance_id: str) -> dict[str, Any]:
         """仅允许 running 实例刷新活动时间。"""
