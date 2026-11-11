@@ -672,16 +672,34 @@ class NetworkManager:
         raise NetworkFailure(f"no free network slot remains in {self.address_pool.network}")
 
     def reserve_snapshot_lease(self, instance_id: str, lease: dict) -> dict:
-        """为快照恢复重新预留原来的网络槽位。
+        """为快照恢复取得原来的网络槽位。
 
         Guest 的 IP、MAC 和虚拟网卡状态已经保存在 Firecracker 快照中，恢复时
-        不能改用另一个槽位。SQLite 唯一约束会在该槽位已被占用时拒绝恢复。
+        不能改用另一个槽位。
+
+        阶段 2A 之后，暂停时租约已保留为 ``reserved``，这里直接复用并校验一致；
+        旧快照（暂停时已释放租约）则回退到重新预留原槽位，唯一约束会在槽位
+        已被占用时拒绝恢复。
         """
 
-        if self.store.get(instance_id) is not None:
-            raise NetworkFailure(f"instance already has a network lease: {instance_id}")
+        existing = self.store.get(instance_id)
+        if existing is not None:
+            if existing["status"] != "reserved":
+                raise NetworkFailure(
+                    f"snapshot network lease is not reserved: {existing['status']}"
+                )
+            self._validate_snapshot_lease(existing, lease)
+            return existing
+
         slot = int(lease["slot"])
         expected = self.address_pool.build_lease(instance_id, slot)
+        self._validate_snapshot_lease(expected, lease)
+        if not self.network.resources_are_free(expected):
+            raise NetworkFailure(f"snapshot network slot is not free: {expected['subnet']}")
+        return self.store.reserve(expected)
+
+    def _validate_snapshot_lease(self, expected: dict, lease: dict) -> None:
+        """校验快照保存的网络字段与预期租约一致，防止用错槽位或 MAC。"""
         comparable = (
             "subnet",
             "host_ip",
@@ -694,11 +712,8 @@ class NetworkManager:
             "nft_family",
         )
         for field in comparable:
-            if str(lease.get(field)) != str(expected[field]):
+            if str(lease.get(field)) != str(expected.get(field)):
                 raise NetworkFailure(f"snapshot network lease mismatch: {field}")
-        if not self.network.resources_are_free(expected):
-            raise NetworkFailure(f"snapshot network slot is not free: {expected['subnet']}")
-        return self.store.reserve(expected)
 
     def setup(self, lease: dict, firecracker_uid: int, allowed_host_ports: tuple[int, ...]) -> None:
         """根据已经分配的租约创建真实网络，并在创建失败时处理租约记录。失败时释放租约或保留 error 记录。"""
@@ -716,6 +731,11 @@ class NetworkManager:
     def activate(self, instance_id: str) -> dict:
         """Guest 检查通过后，把 reserved 租约标记为 active。"""
         return self.store.set_status(instance_id, "active")
+
+    def free_slot_count(self) -> int:
+        """返回仍可分配的槽位数；reserved（含快照保留）与 active 均计为已占用。"""
+        used = len(self.store.list())
+        return max(0, self.address_pool.slot_count - used)
 
     def release(self, instance_id: str, *, lease: dict | None = None) -> None:
         """删除 Linux 网络资源；完全清理后再删除租约记录。"""
@@ -744,3 +764,18 @@ class NetworkManager:
         # 删除，此时保持幂等即可，不能再因“记录不存在”让停止流程失败。
         if stored_lease is not None:
             self.store.release(instance_id)
+
+    def suspend_lease(self, instance_id: str) -> None:
+        """暂停快照：拆除 Linux 网络资源但保留租约记录为 ``reserved``。
+
+        与 ``release`` 的区别：``release`` 清理后删除记录（槽位可被复用），
+        ``suspend_lease`` 清理后保留记录（槽位被快照持有，恢复时复用）。
+        """
+        stored_lease = self.store.get(instance_id)
+        if stored_lease is None:
+            return  # 已经无租约，幂等返回
+        leftovers = self.network.remove(stored_lease)
+        if leftovers:
+            self.store.set_status(instance_id, "error")
+            raise NetworkFailure("network cleanup failed: " + ", ".join(leftovers))
+        self.store.set_status(instance_id, "reserved")

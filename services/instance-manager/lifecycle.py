@@ -216,8 +216,12 @@ def stop_process(metadata: dict, *, guest_shutdown: bool = True) -> str:
     return "sigkill"
 
 
-def cleanup_ephemeral(metadata: dict, state_root: Path) -> None:
-    """清理 TAP、nftables 与 jail；持久化数据盘不在此函数删除。"""
+def cleanup_ephemeral(metadata: dict, state_root: Path, reason: str = "") -> None:
+    """清理 TAP、nftables 与 jail；持久化数据盘不在此函数删除。
+
+    ``reason == "suspended"`` 时保留网络租约记录为 ``reserved``（快照槽位保留），
+    其余情况完整释放。
+    """
     tap_name = metadata.get("tapName", "")
     network_database = metadata.get("networkDatabasePath", "")
     lease_path = metadata.get("networkLeasePath", "")
@@ -233,7 +237,10 @@ def cleanup_ephemeral(metadata: dict, state_root: Path) -> None:
         }
         try:
             manager = NetworkManager(SQLiteLeaseStore(database_path))
-            manager.release(metadata["id"], lease=network)
+            if reason == "suspended":
+                manager.suspend_lease(metadata["id"])
+            else:
+                manager.release(metadata["id"], lease=network)
         except NetworkFailure as error:
             raise SystemExit(str(error)) from error
     elif lease_path:
@@ -294,7 +301,7 @@ def stop_instance(
     try:
         stop_method = stop_process(metadata, guest_shutdown=guest_shutdown)
         stop_sidecars(metadata)
-        cleanup_ephemeral(metadata, state_root)
+        cleanup_ephemeral(metadata, state_root, reason)
         metadata.update(
             {
                 "status": "stopped",

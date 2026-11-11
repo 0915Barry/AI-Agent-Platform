@@ -40,6 +40,14 @@ class PrewarmConfigTests(unittest.TestCase):
         with self.assertRaises(PrewarmConfigError):
             PrewarmConfig.from_env({"PREWARM_TTL_SECONDS": "0"})
 
+    def test_parses_min_free_network_slots(self) -> None:
+        config = PrewarmConfig.from_env({"PREWARM_MIN_FREE_NETWORK_SLOTS": "8"})
+        self.assertEqual(config.min_free_network_slots, 8)
+
+    def test_rejects_negative_min_free_network_slots(self) -> None:
+        with self.assertRaises(PrewarmConfigError):
+            PrewarmConfig.from_env({"PREWARM_MIN_FREE_NETWORK_SLOTS": "-1"})
+
 
 class PrewarmManagerTests(unittest.TestCase):
     def test_target_ready_reads_config(self) -> None:

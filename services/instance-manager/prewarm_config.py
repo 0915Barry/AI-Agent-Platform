@@ -30,6 +30,7 @@ class PrewarmConfig:
     claim_timeout_seconds: int
     activate_timeout_seconds: int
     min_available_mib: int
+    min_free_network_slots: int
 
     @staticmethod
     def _parse_bool(raw: str, key: str) -> bool:
@@ -72,6 +73,9 @@ class PrewarmConfig:
         min_available_mib = cls._parse_int(
             values.get("PREWARM_MIN_AVAILABLE_MIB", "2048"), "PREWARM_MIN_AVAILABLE_MIB"
         )
+        min_free_network_slots = cls._parse_int(
+            values.get("PREWARM_MIN_FREE_NETWORK_SLOTS", "4"), "PREWARM_MIN_FREE_NETWORK_SLOTS"
+        )
 
         if target_ready < 0:
             raise PrewarmConfigError("PREWARM_TARGET_READY must be >= 0")
@@ -89,6 +93,8 @@ class PrewarmConfig:
                 raise PrewarmConfigError(f"{key} must be >= 1")
         if min_available_mib < 0:
             raise PrewarmConfigError("PREWARM_MIN_AVAILABLE_MIB must be >= 0")
+        if min_free_network_slots < 0:
+            raise PrewarmConfigError("PREWARM_MIN_FREE_NETWORK_SLOTS must be >= 0")
 
         return cls(
             enabled=enabled,
@@ -100,6 +106,7 @@ class PrewarmConfig:
             claim_timeout_seconds=claim_timeout_seconds,
             activate_timeout_seconds=activate_timeout_seconds,
             min_available_mib=min_available_mib,
+            min_free_network_slots=min_free_network_slots,
         )
 
     @classmethod

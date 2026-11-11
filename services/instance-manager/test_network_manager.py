@@ -8,7 +8,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from network_manager import LeaseConflict, LinuxNetworkDriver, NetworkManager, SQLiteLeaseStore
+from network_manager import (
+    LeaseConflict,
+    LinuxNetworkDriver,
+    NetworkFailure,
+    NetworkManager,
+    SQLiteLeaseStore,
+)
 
 
 class FakeRunner:
@@ -112,6 +118,54 @@ class NetworkManagerTests(unittest.TestCase):
         restored = self.manager.reserve_snapshot_lease("agent-snapshot", original)
         self.assertEqual(restored["slot"], original["slot"])
         self.assertEqual(restored["guest_ip"], original["guest_ip"])
+
+    def test_suspend_lease_tears_down_linux_but_keeps_reservation(self) -> None:
+        lease = self.manager.allocate("agent-suspend")
+        self.manager.setup(lease, 999, (18082,))
+        active = self.manager.activate("agent-suspend")
+
+        self.manager.suspend_lease("agent-suspend")
+
+        stored = self.store.get("agent-suspend")
+        self.assertEqual(stored["status"], "reserved")
+        self.assertNotIn(active["tap"], self.runner.links)
+        self.assertNotIn(("inet", active["nft_table"]), self.runner.tables)
+
+    def test_snapshot_resume_reuses_reserved_lease(self) -> None:
+        lease = self.manager.allocate("agent-reuse")
+        self.manager.setup(lease, 999, (18082,))
+        active = self.manager.activate("agent-reuse")
+        self.manager.suspend_lease("agent-reuse")
+
+        restored = self.manager.reserve_snapshot_lease("agent-reuse", active)
+        self.assertEqual(restored["slot"], lease["slot"])
+        self.assertEqual(restored["guest_ip"], lease["guest_ip"])
+        # 复用而非重新插入：数据库中仍只有一条记录。
+        with sqlite3.connect(self.database_path) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM network_leases WHERE instance_id=?", ("agent-reuse",)
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_snapshot_resume_rejects_non_reserved_lease(self) -> None:
+        lease = self.manager.allocate("agent-active")
+        self.manager.setup(lease, 999, (18082,))
+        active = self.manager.activate("agent-active")
+
+        with self.assertRaises(NetworkFailure):
+            self.manager.reserve_snapshot_lease("agent-active", active)
+
+    def test_free_slot_count_excludes_held_leases(self) -> None:
+        total = self.manager.address_pool.slot_count
+        self.assertEqual(self.manager.free_slot_count(), total)
+        self.manager.allocate("agent-a")
+        self.assertEqual(self.manager.free_slot_count(), total - 1)
+        # 快照保留的 reserved 租约同样占位。
+        lease = self.manager.allocate("agent-b")
+        self.manager.setup(lease, 999, (18082,))
+        self.manager.activate("agent-b")
+        self.manager.suspend_lease("agent-b")
+        self.assertEqual(self.manager.free_slot_count(), total - 2)
 
     def test_host_rpc_replies_are_opt_in_and_forwarding_stays_blocked(self) -> None:
         lease = self.manager.allocate("agent-rpc")

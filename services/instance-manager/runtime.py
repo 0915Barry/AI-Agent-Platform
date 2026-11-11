@@ -763,9 +763,15 @@ class InstanceRuntime:
         return manifest
 
     def discard_snapshot(self, instance_id: str) -> None:
+        runtime_id = self.runtime_store.resolve_runtime_id(instance_id)
         paths = self.paths(instance_id)
         shutil.rmtree(paths["snapshot"], ignore_errors=True)
         shutil.rmtree(paths["snapshot_next"], ignore_errors=True)
+        # 阶段 2A：释放快照保留的网络槽位；无租约或已清理时保持幂等。
+        try:
+            self.network_manager.release(runtime_id)
+        except NetworkFailure:
+            pass
 
     def start(self, instance_id: str, owner_id: str | None = None) -> dict:
         """启动实例并等待 AGENT_RUNTIME_READY 后再向调用者返回。
