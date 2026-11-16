@@ -94,6 +94,7 @@ start_service() {
     --state-root /var/lib/fc \
     --idle-timeout "${INSTANCE_IDLE_TIMEOUT_SECONDS}" \
     --suspended-stop-timeout "${INSTANCE_SUSPENDED_STOP_TIMEOUT_SECONDS}" \
+    --prewarm-config "${repo_dir}/config/prewarm.env" \
     --require-auth \
     >> "${log_path}" 2>&1 &
   local process_pid=$!

@@ -23,6 +23,7 @@ import urllib.request
 from contextlib import closing
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SERVER_PATH = Path(__file__).resolve().with_name("server.py")
@@ -68,6 +69,9 @@ class FakeRuntime:
 
         status = self.instances.get(instance_id)
         return None if status is None else dict(status)
+
+    def user_volume_path(self, owner_id: str) -> Path:
+        return Path("/srv/fc/volumes/users") / f"{owner_id}.ext4"
 
     def heartbeat(self, instance_id: str) -> dict:
         """模拟一次活动心跳，将空闲时间归零。"""
@@ -120,6 +124,58 @@ class FakeRuntime:
     def delete_pi_session_data(self, owner_id: str, session_id: str) -> int:
         self.calls.append(("delete_pi_session_data", owner_id, session_id))
         return 1
+
+
+class FakePrewarmManager:
+    """只模拟 Control Plane 需要的领取与提交边界。"""
+
+    def __init__(self, *, available: bool = True, fail_commit: bool = False) -> None:
+        self.config = SERVER.PrewarmConfig.from_env({"PREWARM_ENABLED": "1"})
+        self.available = available
+        self.fail_commit = fail_commit
+        self.claims: list[tuple[str, str, str, str, str]] = []
+        self.commits: list[tuple[str, str, str, str]] = []
+
+    def claim(
+        self,
+        profile_key: str,
+        instance_id: str,
+        owner_id: str,
+        volume_path: str,
+        operation_id: str,
+    ):
+        self.claims.append(
+            (profile_key, instance_id, owner_id, volume_path, operation_id)
+        )
+        if not self.available:
+            return SimpleNamespace(claimed=False, reason="unavailable")
+        return SimpleNamespace(
+            claimed=True,
+            reason=None,
+            runtime_id="prewarm-physical-1",
+            activation_id="activation-1",
+            operation_id=operation_id,
+            runtime={
+                "id": "prewarm-physical-1",
+                "status": "running",
+                "processAlive": True,
+                "guestIp": "172.29.0.2",
+                "rpcPort": 8080,
+            },
+        )
+
+    def commit(
+        self,
+        instance_id: str,
+        runtime_id: str,
+        operation_id: str,
+        activation_id: str,
+    ) -> None:
+        if self.fail_commit:
+            raise SERVER.PrewarmManagerError("prewarm commit failed")
+        self.commits.append(
+            (instance_id, runtime_id, operation_id, activation_id)
+        )
 
 
 class FakePiGateway:
@@ -312,6 +368,89 @@ class ControlPlaneTests(unittest.TestCase):
             ).fetchall()
         pairs = sorted((row["strategy"], row["status"]) for row in rows)
         self.assertEqual(pairs, [("cold", "succeeded"), ("snapshot", "succeeded")])
+
+    def test_start_uses_prewarm_strategy_when_ready_item_exists(self) -> None:
+        owner_id = "user-prewarm"
+        instance_id = "agent-prewarm"
+        manager = FakePrewarmManager()
+        control = SERVER.ControlPlane(
+            self.store,
+            self.runtime,
+            self.tasks,
+            workspaces=self.workspaces,
+            prewarm_manager=manager,  # type: ignore[arg-type]
+        )
+        control.create({"id": instance_id}, owner_id)
+
+        running = control.start(instance_id, owner_id)
+
+        self.assertEqual(running["status"], "running")
+        self.assertEqual(running["runtime"]["id"], "prewarm-physical-1")
+        self.assertNotIn(("start", instance_id), self.runtime.calls)
+        self.assertEqual(
+            manager.claims[0][3],
+            f"/srv/fc/volumes/users/{owner_id}.ext4",
+        )
+        self.assertEqual(len(manager.commits), 1)
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT strategy,status,runtime_id FROM startup_operations "
+                "WHERE logical_instance_id=?",
+                (instance_id,),
+            ).fetchone()
+        self.assertEqual(row, ("prewarm", "succeeded", "prewarm-physical-1"))
+
+    def test_start_falls_back_to_cold_when_prewarm_pool_is_empty(self) -> None:
+        owner_id = "user-prewarm-empty"
+        instance_id = "agent-prewarm-empty"
+        manager = FakePrewarmManager(available=False)
+        control = SERVER.ControlPlane(
+            self.store,
+            self.runtime,
+            self.tasks,
+            workspaces=self.workspaces,
+            prewarm_manager=manager,  # type: ignore[arg-type]
+        )
+        control.create({"id": instance_id}, owner_id)
+
+        running = control.start(instance_id, owner_id)
+
+        self.assertEqual(running["status"], "running")
+        self.assertIn(("start", instance_id), self.runtime.calls)
+        with sqlite3.connect(self.database) as connection:
+            rows = connection.execute(
+                "SELECT strategy,status FROM startup_operations "
+                "WHERE logical_instance_id=? ORDER BY created_at,rowid",
+                (instance_id,),
+            ).fetchall()
+        self.assertEqual(rows, [("prewarm", "failed"), ("cold", "succeeded")])
+
+    def test_prewarm_commit_failure_marks_business_and_operation_failed(self) -> None:
+        owner_id = "user-prewarm-fail"
+        instance_id = "agent-prewarm-fail"
+        manager = FakePrewarmManager(fail_commit=True)
+        control = SERVER.ControlPlane(
+            self.store,
+            self.runtime,
+            self.tasks,
+            workspaces=self.workspaces,
+            prewarm_manager=manager,  # type: ignore[arg-type]
+        )
+        control.create({"id": instance_id}, owner_id)
+
+        with self.assertRaises(SERVER.ApiError) as raised:
+            control.start(instance_id, owner_id)
+
+        self.assertEqual(raised.exception.code, "instance_start_commit_failed")
+        self.assertEqual(self.store.get(instance_id)["status"], "failed")
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT status,last_error FROM startup_operations "
+                "WHERE logical_instance_id=?",
+                (instance_id,),
+            ).fetchone()
+        self.assertEqual(row[0], "failed")
+        self.assertIn("prewarm commit failed", row[1])
 
     def test_ensure_running_resumes_suspended_instance(self) -> None:
         """suspended 实例在聊天时自动 resume，而不是冷启动或报错。"""

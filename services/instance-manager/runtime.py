@@ -276,6 +276,11 @@ class InstanceRuntime:
         """
         return self.runtime_store.resolve_runtime_id(validate_instance_id(instance_id))
 
+    def user_volume_path(self, owner_id: str) -> Path:
+        """返回用户唯一数据盘路径，供启动协调器传给预热领取流程。"""
+        owner_id = validate_instance_id(owner_id)
+        return (self.volume_root / f"{owner_id}.ext4").resolve()
+
     def paths(self, instance_id: str, volume_owner_id: str | None = None) -> dict[str, Path]:
         """集中生成实例所有路径，确保它们只能落在固定根目录。
 

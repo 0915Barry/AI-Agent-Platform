@@ -50,6 +50,10 @@ from task_store import TaskStore, TaskStoreError  # noqa: E402
 from workspace_store import WorkspaceStore, WorkspaceStoreError  # noqa: E402
 from startup_store import StartupStore  # noqa: E402
 from startup_coordinator import StartupCoordinator  # noqa: E402
+from prewarm_config import DEFAULT_CONFIG_PATH, PrewarmConfig  # noqa: E402
+from prewarm_manager import PrewarmManager, PrewarmManagerError  # noqa: E402
+from prewarm_store import PrewarmStore  # noqa: E402
+from runtime_store import VolumeAttachmentStore  # noqa: E402
 
 
 INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -278,6 +282,7 @@ class ControlPlane:
         agent_runtime: AgentRuntimeAdapter | None = None,
         workspaces: WorkspaceStore | None = None,
         suspended_stop_timeout_seconds: int = 600,
+        prewarm_manager: PrewarmManager | None = None,
     ) -> None:
         self.store = store
         self.runtime = runtime
@@ -287,7 +292,9 @@ class ControlPlane:
         self.suspended_stop_timeout_seconds = suspended_stop_timeout_seconds
         # 统一启动协调器：记录每次启动操作的代次，并路由冷启动/快照（预热阶段 3 接入）。
         self.startup_coordinator = StartupCoordinator(
-            StartupStore(self.store.database_path), runtime
+            StartupStore(self.store.database_path),
+            runtime,
+            prewarm_manager=prewarm_manager,
         )
         self._locks_guard = threading.Lock()
         self._locks: dict[str, threading.RLock] = {}
@@ -552,12 +559,30 @@ class ControlPlane:
                     # 在释放配额锁之前写入 starting；下一请求会把它计入配额。
                     self.store.update(instance_id, "starting")
             try:
-                result = self.startup_coordinator.run_cold(instance_id, owner_id)
-            except (RuntimeFailure, OSError, subprocess.SubprocessError) as error:
+                volume_path = (
+                    str(self.runtime.user_volume_path(owner_id))
+                    if owner_id is not None
+                    else None
+                )
+                result = self.startup_coordinator.run_start(
+                    instance_id,
+                    owner_id,
+                    volume_path=volume_path,
+                )
+            except (
+                RuntimeFailure,
+                PrewarmManagerError,
+                OSError,
+                subprocess.SubprocessError,
+            ) as error:
                 self.store.update(instance_id, "failed", str(error)[-4000:])
                 raise ApiError(500, "instance_start_failed", str(error)) from error
             updated = self.store.update(instance_id, "running")
-            self.startup_coordinator.commit_success(result.operation_id)
+            try:
+                self.startup_coordinator.commit_success(result)
+            except (RuntimeFailure, PrewarmManagerError, RuntimeError) as error:
+                self.store.update(instance_id, "failed", str(error)[-4000:])
+                raise ApiError(500, "instance_start_commit_failed", str(error)) from error
             return {**updated, "runtime": result.runtime}
 
     def stop(self, instance_id: str) -> dict[str, Any]:
@@ -1554,6 +1579,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--idle-timeout", type=int, default=300)
     parser.add_argument("--suspended-stop-timeout", type=int, default=600)
     parser.add_argument(
+        "--prewarm-config",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help="prewarm pool configuration file; PREWARM_ENABLED defaults to 0",
+    )
+    parser.add_argument(
         "--require-auth",
         action="store_true",
         help="require M16 local-account sessions for every instance API",
@@ -1585,6 +1616,14 @@ def main() -> None:
         deepseek_credential=args.deepseek_credential,
         state_database=args.database,
     )
+    prewarm_config = PrewarmConfig.from_file(args.prewarm_config)
+    prewarm_manager = PrewarmManager(
+        prewarm_config,
+        prewarm_store=PrewarmStore(args.database),
+        attachment_store=VolumeAttachmentStore(args.database),
+        runtime_store=runtime.runtime_store,
+        activator=runtime,
+    )
     control = ControlPlane(
         store,
         runtime,
@@ -1592,6 +1631,7 @@ def main() -> None:
         PiRuntimeAdapter(),
         workspaces,
         suspended_stop_timeout_seconds=args.suspended_stop_timeout,
+        prewarm_manager=prewarm_manager,
     )
     control.start_lifecycle_monitor()
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), ControlPlaneHandler)
@@ -1600,6 +1640,7 @@ def main() -> None:
     print(
         f"CONTROL_PLANE_READY bind={args.listen_host}:{args.listen_port} "
         f"idle_timeout={args.idle_timeout}s suspended_stop_timeout={args.suspended_stop_timeout}s "
+        f"prewarm={int(prewarm_config.enabled)} "
         f"auth={'session-cookie' if auth_store else 'disabled'}",
         flush=True,
     )
