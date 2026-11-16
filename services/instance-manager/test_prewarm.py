@@ -4,6 +4,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from prewarm_config import PrewarmConfig, PrewarmConfigError
 from prewarm_manager import PrewarmManager, PrewarmManagerError
@@ -58,7 +59,7 @@ class PrewarmManagerTests(unittest.TestCase):
         def __init__(self) -> None:
             self.fail = False
             self.fail_commit = False
-            self.activated: list[tuple[str, str, str, str, str, str]] = []
+            self.activated: list[tuple[str, str, str, str, str, str, str]] = []
             self.committed: list[tuple[str, str, str]] = []
 
         def activate_prewarmer(
@@ -69,6 +70,7 @@ class PrewarmManagerTests(unittest.TestCase):
             volume_path: str,
             operation_id: str,
             activation_id: str,
+            claim_token_hash: str,
         ) -> dict:
             self.activated.append(
                 (
@@ -78,6 +80,7 @@ class PrewarmManagerTests(unittest.TestCase):
                     volume_path,
                     operation_id,
                     activation_id,
+                    claim_token_hash,
                 )
             )
             if self.fail:
@@ -110,7 +113,9 @@ class PrewarmManagerTests(unittest.TestCase):
         )
 
     def _ready(self, runtime_id: str = "runtime-1") -> None:
-        self.prewarm_store.create_item(runtime_id, "profile-a")
+        self.prewarm_store.create_item(
+            runtime_id, "profile-a", claim_token_hash="a" * 64
+        )
         self.assertTrue(self.prewarm_store.mark_ready(runtime_id, ttl_seconds=900))
 
     def test_target_ready_reads_config(self) -> None:
@@ -219,6 +224,36 @@ class PrewarmManagerTests(unittest.TestCase):
             self.attachment_store.get("/vol/user-1.ext4")["status"], "error"
         )
         self.assertEqual(self.runtime_store.get_binding("logical-1")["status"], "error")
+
+    def test_complete_stop_releases_attachment_binding_and_retires_item(self) -> None:
+        self._ready()
+        self.manager.claim(
+            "profile-a", "logical-1", "user-1", "/vol/user-1.ext4", "operation-1"
+        )
+        self.manager.commit(
+            "logical-1", "runtime-1", "operation-1", "activation-1"
+        )
+        with patch.object(
+            self.runtime_store, "get", return_value={"status": "stopped"}
+        ):
+            self.manager.complete_stop("logical-1", "runtime-1", "operation-1")
+        self.assertEqual(self.prewarm_store.get("runtime-1")["status"], "retired")
+        self.assertIsNone(self.attachment_store.get("/vol/user-1.ext4"))
+        self.assertIsNone(self.runtime_store.get_binding("logical-1"))
+
+    def test_complete_stop_rejects_live_runtime(self) -> None:
+        self._ready()
+        self.manager.claim(
+            "profile-a", "logical-1", "user-1", "/vol/user-1.ext4", "operation-1"
+        )
+        self.manager.commit(
+            "logical-1", "runtime-1", "operation-1", "activation-1"
+        )
+        with patch.object(
+            self.runtime_store, "get", return_value={"status": "running"}
+        ):
+            with self.assertRaisesRegex(PrewarmManagerError, "must be stopped"):
+                self.manager.complete_stop("logical-1", "runtime-1", "operation-1")
 
 
 if __name__ == "__main__":

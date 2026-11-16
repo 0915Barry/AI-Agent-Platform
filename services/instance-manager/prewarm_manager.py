@@ -34,6 +34,7 @@ class PrewarmActivator(Protocol):
         volume_path: str,
         operation_id: str,
         activation_id: str,
+        claim_token_hash: str,
     ) -> dict: ...
 
     def commit_prewarmer(
@@ -153,6 +154,7 @@ class PrewarmManager:
                 volume_path,
                 operation_id,
                 activation_id,
+                str(item.get("claim_token_hash") or ""),
             )
             if not attachment_store.mark_attached(volume_path, operation_id):
                 raise PrewarmManagerError("volume attachment generation changed during activation")
@@ -232,6 +234,36 @@ class PrewarmManager:
             if isinstance(error, PrewarmManagerError):
                 raise
             raise PrewarmManagerError(message) from error
+
+    def complete_stop(
+        self,
+        logical_instance_id: str,
+        runtime_id: str,
+        operation_id: str,
+    ) -> None:
+        """物理 runtime 停止后释放绑定与数据盘独占并退休预热项。"""
+        prewarm_store, attachment_store, runtime_store, _ = (
+            self._require_phase3_dependencies()
+        )
+        item = prewarm_store.get(runtime_id)
+        metadata = runtime_store.get(runtime_id)
+        if metadata is None or metadata.get("status") != "stopped":
+            raise PrewarmManagerError("prewarm runtime must be stopped before releasing ownership")
+        if (
+            item is None
+            or item.get("status") != "assigned"
+            or item.get("operation_id") != operation_id
+            or item.get("logical_instance_id") != logical_instance_id
+        ):
+            raise PrewarmManagerError("assigned prewarm generation changed before stop cleanup")
+        if not prewarm_store.begin_assigned_stop(runtime_id, operation_id):
+            raise PrewarmManagerError("failed to enter prewarm draining state")
+        volume_path = str(item["volume_path"])
+        if not attachment_store.release(volume_path, operation_id):
+            raise PrewarmManagerError("volume attachment changed during stop cleanup")
+        runtime_store.delete_binding(logical_instance_id)
+        if not prewarm_store.retire(runtime_id):
+            raise PrewarmManagerError("failed to retire stopped prewarm runtime")
 
     def fill_if_needed(self) -> None:
         """阶段 4 自动补池 Worker 才实现。"""

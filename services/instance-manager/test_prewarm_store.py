@@ -41,6 +41,15 @@ class PrewarmStoreTests(unittest.TestCase):
         self.assertIsNotNone(item["expires_at"])
         self.assertEqual(item["claim_token_hash"], "tok")
 
+    def test_record_runtime_generation_only_while_preparing(self) -> None:
+        self.store.create_item("rt-1", "profile-a")
+        self.assertTrue(self.store.record_runtime_generation("rt-1", 123, 456))
+        item = self.store.get("rt-1")
+        self.assertEqual(item["vmm_pid"], 123)
+        self.assertEqual(item["process_start_ticks"], 456)
+        self.assertTrue(self.store.mark_ready("rt-1", ttl_seconds=900))
+        self.assertFalse(self.store.record_runtime_generation("rt-1", 999, 999))
+
     def test_claim_sets_binding_fields(self) -> None:
         self._ready_item("rt-1")
         claimed = self.store.claim(
@@ -108,6 +117,16 @@ class PrewarmStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get("rt-1")["status"], "draining")
         self.assertTrue(self.store.retire("rt-1"))
         self.assertEqual(self.store.get("rt-1")["status"], "retired")
+
+    def test_assigned_item_enters_draining_only_for_current_operation(self) -> None:
+        self._ready_item("rt-1")
+        self.store.claim(
+            "profile-a", "logical-1", "user-1", "/vol/1.ext4", "op-1", "act-1"
+        )
+        self.assertTrue(self.store.mark_assigned("rt-1", "op-1"))
+        self.assertFalse(self.store.begin_assigned_stop("rt-1", "stale-op"))
+        self.assertTrue(self.store.begin_assigned_stop("rt-1", "op-1"))
+        self.assertEqual(self.store.get("rt-1")["status"], "draining")
 
     def test_duplicate_active_binding_rejected(self) -> None:
         self._ready_item("rt-1")

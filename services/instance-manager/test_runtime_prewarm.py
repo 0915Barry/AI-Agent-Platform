@@ -2,6 +2,7 @@
 """InstanceRuntime 预热激活接口的 fake/mock 单元测试。"""
 
 import subprocess
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -97,6 +98,7 @@ class RuntimePrewarmTests(unittest.TestCase):
             str(self.volume),
             self.operation_id,
             self.activation_id,
+            hashlib.sha256(b"claim-token").hexdigest(),
         )
 
     def prepare(self) -> dict:
@@ -272,6 +274,21 @@ class RuntimePrewarmTests(unittest.TestCase):
             self.activate()
         self.runtime.terminate_process.assert_called_once_with(sidecar)
         self.runtime.runtime_store.save.assert_not_called()
+
+    @patch("runtime.process_matches", return_value=True)
+    @patch("runtime.Path.is_socket", return_value=True)
+    def test_activation_rejects_token_file_hash_mismatch(self, _is_socket, _matches) -> None:
+        with self.assertRaisesRegex(RuntimeFailure, "token hash mismatch"):
+            self.runtime.activate_prewarmer(
+                self.runtime_id,
+                self.logical_id,
+                self.user_id,
+                str(self.volume),
+                self.operation_id,
+                self.activation_id,
+                "0" * 64,
+            )
+        self.runtime.prewarm_activation.probe.assert_not_called()
 
     @patch("runtime.process_matches", return_value=True)
     @patch("runtime.Path.is_socket", return_value=True)

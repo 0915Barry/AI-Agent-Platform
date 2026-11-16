@@ -196,6 +196,26 @@ class PrewarmStore:
             )
         return cursor.rowcount == 1
 
+    def record_runtime_generation(
+        self,
+        runtime_id: str,
+        vmm_pid: int,
+        process_start_ticks: int,
+    ) -> bool:
+        """准备阶段记录真实 VMM 代次；仅 preparing 项允许写入。"""
+        now = int(time.time())
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE prewarm_items
+                SET vmm_pid=?, process_start_ticks=?, updated_at=?
+                WHERE runtime_id=? AND status='preparing'
+                """,
+                (vmm_pid, process_start_ticks, now, runtime_id),
+            )
+        return cursor.rowcount == 1
+
     def claim(
         self,
         profile_key: str,
@@ -308,6 +328,21 @@ class PrewarmStore:
                 WHERE runtime_id=? AND status IN ('ready','error')
                 """,
                 (now, runtime_id),
+            )
+        return cursor.rowcount == 1
+
+    def begin_assigned_stop(self, runtime_id: str, operation_id: str) -> bool:
+        """物理 VMM 已停止后，把本代 assigned 项转入清理态。"""
+        now = int(time.time())
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE prewarm_items
+                SET status='draining', updated_at=?
+                WHERE runtime_id=? AND status='assigned' AND operation_id=?
+                """,
+                (now, runtime_id, operation_id),
             )
         return cursor.rowcount == 1
 

@@ -9,6 +9,8 @@ rootfs 始终只读；用户工作区位于用户专属 ext4 数据盘。停止�
 清理 VMM/jail，用户盘由账户数据生命周期单独管理。
 """
 
+import hashlib
+import hmac
 import json
 import os
 import pwd
@@ -1295,6 +1297,7 @@ class InstanceRuntime:
         volume_path: str,
         operation_id: str,
         activation_id: str,
+        claim_token_hash: str,
     ) -> dict:
         """把一台 WARM_READY Guest 绑定到用户数据盘并启动 Pi RPC。
 
@@ -1315,6 +1318,15 @@ class InstanceRuntime:
         if supplied_volume != expected_volume:
             raise RuntimeFailure("prewarm activation volume does not match the user volume")
 
+        token_path = physical_paths["state"] / "prewarm-token"
+        claim_token = self._read_prewarm_token(token_path)
+        actual_token_hash = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
+        if (
+            len(claim_token_hash) != 64
+            or not hmac.compare_digest(actual_token_hash, claim_token_hash.lower())
+        ):
+            raise RuntimeFailure("prewarm claim token hash mismatch")
+
         self.adopt_legacy_volume(logical_instance_id, user_id, supplied_volume)
         self.create_volume(supplied_volume, uid, gid)
         try:
@@ -1328,8 +1340,6 @@ class InstanceRuntime:
             )
         self.configure_agent_volume(supplied_volume, str(network["host_ip"]))
 
-        token_path = physical_paths["state"] / "prewarm-token"
-        claim_token = self._read_prewarm_token(token_path)
         try:
             probe_state = self.prewarm_activation.probe(
                 str(network["guest_ip"]), PREWARM_ACTIVATE_PORT, claim_token
