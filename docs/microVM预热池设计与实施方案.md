@@ -1,10 +1,10 @@
 # microVM 预热池设计与实施方案
 
-> 文档状态：设计基线，尚未完成生产接入。
+> 文档状态：阶段 3 接入中，尚未允许生产启用。
 >
-> 基线日期：2026-11-10。
+> 当前进度日期：2026-11-16。
 >
-> 当前结论：空白 Guest 热切数据盘并激活 Pi RPC 的技术探针已经成立；自动补池、原子领取、统一启动仲裁和故障恢复仍未实现。预热功能默认关闭，现有冷启动和快照恢复继续作为可用基线。
+> 当前结论：数据库状态机、数据盘独占、真实 Runtime 预热接管和 Control Plane 启动策略已经落地；自动补池、Control Plane 停止/销毁清理和预热故障协调尚未完成。预热功能默认关闭，现有冷启动和快照恢复继续作为可用基线。
 
 ## 1. 目标与边界
 
@@ -40,20 +40,24 @@
 
 因此，“提前启动公共 Guest，用户到来后再绑定数据盘”的技术路线可行。
 
-### 2.2 尚未成立的系统能力
+### 2.2 当前实现边界
 
-当前还没有完整预热池：
+当前已经实现：
 
-- `PrewarmManager.fill_if_needed()`、`claim()`、`drain()`、`reconcile()` 仍未实现；
-- 没有 `prewarm_items` 状态表；
-- 没有后台自动补池 Worker；
-- Control Plane 尚未执行“快照、预热、冷启动”统一仲裁；
-- 没有跨启动方式统一的数据盘独占锁；
-- 快照暂停后会释放网络租约，恢复时重新申请原槽位；若该槽位已被预热机占用，恢复会安全失败；
-- 预热技术探针使用固定测试网络，不代表已经接入正式 NetworkManager；
-- `runtime_bindings` 已有基础结构，但尚未参与真实预热领取。
+- `prewarm_items`、`startup_operations`、`volume_attachments` 及代次条件转换；
+- `PrewarmManager.claim()/commit()/complete_stop()` 与逻辑/物理 Runtime 绑定；
+- 正式 `NetworkManager`、`RuntimeStore` 和 `InstanceRuntime` 上的空白 Guest 创建、热切盘、激活和提交；
+- 快照暂停保留网络槽位，恢复时复用原租约；
+- `StartupCoordinator` 的预热优先、池空冷启动回退和激活失败禁止回退；
+- Control Plane 启动入口接入上述策略，默认关闭回归保持通过。
 
-所以当前代码只能证明底层激活链路，不能直接打开 `PREWARM_ENABLED=1` 投入使用。
+仍未完成：
+
+- Control Plane 停止和销毁路径调用 `complete_stop()` 释放附件、绑定与预热项；
+- 自动补池、TTL/健康回收和重启 Reconcile Worker；
+- 启用预热后的 Control Plane 全链路压力与故障测试。
+
+因此当前代码已完成单台人工预热接管，但仍不能直接打开 `PREWARM_ENABLED=1` 投入使用。
 
 ## 3. 设计原则
 
@@ -110,7 +114,7 @@
 
 ### 5.1 StartupCoordinator：统一启动仲裁
 
-建议新增 `services/instance-manager/startup_coordinator.py`，由 Control Plane 调用，不让 `server.py` 继续堆积资源编排细节。
+`services/instance-manager/startup_coordinator.py` 已由 Control Plane 调用，避免把策略选择继续堆积到 `server.py`。
 
 职责：
 
@@ -125,7 +129,7 @@
 
 ### 5.2 PrewarmStore：预热状态存储
 
-建议新增 `services/instance-manager/prewarm_store.py`，负责：
+`services/instance-manager/prewarm_store.py` 已实现以下职责：
 
 - 创建与查询 `prewarm_items`；
 - 使用 `BEGIN IMMEDIATE` 原子领取；
@@ -149,7 +153,7 @@ Worker 和 Reconcile 共用同一套条件转换，避免每个调用点各自�
 
 ### 5.3 PrewarmManager：单项编排
 
-现有 `prewarm_manager.py` 作为唯一业务入口，后续实现：
+`prewarm_manager.py` 作为单项编排入口，已实现领取、激活、提交和停止后归属清理；自动补池相关方法仍留待 Worker 阶段：
 
 - `prepare_one()`：创建一台空白 Guest；
 - `claim()`：领取一条 `ready` 记录；
@@ -172,7 +176,7 @@ Worker 不接收用户请求，也不能直接修改业务实例状态。
 
 ### 5.5 ActivationClient：Host 激活客户端
 
-建议把 Host 侧固定协议封装为独立模块，负责：
+Host 侧固定协议已封装在 `prewarm_activation.py`，负责：
 
 - `PROBE_V1`；
 - `ACTIVATE_V1`；
@@ -402,13 +406,11 @@ Host 数据库才是最终归属依据，Guest 的 `BOUND_READY` 只是激活已
 
 ### 9.1 当前真实行为
 
-当前快照清单保存原网络信息。暂停完成后，生命周期清理会释放真实网络资源和租约；恢复时 `reserve_snapshot_lease()` 必须重新取得原槽位，因为 Guest IP、MAC 和网卡状态已经在快照中。
+当前快照清单保存原网络信息。暂停完成后会删除 TAP、路由和 nftables，但把原租约保留为 `reserved`；恢复时 `reserve_snapshot_lease()` 复用同一槽位，再重建网络资源并切回 `active`。
 
-如果原槽位已经被冷启动或预热机占用，当前恢复会拒绝执行。这是安全行为，但会造成用户无法及时恢复。
+### 9.2 已采用的网络策略
 
-### 9.2 接入自动预热前必须选择网络策略
-
-首期推荐“快照槽位保留”：
+首期已经采用“快照槽位保留”：
 
 - 暂停时删除 TAP、路由和 nftables；
 - `network_leases` 保留原槽位，状态维持 `reserved`；
@@ -498,7 +500,7 @@ running复用 → 有效快照恢复 → ready预热领取 → 冷启动
 - `PREWARM_BUILD_CONCURRENCY`：并行补池上限；
 - `PREWARM_TTL_SECONDS`：空白项最大等待时间；
 - `PREWARM_MIN_AVAILABLE_MIB`：补池前最低可用内存；
-- `PREWARM_MIN_FREE_NETWORK_SLOTS`：补池后仍须留给冷启动和恢复的最小空闲槽位（计划新增）；
+- `PREWARM_MIN_FREE_NETWORK_SLOTS`：补池后仍须留给冷启动和恢复的最小空闲槽位（已实现配置解析与容量查询）；
 - `PREWARM_CLAIM_TIMEOUT_SECONDS`：领取事务超时；
 - `PREWARM_ACTIVATE_TIMEOUT_SECONDS`：Guest 激活超时。
 
@@ -596,6 +598,8 @@ prewarm_activate_seconds
 - 用户请求能够领取、激活、提交和正常停止；
 - 暂不启动自动补池。
 
+当前进度：Runtime 真实领取、Pi RPC 验证、提交和停止清理专项测试已通过；Control Plane 启动策略已接入并在默认关闭下通过 CLI 回归。Control Plane 停止/销毁清理尚未接入。
+
 验收：连续至少 30 次真实领取；错误 Token/UUID/重复激活全部硬失败；数据盘和网络无残留。
 
 ### 阶段 4：自动补池 Worker
@@ -632,11 +636,11 @@ prewarm_activate_seconds
 |---|---|
 | `services/instance-manager/prewarm_config.py` | 已有，继续作为配置解析器 |
 | `services/instance-manager/prewarm_manager.py` | 已有骨架，逐阶段实现 |
-| `services/instance-manager/prewarm_store.py` | 新增，状态机与原子领取 |
+| `services/instance-manager/prewarm_store.py` | 已实现，状态机与原子领取 |
 | `services/instance-manager/prewarm_worker.py` | 新增，补池与巡检 |
-| `services/instance-manager/startup_coordinator.py` | 新增，统一策略仲裁 |
-| `services/instance-manager/prewarm_activation.py` | 建议新增，Host 激活协议客户端 |
-| `services/instance-manager/runtime_store.py` | 新增 `volume_attachments`，扩展绑定和代次约束 |
+| `services/instance-manager/startup_coordinator.py` | 已实现并接入 Control Plane 启动路径 |
+| `services/instance-manager/prewarm_activation.py` | 已实现，Host 激活协议客户端 |
+| `services/instance-manager/runtime_store.py` | 已实现 `volume_attachments`、绑定和代次约束 |
 | `services/instance-manager/network_manager.py` | 增加快照槽位保留及预热容量查询 |
 | `services/control-plane/server.py` | 只接 StartupCoordinator，不内嵌池细节 |
 | `scripts/guest/agent-init.sh` | 已有预热分支，后续只做必要修正 |
@@ -668,11 +672,14 @@ PREWARM_ENABLED=0
 
 ## 18. 下一项开发任务
 
-阶段 1、阶段 2 和阶段 2A 已完成：数据库状态机、统一启动协调器和快照网络槽位保留均已落地，且预热默认关闭时的 CLI、快照、恢复和生命周期回归测试保持通过。
+阶段 1、阶段 2、阶段 2A 和阶段 3 的启动侧已经完成：数据库状态机、快照槽位保留、真实 Runtime 接管、启动策略选择和 Control Plane 启动入口均已落地。`prewarm-runtime-smoke-test` 已验证 prepare、claim、activate、commit、Pi RPC、stop 及底层资源清理；默认关闭时 `cli-smoke-test` 保持通过。
 
-下一步实施阶段 3，并拆成两个可独立验证的小提交：
+下一项开发任务是补齐阶段 3 的 Control Plane 退出侧：
 
-1. **阶段 3A：领取状态编排。** 实现 `PrewarmManager` 的 ready 查询、原子领取、数据盘独占、激活调用、绑定记录、代次提交和失败锁定；使用 fake runtime 验证跨表状态变化，不接 Control Plane。
-2. **阶段 3B：真实单台接管。** 把技术探针已经验证的 WARM_READY、热切数据盘、ACTIVATE_V1、BOUND_READY 和 COMMIT_V1 接入正式 Runtime、NetworkManager 与生命周期停止路径；停止或销毁时必须释放绑定和数据盘附件，错误状态不得自动解锁。
+1. `stop/destroy` 识别逻辑实例是否来自预热分配；
+2. Firecracker 确认停止后调用 `PrewarmManager.complete_stop()`；
+3. 条件释放 `volume_attachments`、`runtime_bindings` 并把预热项转为 `retired`；
+4. 增加停止失败、重复停止和旧 `operation_id` 不得误清理新归属的测试；
+5. 完成 Control Plane 启用预热后的真实端到端验收。
 
-阶段 3 完成前仍不启动自动 Worker。用户请求只有在开关显式启用且存在健康的 ready 项时才尝试预热领取；没有 ready 项必须立即回退现有冷启动路径。
+上述清理闭环通过前继续保持 `PREWARM_ENABLED=0`，暂不启动自动 Worker。
