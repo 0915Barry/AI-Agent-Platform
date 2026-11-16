@@ -21,8 +21,9 @@ import threading
 import time
 from pathlib import Path
 
-from lifecycle import process_matches, validate_instance_id
+from lifecycle import process_matches, process_start_ticks, validate_instance_id
 from network_manager import NetworkFailure, NetworkManager, SQLiteLeaseStore
+from prewarm_activation import ActivationClient, ActivationError
 from runtime_store import RuntimeStore, RuntimeStoreError, UserVolumeStore
 
 
@@ -39,6 +40,7 @@ GATEWAY_USER = "agent-gateway"
 GATEWAY_GROUP = "agent-gateway"
 GATEWAY_PORT = 18082
 PI_RPC_PORT = 8080
+PREWARM_ACTIVATE_PORT = 8081
 
 
 class RuntimeFailure(RuntimeError):
@@ -162,6 +164,7 @@ class InstanceRuntime:
         deepseek_credential: Path | None = None,
         state_database: Path | None = None,
         snapshot_root: Path = DEFAULT_SNAPSHOT_ROOT,
+        prewarm_activate_timeout_seconds: float = 10,
     ) -> None:
         self.state_root = state_root.resolve()
         self.volume_root = volume_root.resolve()
@@ -179,6 +182,7 @@ class InstanceRuntime:
         )
         self.runtime_store = RuntimeStore(self.state_database)
         self.user_volume_store = UserVolumeStore(self.state_database)
+        self.prewarm_activation = ActivationClient(prewarm_activate_timeout_seconds)
         self.manager = Path(__file__).resolve().with_name("lifecycle.py")
         self.gateway = Path(__file__).resolve().parents[1] / "tool-gateway" / "gateway.py"
         kernel_version = load_version("SMOKE_KERNEL_VERSION")
@@ -995,6 +999,183 @@ class InstanceRuntime:
             if isinstance(error, NetworkFailure):
                 raise RuntimeFailure(str(error)) from error
             raise
+
+    @staticmethod
+    def _read_prewarm_token(token_path: Path) -> str:
+        """读取 Host 私有的一次性领取 Token，不把内容写入异常。"""
+        try:
+            token = token_path.read_text(encoding="utf-8").strip()
+        except OSError as error:
+            raise RuntimeFailure("prewarm claim token is unavailable") from error
+        if not token:
+            raise RuntimeFailure("prewarm claim token is empty")
+        return token
+
+    @staticmethod
+    def _volume_uuid(volume_path: Path) -> str:
+        result = run(
+            ["blkid", "-s", "UUID", "-o", "value", str(volume_path)],
+            check=False,
+        )
+        value = result.stdout.strip()
+        if result.returncode != 0 or not value:
+            raise RuntimeFailure("user volume UUID is unavailable")
+        return value
+
+    def _live_prewarmer(self, runtime_id: str) -> tuple[dict, dict, dict[str, Path]]:
+        """校验预热 VMM 代次、网络租约和 API Socket 后返回运行上下文。"""
+        runtime_id = validate_instance_id(runtime_id)
+        metadata = self.runtime_store.get(runtime_id)
+        if (
+            metadata is None
+            or metadata.get("status") != "running"
+            or not process_matches(metadata)
+        ):
+            raise RuntimeFailure(f"prewarm runtime is not alive: {runtime_id}")
+        paths = self.paths(runtime_id, runtime_id)
+        if Path(str(metadata.get("apiSocket", ""))).resolve() != paths["socket"].resolve():
+            raise RuntimeFailure("prewarm runtime API socket does not match its generation")
+        if not paths["socket"].is_socket():
+            raise RuntimeFailure("prewarm runtime API socket is unavailable")
+        network = self.network_manager.store.get(runtime_id)
+        if network is None or network.get("status") != "active":
+            raise RuntimeFailure("prewarm runtime network lease is not active")
+        return metadata, network, paths
+
+    def activate_prewarmer(
+        self,
+        runtime_id: str,
+        logical_instance_id: str,
+        user_id: str,
+        volume_path: str,
+        operation_id: str,
+        activation_id: str,
+    ) -> dict:
+        """把一台 WARM_READY Guest 绑定到用户数据盘并启动 Pi RPC。
+
+        本方法不写 ``prewarm_items``、``volume_attachments`` 或业务实例状态；
+        这些跨表状态由 ``PrewarmManager`` 统一编排。数据盘一旦 PATCH 给 VMM，
+        后续失败都不能自动解锁，由上层标为 error 并进入显式补偿。
+        """
+        runtime_id = validate_instance_id(runtime_id)
+        logical_instance_id = validate_instance_id(logical_instance_id)
+        user_id = validate_instance_id(user_id)
+        validate_instance_id(operation_id)
+        validate_instance_id(activation_id)
+        metadata, network, physical_paths = self._live_prewarmer(runtime_id)
+
+        uid, gid, gateway_uid, gateway_gid = self.ensure_host()
+        expected_volume = (self.volume_root / f"{user_id}.ext4").resolve()
+        supplied_volume = Path(volume_path).resolve()
+        if supplied_volume != expected_volume:
+            raise RuntimeFailure("prewarm activation volume does not match the user volume")
+
+        self.adopt_legacy_volume(logical_instance_id, user_id, supplied_volume)
+        self.create_volume(supplied_volume, uid, gid)
+        try:
+            self.user_volume_store.ensure(user_id, supplied_volume)
+        except RuntimeStoreError as error:
+            raise RuntimeFailure(str(error)) from error
+        filesystem_check = run(["e2fsck", "-f", "-y", str(supplied_volume)], check=False)
+        if filesystem_check.returncode > 1:
+            raise RuntimeFailure(
+                f"persistent volume check failed: {filesystem_check.stderr.strip()}"
+            )
+        self.configure_agent_volume(supplied_volume, str(network["host_ip"]))
+
+        token_path = physical_paths["state"] / "prewarm-token"
+        claim_token = self._read_prewarm_token(token_path)
+        try:
+            probe_state = self.prewarm_activation.probe(
+                str(network["guest_ip"]), PREWARM_ACTIVATE_PORT, claim_token
+            )
+        except ActivationError as error:
+            raise RuntimeFailure(str(error)) from error
+        if probe_state != "warm":
+            raise RuntimeFailure("prewarm Guest is not in the warm state")
+
+        physical_paths["activity"].parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        physical_paths["activity"].touch()
+        os.chown(physical_paths["activity"], gateway_uid, gateway_gid)
+        os.chmod(physical_paths["activity"], 0o600)
+        sidecars: list[subprocess.Popen[bytes]] = []
+        try:
+            sidecars = self.start_model_gateway(
+                logical_instance_id,
+                physical_paths,
+                network,
+                gateway_uid,
+                gateway_gid,
+            )
+
+            # 原子替换 jail 内目录项；Firecracker 仍持有占位盘旧 FD，随后 PATCH
+            # 才会重新打开当前 /data.ext4 对应的真实用户盘。
+            data_link = physical_paths["chroot"] / "data.ext4"
+            staged_link = physical_paths["chroot"] / "data.ext4.next"
+            staged_link.unlink(missing_ok=True)
+            os.link(supplied_volume, staged_link)
+            os.replace(staged_link, data_link)
+            self.firecracker_api(
+                physical_paths["socket"],
+                "PATCH",
+                "/drives/data",
+                {"drive_id": "data", "path_on_host": "/data.ext4"},
+            )
+
+            volume_uuid = self._volume_uuid(supplied_volume)
+            try:
+                bound = self.prewarm_activation.activate(
+                    str(network["guest_ip"]),
+                    PREWARM_ACTIVATE_PORT,
+                    claim_token,
+                    activation_id,
+                    volume_uuid,
+                )
+            except ActivationError as error:
+                raise RuntimeFailure(str(error)) from error
+            if bound.rpc_host != str(network["guest_ip"]) or bound.rpc_port != PI_RPC_PORT:
+                raise RuntimeFailure("BOUND_READY returned an unexpected Pi RPC endpoint")
+
+            sidecar_rows = list(metadata.get("sidecars", []))
+            for sidecar in sidecars:
+                ticks = process_start_ticks(sidecar.pid)
+                if ticks is None:
+                    raise RuntimeFailure("model gateway exited during prewarm activation")
+                sidecar_rows.append(
+                    {"pid": sidecar.pid, "processStartTicks": ticks}
+                )
+                threading.Thread(target=sidecar.wait, daemon=True).start()
+            metadata["sidecars"] = sidecar_rows
+            metadata["volumePath"] = str(supplied_volume)
+            stored = self.runtime_store.save(metadata)
+            stored["processAlive"] = process_matches(stored)
+            return stored
+        except Exception:
+            for sidecar in sidecars:
+                self.terminate_process(sidecar)
+            raise
+
+    def commit_prewarmer(
+        self,
+        runtime_id: str,
+        operation_id: str,
+        activation_id: str,
+    ) -> None:
+        """Host 业务状态已提交后通知 Guest 固化本次激活。"""
+        runtime_id = validate_instance_id(runtime_id)
+        validate_instance_id(operation_id)
+        validate_instance_id(activation_id)
+        _, network, paths = self._live_prewarmer(runtime_id)
+        claim_token = self._read_prewarm_token(paths["state"] / "prewarm-token")
+        try:
+            self.prewarm_activation.commit(
+                str(network["guest_ip"]),
+                PREWARM_ACTIVATE_PORT,
+                claim_token,
+                activation_id,
+            )
+        except ActivationError as error:
+            raise RuntimeFailure(str(error)) from error
 
     def suspend(self, instance_id: str, owner_id: str) -> dict:
         """暂停运行实例、创建完整快照并释放计算与临时网络资源。"""
