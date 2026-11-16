@@ -253,6 +253,7 @@ class InstanceRuntime:
         for directory in (
             FIRECRACKER_JAIL_ROOT,
             self.volume_root,
+            self.volume_root.parent / "prewarm",
             LEGACY_VOLUME_ROOT,
             self.state_root / "instances",
             self.state_root / "activity",
@@ -295,6 +296,10 @@ class InstanceRuntime:
             "metadata": self.state_root / "instances" / f"{runtime_id}.json",
             "activity": self.state_root / "activity" / runtime_id,
             "state": state_dir,
+            "prewarm_placeholder": self.volume_root.parent
+            / "prewarm"
+            / f"{runtime_id}.placeholder.ext4",
+            "prewarm_token": state_dir / "prewarm-token",
             "console": state_dir / "console.log",
             "reaper": state_dir / "reaper.log",
             "sidecars": state_dir / "sidecars",
@@ -660,6 +665,89 @@ class InstanceRuntime:
         config_path.write_text(json.dumps(config, separators=(",", ":")) + "\n", encoding="utf-8")
         os.chmod(config_path, 0o644)
 
+    def prepare_prewarm_jail(
+        self,
+        runtime_id: str,
+        paths: dict[str, Path],
+        network: dict[str, str],
+        claim_token: str,
+    ) -> None:
+        """生成只挂占位盘的预热 Firecracker 配置。"""
+        shutil.rmtree(paths["jail"], ignore_errors=True)
+        paths["chroot"].mkdir(parents=True, mode=0o755)
+        try:
+            os.link(self.kernel_source, paths["chroot"] / "vmlinux")
+            os.link(self.rootfs_source, paths["chroot"] / "rootfs.ext4")
+            os.link(paths["prewarm_placeholder"], paths["chroot"] / "placeholder.ext4")
+        except OSError as error:
+            shutil.rmtree(paths["jail"], ignore_errors=True)
+            raise RuntimeFailure(
+                "kernel, rootfs, prewarm placeholder, and jail paths must support hard links"
+            ) from error
+
+        boot_args = (
+            "root=/dev/vda ro rootfstype=ext4 console=ttyS0 reboot=k "
+            "panic=1 pci=off init=/usr/local/sbin/agent-init agent_prewarm=1"
+            f" agent_ip={network['guest_cidr']}"
+            f" agent_gateway={network['host_ip']}"
+            f" agent_dns={network['host_ip']}"
+            f" agent_gateway_host={network['host_ip']}"
+            f" agent_gateway_port={GATEWAY_PORT}"
+            f" agent_rpc_port={PI_RPC_PORT}"
+            f" agent_activate_port={PREWARM_ACTIVATE_PORT}"
+            f" agent_prewarm_token={claim_token}"
+            " agent_rpc_provider=deepseek-gateway"
+            " agent_rpc_model=deepseek-flash"
+        )
+        config = {
+            "boot-source": {
+                "kernel_image_path": "/vmlinux",
+                "boot_args": boot_args,
+            },
+            "machine-config": {
+                "vcpu_count": 2,
+                "mem_size_mib": 1024,
+                "smt": False,
+                "track_dirty_pages": False,
+                "huge_pages": "None",
+            },
+            "drives": [
+                {
+                    "drive_id": "rootfs",
+                    "path_on_host": "/rootfs.ext4",
+                    "is_root_device": True,
+                    "is_read_only": True,
+                },
+                {
+                    "drive_id": "data",
+                    "path_on_host": "/placeholder.ext4",
+                    "is_root_device": False,
+                    "is_read_only": False,
+                },
+            ],
+            "network-interfaces": [
+                {
+                    "iface_id": "eth0",
+                    "guest_mac": network["guest_mac"],
+                    "host_dev_name": network["tap"],
+                }
+            ],
+            "cpu-config": None,
+            "balloon": None,
+            "vsock": None,
+            "logger": None,
+            "metrics": None,
+            "mmds-config": None,
+            "entropy": None,
+            "pmem": [],
+            "memory-hotplug": None,
+        }
+        config_path = paths["chroot"] / "config.json"
+        config_path.write_text(
+            json.dumps(config, separators=(",", ":")) + "\n", encoding="utf-8"
+        )
+        os.chmod(config_path, 0o600)
+
     def lifecycle(self, *arguments: str, capture: bool = True) -> subprocess.CompletedProcess[str]:
         """调用统一生命周期 CLI，并把子进程错误转换为 RuntimeFailure。"""
         command = [
@@ -996,6 +1084,163 @@ class InstanceRuntime:
                     pass
             shutil.rmtree(paths["jail"], ignore_errors=True)
             timing.emit("failed")  # STARTUP_TIMING_DIAGNOSTIC
+            if isinstance(error, NetworkFailure):
+                raise RuntimeFailure(str(error)) from error
+            raise
+
+    def prepare_prewarmer(
+        self,
+        runtime_id: str,
+        claim_token: str,
+        *,
+        min_free_network_slots: int = 4,
+    ) -> dict:
+        """启动一台未绑定用户数据盘的 WARM_READY Guest。
+
+        本方法只创建一台物理预热机，不写 ``prewarm_items``；调用方必须先写
+        preparing，成功后再条件更新为 ready。预热机不启动 idle watcher，后续
+        由池 Worker 根据 TTL 回收。
+        """
+        runtime_id = validate_instance_id(runtime_id)
+        if (
+            not claim_token
+            or len(claim_token) > 128
+            or not claim_token.isascii()
+            or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-" for character in claim_token)
+        ):
+            raise RuntimeFailure("invalid prewarm claim token")
+        if min_free_network_slots < 0:
+            raise RuntimeFailure("minimum free network slots cannot be negative")
+        if self.runtime_store.get(runtime_id) is not None:
+            raise RuntimeFailure(f"prewarm runtime already exists: {runtime_id}")
+
+        uid, gid, _, _ = self.ensure_host()
+        if self.network_manager.free_slot_count() <= min_free_network_slots:
+            raise RuntimeFailure("insufficient network slots for a prewarm runtime")
+        paths = self.paths(runtime_id, runtime_id)
+        paths["state"].mkdir(parents=True, exist_ok=True, mode=0o700)
+        paths["prewarm_placeholder"].parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        paths["prewarm_placeholder"].unlink(missing_ok=True)
+        run(["truncate", "-s", "1G", str(paths["prewarm_placeholder"])])
+        os.chown(paths["prewarm_placeholder"], uid, gid)
+        os.chmod(paths["prewarm_placeholder"], 0o600)
+        paths["prewarm_token"].write_text(claim_token + "\n", encoding="utf-8")
+        os.chown(paths["prewarm_token"], 0, 0)
+        os.chmod(paths["prewarm_token"], 0o400)
+
+        network: dict[str, str] | None = None
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            network = self.network_manager.allocate(runtime_id)
+            self.network_manager.setup(network, uid, (GATEWAY_PORT,))
+            self.prepare_prewarm_jail(runtime_id, paths, network, claim_token)
+            paths["console"].write_text("", encoding="utf-8")
+            os.chmod(paths["console"], 0o640)
+            console_handle = paths["console"].open("ab", buffering=0)
+            process = subprocess.Popen(
+                [
+                    "/usr/local/bin/jailer",
+                    "--id",
+                    runtime_id,
+                    "--exec-file",
+                    "/usr/local/bin/firecracker",
+                    "--uid",
+                    str(uid),
+                    "--gid",
+                    str(gid),
+                    "--chroot-base-dir",
+                    str(JAILER_ROOT),
+                    "--cgroup-version",
+                    "2",
+                    "--resource-limit",
+                    "no-file=2048",
+                    "--",
+                    "--api-sock",
+                    "/firecracker.socket",
+                    "--config-file",
+                    "/config.json",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=console_handle,
+                stderr=subprocess.STDOUT,
+                env={
+                    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                },
+                start_new_session=True,
+            )
+            console_handle.close()
+            self.wait_for_socket(paths["socket"], process)
+
+            ready = False
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                console = paths["console"].read_text(encoding="utf-8", errors="replace")
+                if "\nWARM_READY " in f"\n{console}":
+                    ready = True
+                    break
+                if process.poll() is not None:
+                    break
+                time.sleep(0.1)
+            if not ready:
+                tail = paths["console"].read_text(encoding="utf-8", errors="replace")[-8000:]
+                raise RuntimeFailure(f"prewarm Guest did not become ready\n{tail}")
+            try:
+                state = self.prewarm_activation.probe(
+                    str(network["guest_ip"]), PREWARM_ACTIVATE_PORT, claim_token
+                )
+            except ActivationError as error:
+                raise RuntimeFailure(str(error)) from error
+            if state != "warm":
+                raise RuntimeFailure("new prewarm Guest is not in the warm state")
+
+            self.network_manager.activate(runtime_id)
+            self.lifecycle(
+                "register",
+                runtime_id,
+                "--pid",
+                str(process.pid),
+                "--idle-timeout",
+                str(self.idle_timeout_seconds),
+                "--jail-path",
+                str(paths["jail"]),
+                "--api-socket",
+                str(paths["socket"]),
+                "--volume-path",
+                str(paths["prewarm_placeholder"]),
+                "--tap-name",
+                str(network["tap"]),
+                "--nft-family",
+                "inet",
+                "--nft-table",
+                str(network["nft_table"]),
+                "--network-database",
+                str(self.state_database),
+                "--network-subnet",
+                str(network["subnet"]),
+                "--host-ip",
+                str(network["host_ip"]),
+                "--guest-ip",
+                str(network["guest_ip"]),
+                "--rpc-port",
+                str(PI_RPC_PORT),
+            )
+            threading.Thread(target=process.wait, daemon=True).start()
+            status = self.status(runtime_id)
+            if status is None:
+                raise RuntimeFailure("prewarm lifecycle registration did not persist metadata")
+            status["prewarmState"] = "warm"
+            return status
+        except Exception as error:
+            if process is not None and process.poll() is None:
+                self.terminate_process(process)
+            if network is not None:
+                try:
+                    self.network_manager.release(runtime_id)
+                except NetworkFailure:
+                    pass
+            shutil.rmtree(paths["jail"], ignore_errors=True)
+            paths["prewarm_placeholder"].unlink(missing_ok=True)
+            paths["prewarm_token"].unlink(missing_ok=True)
             if isinstance(error, NetworkFailure):
                 raise RuntimeFailure(str(error)) from error
             raise

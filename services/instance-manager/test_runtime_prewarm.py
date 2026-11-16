@@ -99,6 +99,113 @@ class RuntimePrewarmTests(unittest.TestCase):
             self.activation_id,
         )
 
+    def prepare(self) -> dict:
+        return self.runtime.prepare_prewarmer(
+            self.runtime_id,
+            "claim-token",
+            min_free_network_slots=4,
+        )
+
+    @patch("runtime.threading.Thread")
+    @patch("runtime.subprocess.Popen")
+    @patch("runtime.os.chmod")
+    @patch("runtime.os.chown")
+    @patch("runtime.run", side_effect=fake_run.__func__)
+    def test_prepare_prewarmer_reaches_warm_and_registers_runtime(
+        self, _run, _chown, _chmod, popen, _thread
+    ) -> None:
+        process = Mock(pid=222)
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        popen.return_value = process
+        self.runtime.runtime_store.get.return_value = None
+        self.runtime.network_manager.free_slot_count.return_value = 5
+        self.runtime.network_manager.allocate.return_value = {
+            "instance_id": self.runtime_id,
+            "status": "reserved",
+            "host_ip": "172.29.0.1",
+            "guest_ip": "172.29.0.2",
+            "guest_cidr": "172.29.0.2/30",
+            "guest_mac": "06:00:ac:1d:00:02",
+            "tap": "fc00000000",
+            "nft_table": "aap_00000000",
+            "subnet": "172.29.0.0/30",
+        }
+        self.runtime.prepare_prewarm_jail = Mock()
+        self.runtime.wait_for_socket = Mock(
+            side_effect=lambda *_args: self.paths["console"].write_text(
+                "WARM_READY activate_address=172.29.0.2:8081\n", encoding="utf-8"
+            )
+        )
+        self.runtime.lifecycle = Mock()
+        self.runtime.status = Mock(
+            return_value={"id": self.runtime_id, "status": "running", "processAlive": True}
+        )
+
+        result = self.prepare()
+
+        self.assertEqual(result["prewarmState"], "warm")
+        self.runtime.network_manager.setup.assert_called_once()
+        self.runtime.prewarm_activation.probe.assert_called_once_with(
+            "172.29.0.2", 8081, "claim-token"
+        )
+        self.runtime.network_manager.activate.assert_called_once_with(self.runtime_id)
+        register = self.runtime.lifecycle.call_args.args
+        self.assertEqual(register[:2], ("register", self.runtime_id))
+        self.assertIn(str(self.paths["prewarm_placeholder"]), register)
+        self.assertEqual(
+            self.paths["prewarm_token"].read_text(encoding="utf-8"), "claim-token\n"
+        )
+
+    def test_prepare_prewarmer_reserves_network_safety_margin(self) -> None:
+        self.runtime.runtime_store.get.return_value = None
+        self.runtime.network_manager.free_slot_count.return_value = 4
+        with self.assertRaisesRegex(RuntimeFailure, "insufficient network slots"):
+            self.prepare()
+        self.runtime.network_manager.allocate.assert_not_called()
+
+    def test_prepare_prewarmer_rejects_unsafe_token(self) -> None:
+        with self.assertRaisesRegex(RuntimeFailure, "invalid prewarm claim token"):
+            self.runtime.prepare_prewarmer(self.runtime_id, "bad token\n")
+        self.runtime.ensure_host.assert_not_called()
+
+    @patch("runtime.subprocess.Popen")
+    @patch("runtime.os.chmod")
+    @patch("runtime.os.chown")
+    @patch("runtime.run", side_effect=fake_run.__func__)
+    def test_prepare_probe_failure_cleans_process_network_and_secret(
+        self, _run, _chown, _chmod, popen
+    ) -> None:
+        process = Mock(pid=222)
+        process.poll.return_value = None
+        popen.return_value = process
+        self.runtime.runtime_store.get.return_value = None
+        self.runtime.network_manager.free_slot_count.return_value = 5
+        self.runtime.network_manager.allocate.return_value = {
+            "instance_id": self.runtime_id,
+            "status": "reserved",
+            "host_ip": "172.29.0.1",
+            "guest_ip": "172.29.0.2",
+            "guest_cidr": "172.29.0.2/30",
+            "guest_mac": "06:00:ac:1d:00:02",
+            "tap": "fc00000000",
+            "nft_table": "aap_00000000",
+            "subnet": "172.29.0.0/30",
+        }
+        self.runtime.prepare_prewarm_jail = Mock()
+        self.runtime.wait_for_socket = Mock(
+            side_effect=lambda *_args: self.paths["console"].write_text(
+                "WARM_READY activate_address=172.29.0.2:8081\n", encoding="utf-8"
+            )
+        )
+        self.runtime.prewarm_activation.probe.return_value = "activated"
+
+        with self.assertRaisesRegex(RuntimeFailure, "not in the warm state"):
+            self.prepare()
+        self.runtime.terminate_process.assert_called_once_with(process)
+        self.runtime.network_manager.release.assert_called_once_with(self.runtime_id)
+        self.assertFalse(self.paths["prewarm_token"].exists())
+
     @patch("runtime.process_start_ticks", return_value=789)
     @patch("runtime.process_matches", return_value=True)
     @patch("runtime.os.chmod")
