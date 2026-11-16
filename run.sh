@@ -61,6 +61,8 @@ Commands:
   auto-snapshot-smoke-test
                          Verify idle auto-snapshot and delayed stop
   prewarm-smoke-test     Verify blank-guest PATCH hot-swap and one-shot activation
+  prewarm-runtime-smoke-test
+                         Verify Runtime prepare, claim, activation, commit, and cleanup
   control-plane-start    Start the loopback-only API in the Linux VM
   control-plane-stop     Stop the API; running instances remain managed
   control-plane-status   Show whether the API service is running
@@ -467,6 +469,18 @@ smoke_test_prewarm() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/prewarm-smoke-test.sh'"
 }
 
+smoke_test_prewarm_runtime() {
+  sync_repo
+  echo "Building and testing the managed prewarm Runtime path in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/prewarm-runtime-smoke-test.sh'"
+}
+
 control_plane_service() {
   action="$1"
   require_vm_host
@@ -601,6 +615,9 @@ case "${command}" in
     ;;
   prewarm-smoke-test)
     smoke_test_prewarm
+    ;;
+  prewarm-runtime-smoke-test)
+    smoke_test_prewarm_runtime
     ;;
   control-plane-start)
     control_plane_service start

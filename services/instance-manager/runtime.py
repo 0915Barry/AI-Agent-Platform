@@ -748,7 +748,9 @@ class InstanceRuntime:
         config_path.write_text(
             json.dumps(config, separators=(",", ":")) + "\n", encoding="utf-8"
         )
-        os.chmod(config_path, 0o600)
+        # Jailer 降权后由 firecracker 用户读取该文件；配置中不含 Host 凭据，
+        # Token 另存于 Host 私有 0400 文件，因此这里与普通启动路径保持 0644。
+        os.chmod(config_path, 0o644)
 
     def lifecycle(self, *arguments: str, capture: bool = True) -> subprocess.CompletedProcess[str]:
         """调用统一生命周期 CLI，并把子进程错误转换为 RuntimeFailure。"""
@@ -1116,11 +1118,15 @@ class InstanceRuntime:
         if self.runtime_store.get(runtime_id) is not None:
             raise RuntimeFailure(f"prewarm runtime already exists: {runtime_id}")
 
-        uid, gid, _, _ = self.ensure_host()
+        uid, gid, _, gateway_gid = self.ensure_host()
         if self.network_manager.free_slot_count() <= min_free_network_slots:
             raise RuntimeFailure("insufficient network slots for a prewarm runtime")
         paths = self.paths(runtime_id, runtime_id)
         paths["state"].mkdir(parents=True, exist_ok=True, mode=0o700)
+        # 激活后模型网关以 agent-gateway 低权限用户运行。状态目录只开放给
+        # gateway 组穿越；领取 Token 本身仍是 0400 root，不会因此泄露。
+        os.chown(paths["state"], 0, gateway_gid)
+        os.chmod(paths["state"], 0o750)
         paths["prewarm_placeholder"].parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         paths["prewarm_placeholder"].unlink(missing_ok=True)
         run(["truncate", "-s", "1G", str(paths["prewarm_placeholder"])])
@@ -1171,7 +1177,13 @@ class InstanceRuntime:
                 start_new_session=True,
             )
             console_handle.close()
-            self.wait_for_socket(paths["socket"], process)
+            try:
+                self.wait_for_socket(paths["socket"], process)
+            except RuntimeFailure as error:
+                tail = paths["console"].read_text(
+                    encoding="utf-8", errors="replace"
+                )[-8000:]
+                raise RuntimeFailure(f"{error}\n--- prewarm console tail ---\n{tail}") from error
 
             ready = False
             deadline = time.monotonic() + 60
