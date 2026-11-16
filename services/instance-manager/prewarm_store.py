@@ -157,17 +157,20 @@ class PrewarmStore:
         return self._to_dict(row)
 
     def list_ready(self, profile_key: str | None = None) -> list[dict]:
-        """列出可领取项；profile_key 为空时不按规格过滤。"""
+        """列出尚未过期的可领取项；profile_key 为空时不按规格过滤。"""
+        now = int(time.time())
         with self.connect() as connection:
             if profile_key is None:
                 rows = connection.execute(
-                    "SELECT * FROM prewarm_items WHERE status='ready' ORDER BY ready_at,runtime_id"
+                    "SELECT * FROM prewarm_items WHERE status='ready' "
+                    "AND (expires_at IS NULL OR expires_at > ?) ORDER BY ready_at,runtime_id",
+                    (now,),
                 ).fetchall()
             else:
                 rows = connection.execute(
                     "SELECT * FROM prewarm_items WHERE status='ready' AND profile_key=? "
-                    "ORDER BY ready_at,runtime_id",
-                    (profile_key,),
+                    "AND (expires_at IS NULL OR expires_at > ?) ORDER BY ready_at,runtime_id",
+                    (profile_key, now),
                 ).fetchall()
         return [dict(row) for row in rows]
 
