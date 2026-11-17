@@ -1,6 +1,6 @@
 # microVM 预热池设计与实施方案
 
-> 文档状态：阶段 4 核心功能完成，阶段 5 故障与并发验证完成，尚未允许生产启用。
+> 文档状态：阶段 5 故障与并发验证完成，阶段 6 实施方案已明确、代码尚未开始，尚未允许生产启用。
 >
 > 当前进度日期：2026-11-17。
 >
@@ -589,7 +589,16 @@ prewarm_fallback_cold_total
 prewarm_orphan_cleanup_total
 prewarm_prepare_seconds
 prewarm_activate_seconds
+instance_start_seconds{strategy="cold|prewarm"}
+prewarm_rollout_eligible_total
+prewarm_hit_total
+prewarm_miss_total
+prewarm_compensation_total{classification="..."}
 ```
+
+阶段 6 性能测试必须保留原始样本，运行期指标只用于观察趋势，不能替代可复算的 JSONL/CSV
+验收数据。指标标签不得包含 `user_id`、`logical_instance_id` 等高基数字段；具体实例诊断继续写入
+结构化日志。
 
 ## 15. 分阶段实施
 
@@ -678,12 +687,194 @@ prewarm_activate_seconds
 
 ### 阶段 6：性能验收与灰度
 
-- 同一环境采集冷启动与预热命中各至少 30 个样本；
-- 分别统计实例准备、Pi 就绪、历史展示和模型首字；
-- 先对测试用户灰度，再逐步提高池大小；
-- 保留即时关闭开关和冷启动兜底。
+阶段 6 不再增加新的资源状态，而是回答三个问题：预热到底节省多少用户等待时间、额外占用多少
+Host 资源，以及出现性能或正确性异常时能否立即停止新的预热领取。实施顺序固定为“统一计时 →
+A/B 测试 → 性能判定 → 灰度控制 → 关闭与回滚”，不能在计时口径不一致时直接宣称性能提升。
 
-初始目标：预热命中时实例准备耗时 P95 相比冷启动降低至少 40%，且不以牺牲正确性和资源清理为代价。
+#### 阶段 6.1：冻结指标与统一计时
+
+冷启动当前已有 `startupTiming.totalMs` 和 Host/Guest 分阶段计时，但预热领取路径尚未返回等价
+结构。首先由 `StartupCoordinator` 统一记录一次启动操作的端到端时间，内部阶段由
+`InstanceRuntime` 和 `PrewarmManager` 提供。冷启动和预热必须采用相同起止边界：
+
+```text
+开始：Control Plane 已取得实例锁，准备选择启动策略
+结束：业务实例已置为 running，启动操作已提交，Pi RPC 可以连接
+```
+
+同时保留测试客户端围绕 `POST /start` 测得的 `clientObservedMs`，用于发现 HTTP、锁竞争和
+序列化开销。两种策略统一返回以下结构：
+
+```json
+{
+  "strategy": "cold | prewarm",
+  "totalMs": 0,
+  "phases": {
+    "decisionMs": 0,
+    "claimMs": 0,
+    "volumePrepareMs": 0,
+    "gatewayReadyMs": 0,
+    "drivePatchMs": 0,
+    "guestActivateMs": 0,
+    "piRpcReadyMs": 0,
+    "commitMs": 0
+  }
+}
+```
+
+不适用于某一策略的阶段可以省略，但不能用不同起止点生成同名 `totalMs`。启动响应还必须明确
+返回实际使用的 `strategy`，性能脚本不能仅根据开关配置推断是否命中预热。
+
+阶段 6 指标分为三层：
+
+| 指标 | 定义 | 用途 |
+|---|---|---|
+| 实例准备耗时 | `POST /start` 到 `running + Pi RPC ready` | 主要验收指标 |
+| 历史展示耗时 | 打开会话到历史消息可显示 | 辅助体验指标，与 Session/缓存有关 |
+| 模型首字耗时 | 提交消息到收到第一个 `message.delta` | 辅助体验指标，受外部模型和网络影响 |
+
+历史展示和模型首字不得计入“预热至少提升 40%”的主结论。模型首字需要使用真实 SSE
+`message.delta`，不能把 `model_started` 当作首字。
+
+验收：冷启动和预热启动响应均包含可解析的策略、统一总耗时和分阶段计时；现有 CLI、冷启动、
+快照、预热和 100 轮压力回归保持通过。
+
+#### 阶段 6.2：开发可重复的 A/B 性能测试
+
+新增独立命令，例如：
+
+```bash
+./run.sh prewarm-performance-test 30
+```
+
+测试必须使用独立的数据库、状态目录、Control Plane 端口、Worker 锁和日志，拒绝与长期运行服务
+共享 `/var/lib/fc/control-plane.db`。测试步骤如下：
+
+1. 记录代码提交、rootfs Build ID、内核、Firecracker 版本、CPU、内存和预热配置；
+2. 创建固定测试用户、逻辑实例和持久数据盘，避免把首次创建数据盘混入某一组；
+3. 分别执行至少 5 轮不计入结果的预热样本，使文件缓存和服务初始化趋于稳定；
+4. 冷启动和预热命中各采集至少 30 个有效样本；
+5. 按 `cold → prewarm → prewarm → cold` 或等价交错顺序执行，避免时间漂移偏向某组；
+6. 预热样本开始计时前必须确认存在兼容 `ready` 项，后台准备时间不计入用户请求耗时；
+7. 每次响应必须核对实际 `strategy`，池空回退样本不能混入预热命中集合；
+8. 每轮结束后停止实例并检查 binding、attachment、租约、TAP、nftables、Jailer 和占位盘；
+9. 保存所有原始样本，再生成汇总；禁止只保存最后的 P95 数字。
+
+建议输出：
+
+```text
+/var/lib/fc/prewarm-performance/
+├── samples.jsonl
+├── summary.json
+├── environment.json
+├── control-plane.log
+└── worker.log
+```
+
+每条样本至少保存 `sampleId/strategy/success/clientObservedMs/totalMs/phases/runtimeId/timestamp`。
+环境报告还要记录补出一台 `ready` 的后台准备耗时、空闲预热 VMM 的 RSS/PSS、补池前后 Host
+可用内存和占用的网络槽位，用于说明性能收益对应的资源成本。
+失败样本不得静默删除；只有明确标记为环境无效并记录原因后才能补采。
+
+验收：脚本可重复运行，冷启动与预热各产生不少于 30 个有效样本，原始数据可重新计算全部汇总，
+测试退出后无资源残留。
+
+#### 阶段 6.3：性能与正确性判定
+
+P95 使用固定算法：将有效样本升序排列，取 `ceil(0.95 × N)` 对应的样本；同时报告 P50、P95、
+最大值、均值、标准差、成功率和策略回退率。不得仅比较平均值，也不得在没有说明的情况下剔除
+慢样本。
+
+初始通过条件：
+
+- `prewarm P95 <= cold P95 × 0.60`，即实例准备耗时至少降低 40%；
+- 冷启动和预热启动成功率均为 100%；
+- 预热命中样本的实际策略均为 `prewarm`；
+- 池空时立即走 `cold`，不能等待正在 `preparing` 的 Guest；
+- 测试结束后无 binding、attachment、租约、TAP、nftables、Jailer、Sidecar 和占位盘残留；
+- Worker 始终遵守内存和网络保底，不因追求命中率突破容量边界。
+
+报告必须单列“每台空闲预热机资源成本”和按 `target_ready` 推算的 Host 容量影响；即使启动 P95
+达标，也不能省略常驻内存、网络槽位和后台补池 CPU/I/O 成本。
+
+如果未达到 40%，先根据 phases 判断瓶颈是在数据盘检查、模型网关、drive PATCH、Guest 激活还是
+提交阶段，不允许通过删除必要安全检查来换取通过。
+
+#### 阶段 6.4：增加可控灰度策略
+
+当前 `PREWARM_ENABLED` 是全局开关，不能直接满足“只对测试用户开启”。灰度前增加独立的领取
+策略配置，建议至少包括：
+
+```text
+PREWARM_ALLOWED_USER_IDS=
+PREWARM_ROLLOUT_PERCENT=100
+```
+
+决策顺序为：总开关关闭时禁止领取；Allowlist 命中时允许领取；其余用户根据稳定哈希落入
+`ROLLOUT_PERCENT`。哈希输入使用稳定 `user_id`，不能逐请求随机，保证同一用户在同一灰度比例下
+行为稳定。该字段缺失时按 `100` 处理，以保持现有测试和显式开启预热后的兼容语义；进行
+Allowlist 灰度时必须显式设置为 `0`。灰度未命中、池为空或容量不足都立即走现有冷启动，不向
+用户暴露新的 API 语义。仓库默认配置仍保持总开关 `PREWARM_ENABLED=0`。
+
+灰度日志和指标至少包含：
+
+- eligible、hit、miss、cold fallback 数量；
+- 激活失败、补偿和资源清理失败数量；
+- 当前 `ready/preparing/claiming/assigned` 数量；
+- Host 可用内存和空闲网络槽位；
+- 按策略分组的启动 P50/P95。
+
+验收：Allowlist 用户可以命中预热，非 Allowlist 用户保持冷启动；百分比决策稳定且边界值
+`0/100` 正确；任何灰度用户都不能绕过单用户配额和数据盘独占。
+
+#### 阶段 6.5：实现动态关闭与回滚
+
+Worker 已支持配置热重载，但 Control Plane 当前只在启动时读取一次 `prewarm.env`。因此现有
+`PREWARM_ENABLED=0` 还不是完整的即时关闭开关。应把领取策略封装为可按文件 mtime 安全重载的
+共享配置，或提供等价的原子策略快照；配置解析失败时保留上一份有效配置并报警，不能进入半更新状态。
+
+关闭后的不变量：
+
+```text
+新请求不再领取 ready
+→ Worker停止补池并drain公共ready/preparing
+→ 已进入claiming的操作继续提交或补偿
+→ assigned用户实例继续运行
+→ 池空后的新请求全部冷启动
+```
+
+增加真实回滚 smoke test：运行 Control Plane 和 Worker，先确认测试用户命中预热，再动态把开关
+改为 `0`，验证后续请求实际策略为 `cold`、公共池最终清空、已运行预热实例不被停止且资源无残留。
+
+验收：无需重启 Control Plane 即可停止新的预热领取；关闭动作不会打断已分配用户实例；重新开启
+后 Worker 能按目标安全补池。
+
+#### 阶段 6.6：灰度推进与最终验收
+
+灰度按以下顺序推进，每一级都必须满足性能门槛和零正确性事故后才能升级：
+
+```text
+隔离测试环境
+→ Allowlist测试用户
+→ 5%
+→ 20%
+→ 50%
+→ 100%
+```
+
+每一级至少观察 24 小时且取得不少于 100 次有效启动；测试流量不足时以两项条件都满足为准。
+以下任一条件触发立即回滚到 `PREWARM_ENABLED=0`：
+
+- 数据盘双挂、绑定冲突或跨用户数据风险；
+- 孤儿 VMM、TAP、nftables、Sidecar 或网络租约持续存在；
+- 激活/补偿失败率超过预设阈值；
+- Host 内存或网络保底被突破；
+- 预热 P95 连续两个观察窗口不优于冷启动；
+- 冷启动兜底异常。
+
+最终交付物包括原始性能样本、汇总报告、环境信息、灰度记录、回滚演练记录和生产默认配置。
+只有完成动态关闭演练、性能门槛、资源清理检查和至少一轮灰度观察后，才允许讨论把生产环境的
+`PREWARM_ENABLED` 从 `0` 改为 `1`。
 
 ## 16. 文件规划
 
@@ -698,18 +889,20 @@ prewarm_activate_seconds
 | `services/instance-manager/prewarm_worker_lock.py` | 已实现，单 Host Worker 进程锁 |
 | `services/instance-manager/prewarm_claim_audit.py` | 已实现，超时领取只读分类 |
 | `services/instance-manager/prewarm_claim_compensation.py` | 已实现，四类超时补偿（回滚×3 + 向前修复×1） |
-| `services/instance-manager/startup_coordinator.py` | 已实现并接入 Control Plane 启动路径 |
+| `services/instance-manager/startup_coordinator.py` | 已实现启动仲裁；阶段 6 增加冷启动/预热统一计时 |
 | `services/instance-manager/prewarm_activation.py` | 已实现，Host 激活协议客户端 |
 | `services/instance-manager/runtime_store.py` | 已实现 `volume_attachments`、绑定和代次约束 |
 | `services/instance-manager/network_manager.py` | 增加快照槽位保留及预热容量查询 |
-| `services/control-plane/server.py` | 只接 StartupCoordinator，不内嵌池细节 |
+| `services/control-plane/server.py` | 已接 StartupCoordinator；阶段 6 接入灰度策略热重载与统一计时响应 |
 | `scripts/guest/agent-init.sh` | 已有预热分支，后续只做必要修正 |
 | `scripts/guest/prewarm-activate.sh` | 已有技术探针实现，固化协议与安全检查 |
 | `scripts/linux/prewarm-smoke-test.sh` | 已有底层探针，后续保留为专项测试 |
 | `scripts/linux/prewarm-worker-smoke-test.sh` | 已实现，真实单轮自动补池验收 |
 | `scripts/linux/prewarm-worker-service.sh` | 已实现，手动管理 Worker 服务 |
 | `scripts/linux/prewarm-worker-*-smoke-test.sh` | 已实现，补池、协调、健康、锁、服务和热重载验收 |
-| `config/prewarm.env` | 已有，默认关闭 |
+| `scripts/linux/prewarm-performance-test.sh` | 阶段 6 新增，冷启动/预热 A/B 样本采集与汇总 |
+| `scripts/linux/prewarm-rollout-smoke-test.sh` | 阶段 6 新增，Allowlist、动态关闭与回滚验收 |
+| `config/prewarm.env` | 已有且默认关闭；阶段 6 增加 Allowlist 与灰度比例 |
 
 ## 17. 发布、关闭与回滚
 
@@ -738,7 +931,7 @@ PREWARM_ENABLED=0
 ### 18.1 当前可用状态
 
 - 开发分支：`prewarm-pool`；
-- 当前功能基线提交：`0a63a77`（阶段 5 完成，下一项阶段 6）；
+- 当前阶段 5 功能基线：`0290a06`（100 轮领取、停止和补位压力验收）；
 - 总开关：`config/prewarm.env` 中 `PREWARM_ENABLED=0`，不得直接改为生产默认开启；
 - 阶段 0、1、2、2A、3、4、5 已完成；
 - 阶段 5 已完成四类超时补偿（回滚×3 + 向前修复×1）和 100 轮「领取/停止/补位」压力验收；
@@ -754,7 +947,18 @@ PREWARM_ENABLED=0
 - `activation_timeout`（`prewarm-activation-timeout-smoke-test`）：完整回滚，额外释放 `attached` 附件 + 删除 `binding`；
 - `commit_pending`（`prewarm-commit-pending-smoke-test`）：向前修复，只补 `mark_assigned` + `mark_succeeded`，不停 VMM。
 
-下一步是阶段 6 性能验收与灰度：同一环境采集冷启动与预热命中各至少 30 个样本，分别统计实例准备、Pi 就绪、历史展示和模型首字；初始目标为预热命中时实例准备耗时 P95 相比冷启动降低至少 40%。先对测试用户灰度，再逐步提高池大小，并保留即时关闭开关和冷启动兜底。
+下一步执行阶段 6.1“统一计时”，暂不直接运行 30+30 性能样本：
+
+1. 在 `StartupCoordinator` 记录冷启动和预热启动相同边界的 `totalMs`；
+2. 在预热激活路径增加领取、数据盘准备、模型网关、drive PATCH、Guest 激活和提交计时；
+3. 启动响应明确返回 `strategy=cold|prewarm`，不让测试脚本猜测是否命中；
+4. 保留现有冷启动 Host/Guest 计时，并映射到统一结构；
+5. 补充 fake Runtime 单元测试，验证计时字段、策略和异常路径；
+6. 运行现有 CLI、预热 Control Plane 和压力回归，确认诊断字段不会改变生命周期语义。
+
+阶段 6.1 通过后再实现 `prewarm-performance-test`。在 A/B 数据证明达到 P95 门槛之前，不开始
+生产灰度；在 Control Plane 支持动态策略重载之前，不把 `PREWARM_ENABLED=0` 描述为完整的
+即时关闭能力。
 
 ### 18.3 接手后的基础检查
 
@@ -767,6 +971,7 @@ python3 -m unittest discover \
 ./run.sh prewarm-worker-reconcile-smoke-test
 ./run.sh prewarm-worker-health-smoke-test
 ./run.sh prewarm-worker-reload-smoke-test
+./run.sh prewarm-pressure-test 3
 ```
 
 继续开发前应确认长期运行的 Control Plane 和 Prewarm Worker 已停止，避免专项 smoke test 与正式
