@@ -174,6 +174,36 @@ class PrewarmStore:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def capacity_counts(self, profile_key: str) -> dict[str, int]:
+        """返回 Worker 计算补池数量所需的同一时刻状态快照。
+
+        已过期的 ``ready`` 项不能再被领取，因此不计入 ``claimable_ready``；但在
+        Worker 真正清理它以前仍占用 VMM 和网络槽位，所以继续计入 ``ready_total``。
+        两个口径必须分开，否则可能提前突破 ``max_total``。
+        """
+        now = int(time.time())
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status='preparing' THEN 1 ELSE 0 END) AS preparing,
+                    SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END) AS ready_total,
+                    SUM(CASE WHEN status='ready'
+                              AND (expires_at IS NULL OR expires_at > ?)
+                             THEN 1 ELSE 0 END) AS claimable_ready,
+                    SUM(CASE WHEN status='claiming' THEN 1 ELSE 0 END) AS claiming
+                FROM prewarm_items
+                WHERE profile_key=?
+                """,
+                (now, profile_key),
+            ).fetchone()
+        return {
+            "preparing": int(row["preparing"] or 0),
+            "ready_total": int(row["ready_total"] or 0),
+            "claimable_ready": int(row["claimable_ready"] or 0),
+            "claiming": int(row["claiming"] or 0),
+        }
+
     def mark_ready(
         self,
         runtime_id: str,
