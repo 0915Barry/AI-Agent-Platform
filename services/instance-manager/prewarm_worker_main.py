@@ -13,6 +13,11 @@ from prewarm_capacity import LinuxHostCapacityProbe
 from prewarm_config import DEFAULT_CONFIG_PATH, PrewarmConfig
 from prewarm_store import PrewarmStore
 from prewarm_worker import PrewarmWorker
+from prewarm_worker_lock import (
+    DEFAULT_LOCK_PATH,
+    PrewarmWorkerLock,
+    WorkerAlreadyRunning,
+)
 from prewarm_worker_loop import PrewarmWorkerLoop
 from runtime import InstanceRuntime
 
@@ -30,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     parser.add_argument("--prewarm-config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--profile-key", default=DEFAULT_PROFILE_KEY)
+    parser.add_argument("--lock-file", type=Path, default=DEFAULT_LOCK_PATH)
     parser.add_argument("--max-backoff", type=int, default=60)
     parser.add_argument(
         "--once",
@@ -44,50 +50,60 @@ def run(
     *,
     runtime_factory: Callable[..., InstanceRuntime] = InstanceRuntime,
     capacity_probe_factory: Callable[..., LinuxHostCapacityProbe] = LinuxHostCapacityProbe,
+    lock_factory: Callable[[Path], PrewarmWorkerLock] = PrewarmWorkerLock,
     emit: Callable[[str], None] | None = None,
 ) -> int:
     output = emit or (lambda message: print(message, flush=True))
-    config = PrewarmConfig.from_file(args.prewarm_config)
-    runtime = runtime_factory(
-        state_root=args.state_root,
-        state_database=args.database,
-    )
-    worker = PrewarmWorker(
-        config,
-        prewarm_store=PrewarmStore(args.database),
-        profile_key=args.profile_key,
-        builder=runtime,
-        capacity_probe=capacity_probe_factory(runtime.network_manager),
-    )
-    loop = PrewarmWorkerLoop(
-        worker,
-        interval_seconds=config.health_interval_seconds,
-        max_backoff_seconds=args.max_backoff,
-        emit=output,
-    )
-    output(
-        "PREWARM_WORKER_READY "
-        f"enabled={int(config.enabled)} profile={args.profile_key} "
-        f"target={config.target_ready} max={config.max_total} "
-        f"interval={config.health_interval_seconds}s mode={'once' if args.once else 'loop'}"
-    )
-    if args.once:
-        reconciliation = loop.reconcile_once()
-        if not reconciliation.success:
-            return 1
-        cycle = loop.run_once()
-        return 0 if cycle.success else 1
+    lock = lock_factory(args.lock_file)
+    try:
+        lock.acquire()
+    except WorkerAlreadyRunning:
+        output(f"PREWARM_WORKER_ALREADY_RUNNING lock={args.lock_file}")
+        return 2
+    try:
+        config = PrewarmConfig.from_file(args.prewarm_config)
+        runtime = runtime_factory(
+            state_root=args.state_root,
+            state_database=args.database,
+        )
+        worker = PrewarmWorker(
+            config,
+            prewarm_store=PrewarmStore(args.database),
+            profile_key=args.profile_key,
+            builder=runtime,
+            capacity_probe=capacity_probe_factory(runtime.network_manager),
+        )
+        loop = PrewarmWorkerLoop(
+            worker,
+            interval_seconds=config.health_interval_seconds,
+            max_backoff_seconds=args.max_backoff,
+            emit=output,
+        )
+        output(
+            "PREWARM_WORKER_READY "
+            f"enabled={int(config.enabled)} profile={args.profile_key} "
+            f"target={config.target_ready} max={config.max_total} "
+            f"interval={config.health_interval_seconds}s mode={'once' if args.once else 'loop'}"
+        )
+        if args.once:
+            reconciliation = loop.reconcile_once()
+            if not reconciliation.success:
+                return 1
+            cycle = loop.run_once()
+            return 0 if cycle.success else 1
 
-    stop_signal = threading.Event()
+        stop_signal = threading.Event()
 
-    def request_stop(_signum, _frame) -> None:
-        stop_signal.set()
+        def request_stop(_signum, _frame) -> None:
+            stop_signal.set()
 
-    signal.signal(signal.SIGTERM, request_stop)
-    signal.signal(signal.SIGINT, request_stop)
-    loop.run(stop_signal)
-    output("PREWARM_WORKER_STOPPED")
-    return 0
+        signal.signal(signal.SIGTERM, request_stop)
+        signal.signal(signal.SIGINT, request_stop)
+        loop.run(stop_signal)
+        output("PREWARM_WORKER_STOPPED")
+        return 0
+    finally:
+        lock.release()
 
 
 def main() -> None:

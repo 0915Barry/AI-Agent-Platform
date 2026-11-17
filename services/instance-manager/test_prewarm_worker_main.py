@@ -9,6 +9,7 @@ from pathlib import Path
 from prewarm_capacity import HostCapacity
 from prewarm_store import PrewarmStore
 from prewarm_worker_main import build_parser, run
+from prewarm_worker_lock import PrewarmWorkerLock
 
 
 class FakeNetworkManager:
@@ -73,6 +74,7 @@ class PrewarmWorkerMainTests(unittest.TestCase):
             state_root=self.root,
             prewarm_config=self.config,
             profile_key="profile-test",
+            lock_file=self.root / "worker.lock",
             max_backoff=30,
             once=True,
         )
@@ -112,6 +114,22 @@ class PrewarmWorkerMainTests(unittest.TestCase):
         )
         self.assertEqual(result, 0)
         self.assertEqual(FakeRuntime.instances[0].prepared, [])
+
+    def test_held_lock_rejects_second_entry_before_runtime_creation(self) -> None:
+        messages: list[str] = []
+        with PrewarmWorkerLock(self.root / "worker.lock"):
+            result = run(
+                self.args(),
+                runtime_factory=FakeRuntime,
+                capacity_probe_factory=FakeCapacityProbe,
+                emit=messages.append,
+            )
+        self.assertEqual(result, 2)
+        self.assertEqual(FakeRuntime.instances, [])
+        self.assertEqual(
+            messages,
+            [f"PREWARM_WORKER_ALREADY_RUNNING lock={self.root / 'worker.lock'}"],
+        )
 
 
 if __name__ == "__main__":
