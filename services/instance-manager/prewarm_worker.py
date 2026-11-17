@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
+from prewarm_capacity import HostCapacity
 from prewarm_config import PrewarmConfig
 from prewarm_store import PrewarmStore
 
@@ -34,6 +35,10 @@ class PrewarmBuilder(Protocol):
     ) -> dict: ...
 
     def destroy(self, instance_id: str, *, preserve_volume: bool = True) -> None: ...
+
+
+class CapacityProbe(Protocol):
+    def snapshot(self) -> HostCapacity: ...
 
 
 @dataclass(frozen=True)
@@ -66,6 +71,7 @@ class PrewarmWorker:
         prewarm_store: PrewarmStore,
         profile_key: str,
         builder: PrewarmBuilder | None = None,
+        capacity_probe: CapacityProbe | None = None,
         host_id: str | None = None,
         new_runtime_id: Callable[[], str] | None = None,
         new_claim_token: Callable[[], str] | None = None,
@@ -74,6 +80,7 @@ class PrewarmWorker:
         self.prewarm_store = prewarm_store
         self.profile_key = profile_key
         self.builder = builder
+        self.capacity_probe = capacity_probe
         self.host_id = host_id or socket.gethostname()
         self._new_runtime_id = new_runtime_id or (
             lambda: f"prewarm-{uuid.uuid4().hex[:20]}"
@@ -164,6 +171,16 @@ class PrewarmWorker:
             item = self.prepare_one()
             created.append(str(item["runtime_id"]))
         return FillResult(plan=plan, created_runtime_ids=tuple(created))
+
+    def fill_once_from_host(self) -> FillResult:
+        """读取一次真实 Host 容量快照并执行单轮补池。"""
+        if self.capacity_probe is None:
+            raise PrewarmWorkerError("prewarm capacity probe is not configured")
+        capacity = self.capacity_probe.snapshot()
+        return self.fill_once(
+            available_mib=capacity.available_mib,
+            free_network_slots=capacity.free_network_slots,
+        )
 
     def plan_fill(self, *, available_mib: int, free_network_slots: int) -> FillPlan:
         """计算本轮创建数，不写数据库、不启动 microVM。

@@ -7,11 +7,21 @@ import hashlib
 from pathlib import Path
 
 from prewarm_config import PrewarmConfig
+from prewarm_capacity import HostCapacity
 from prewarm_store import PrewarmStore
 from prewarm_worker import PrewarmWorker, PrewarmWorkerError
 
 
 class PrewarmWorkerTests(unittest.TestCase):
+    class FakeCapacityProbe:
+        def __init__(self, available_mib: int, free_network_slots: int) -> None:
+            self.capacity = HostCapacity(available_mib, free_network_slots)
+            self.calls = 0
+
+        def snapshot(self) -> HostCapacity:
+            self.calls += 1
+            return self.capacity
+
     class FakeBuilder:
         def __init__(self) -> None:
             self.fail_prepare = False
@@ -47,7 +57,13 @@ class PrewarmWorkerTests(unittest.TestCase):
         self.runtime_index += 1
         return f"prewarm-test-{self.runtime_index}"
 
-    def worker(self, *, with_builder: bool = False, **overrides: str) -> PrewarmWorker:
+    def worker(
+        self,
+        *,
+        with_builder: bool = False,
+        capacity_probe=None,
+        **overrides: str,
+    ) -> PrewarmWorker:
         values = {
             "PREWARM_ENABLED": "1",
             "PREWARM_TARGET_READY": "2",
@@ -62,6 +78,7 @@ class PrewarmWorkerTests(unittest.TestCase):
             prewarm_store=self.store,
             profile_key="profile-a",
             builder=self.builder if with_builder else None,
+            capacity_probe=capacity_probe,
             host_id="host-test",
             new_runtime_id=self.next_runtime_id,
             new_claim_token=lambda: "raw-claim-token",
@@ -232,6 +249,20 @@ class PrewarmWorkerTests(unittest.TestCase):
         self.assertEqual(len(self.builder.prepared), 2)
         self.assertEqual(self.store.get("prewarm-test-1")["status"], "ready")
         self.assertEqual(self.store.get("prewarm-test-2")["status"], "error")
+
+    def test_fill_once_from_host_uses_capacity_probe(self) -> None:
+        probe = self.FakeCapacityProbe(4096, 3)
+        result = self.worker(
+            with_builder=True,
+            capacity_probe=probe,
+        ).fill_once_from_host()
+        self.assertEqual(probe.calls, 1)
+        self.assertEqual(result.plan.create_count, 1)
+        self.assertEqual(result.created_runtime_ids, ("prewarm-test-1",))
+
+    def test_fill_once_from_host_requires_probe(self) -> None:
+        with self.assertRaisesRegex(PrewarmWorkerError, "probe is not configured"):
+            self.worker(with_builder=True).fill_once_from_host()
 
 
 if __name__ == "__main__":
