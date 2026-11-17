@@ -8,9 +8,18 @@ from prewarm_worker_loop import PrewarmWorkerLoop
 
 
 class FakeWorker:
-    def __init__(self, outcomes) -> None:
+    def __init__(self, outcomes, *, retired=(), reap_error=None) -> None:
         self.outcomes = list(outcomes)
+        self.retired = tuple(retired)
+        self.reap_error = reap_error
         self.calls = 0
+        self.reap_calls = 0
+
+    def reap_expired_ready(self) -> tuple[str, ...]:
+        self.reap_calls += 1
+        if self.reap_error is not None:
+            raise self.reap_error
+        return self.retired
 
     def fill_once_from_host(self) -> FillResult:
         outcome = self.outcomes[min(self.calls, len(self.outcomes) - 1)]
@@ -59,6 +68,36 @@ class PrewarmWorkerLoopTests(unittest.TestCase):
         self.assertEqual(cycle.created_runtime_ids, ("runtime-1",))
         self.assertIn("status=ok", messages[0])
         self.assertIn("created=1", messages[0])
+
+    def test_cycle_reaps_expired_items_before_filling(self) -> None:
+        messages: list[str] = []
+        worker = FakeWorker(
+            [fill_result("runtime-new")],
+            retired=("runtime-old",),
+        )
+        loop = PrewarmWorkerLoop(worker, interval_seconds=5, emit=messages.append)
+        cycle = loop.run_once()
+        self.assertTrue(cycle.success)
+        self.assertEqual(cycle.retired_runtime_ids, ("runtime-old",))
+        self.assertEqual(cycle.created_runtime_ids, ("runtime-new",))
+        self.assertEqual(worker.reap_calls, 1)
+        self.assertEqual(worker.calls, 1)
+        self.assertIn("retired=1", messages[0])
+
+    def test_reap_failure_prevents_fill_and_enters_backoff(self) -> None:
+        worker = FakeWorker(
+            [fill_result("must-not-start")],
+            reap_error=RuntimeError("retire failed"),
+        )
+        loop = PrewarmWorkerLoop(
+            worker,
+            interval_seconds=5,
+            emit=lambda _message: None,
+        )
+        cycle = loop.run_once()
+        self.assertFalse(cycle.success)
+        self.assertEqual(cycle.next_delay_seconds, 5)
+        self.assertEqual(worker.calls, 0)
 
     def test_failures_back_off_exponentially_and_cap(self) -> None:
         worker = FakeWorker([RuntimeError("host unavailable")])

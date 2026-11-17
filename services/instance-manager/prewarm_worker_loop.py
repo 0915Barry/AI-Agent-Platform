@@ -9,6 +9,8 @@ from prewarm_worker import FillResult
 
 
 class FillTarget(Protocol):
+    def reap_expired_ready(self) -> tuple[str, ...]: ...
+
     def fill_once_from_host(self) -> FillResult: ...
 
 
@@ -23,6 +25,7 @@ class WorkerCycle:
     success: bool
     next_delay_seconds: int
     created_runtime_ids: tuple[str, ...] = ()
+    retired_runtime_ids: tuple[str, ...] = ()
     reason: str = ""
     error: str | None = None
 
@@ -51,6 +54,7 @@ class PrewarmWorkerLoop:
     def run_once(self) -> WorkerCycle:
         """执行一轮并返回下次等待时间；异常不穿透后台主循环。"""
         try:
+            retired_runtime_ids = self.worker.reap_expired_ready()
             result = self.worker.fill_once_from_host()
         except Exception as error:
             self.consecutive_failures += 1
@@ -77,12 +81,13 @@ class PrewarmWorkerLoop:
             success=True,
             next_delay_seconds=self.interval_seconds,
             created_runtime_ids=result.created_runtime_ids,
+            retired_runtime_ids=retired_runtime_ids,
             reason=result.plan.reason,
         )
         self.emit(
             "PREWARM_WORKER_CYCLE status=ok "
             f"reason={result.plan.reason} planned={result.plan.create_count} "
-            f"created={len(result.created_runtime_ids)} "
+            f"retired={len(retired_runtime_ids)} created={len(result.created_runtime_ids)} "
             f"next_delay={self.interval_seconds}s"
         )
         return cycle
