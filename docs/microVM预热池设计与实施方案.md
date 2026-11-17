@@ -4,7 +4,7 @@
 >
 > 当前进度日期：2026-11-17。
 >
-> 当前结论：数据库状态机、数据盘独占、真实 Runtime 接管、Control Plane 启停清理和自动补池 Worker 已经落地。Worker 已具备容量守卫、TTL 回收、稳态健康检查、重启协调、缩容、配置热重载、单进程锁和独立服务管理；超时领取已完成只读分类，并对尚未确认挂载的 `pre_attach_timeout` 与 `reserved_timeout` 启用安全补偿，两者均已通过真实 smoke test（`prewarm-claim-compensation-smoke-test` / `prewarm-reserved-timeout-smoke-test`）。其余故障分类（`activation_timeout`/`commit_pending`）的补偿策略和阶段 5 压力验收尚未完成。预热功能继续默认关闭。
+> 当前结论：数据库状态机、数据盘独占、真实 Runtime 接管、Control Plane 启停清理和自动补池 Worker 已经落地。Worker 已具备容量守卫、TTL 回收、稳态健康检查、重启协调、缩容、配置热重载、单进程锁和独立服务管理；超时领取已完成只读分类，并对 `pre_attach_timeout`、`reserved_timeout`、`activation_timeout` 三类启用安全补偿（分别通过 `prewarm-claim-compensation-smoke-test` / `prewarm-reserved-timeout-smoke-test` / `prewarm-activation-timeout-smoke-test`）。剩余 `commit_pending` 的补偿策略和阶段 5 压力验收尚未完成。预热功能继续默认关闭。
 
 ## 1. 目标与边界
 
@@ -742,17 +742,15 @@ PREWARM_ENABLED=0
 
 ### 18.2 下一项开发任务
 
-已完成「尚未确认挂载」两类的安全补偿，并各自通过真实 smoke test：
+已完成三类超时领取的安全补偿，并各自通过真实 smoke test：
 
 - `pre_attach_timeout`（`prewarm-claim-compensation-smoke-test`）：停 VMM → 销毁 → 退休，op 置 `failed`；
-- `reserved_timeout`（`prewarm-reserved-timeout-smoke-test`）：在上述基础上额外释放 `reserved` 附件锁。
+- `reserved_timeout`（`prewarm-reserved-timeout-smoke-test`）：额外释放 `reserved` 附件锁；
+- `activation_timeout`（`prewarm-activation-timeout-smoke-test`）：完整回滚，额外释放 `attached` 附件 + 删除 `binding`。
 
-两者都在「确认挂载」之前，统一由 `PreActivationClaimCompensator` 回滚；`activation_timeout` / `commit_pending` 仍只分类、不自动补偿。
+前两类由 `PreActivationClaimCompensator` 回滚，第三类由 `ActivationTimeoutClaimCompensator` 回滚；`commit_pending` 仍只分类、不自动补偿。
 
-下一步按风险从低到高继续设计 `activation_timeout` 和 `commit_pending` 的补偿。
-它们已经确认挂载用户盘（或已提交），不能复用上面的「直接停止并释放」逻辑：
-`activation_timeout` 是完整回滚（停 VMM → 释放 attached 附件 → 删 binding → 退休），
-`commit_pending` 更接近成功，需要判断业务实例是否已 `running` 来决定向前修复还是人工介入。
+下一步是最后一个分类 `commit_pending` 的补偿。它已经「绑定 running、就差 item 置 assigned」，最接近成功，不能复用回滚逻辑：需要判断业务实例是否已 `running`——是则向前修复（直接 `mark_assigned` 补完提交），否则说明 CP 在置 running 前就死了，需要人工介入或谨慎回滚。
 
 ### 18.3 接手后的基础检查
 
