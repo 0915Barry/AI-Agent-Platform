@@ -69,6 +69,8 @@ Commands:
                          Verify Worker --once automatic real prewarm and cleanup
   prewarm-worker-reconcile-smoke-test
                          Verify Worker restart reconcile and automatic replenishment
+  prewarm-worker-lock-smoke-test
+                         Verify the real Worker process lock and clean rejection
   control-plane-start    Start the loopback-only API in the Linux VM
   control-plane-stop     Stop the API; running instances remain managed
   control-plane-status   Show whether the API service is running
@@ -523,6 +525,18 @@ smoke_test_prewarm_worker_reconcile() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/prewarm-worker-reconcile-smoke-test.sh'"
 }
 
+smoke_test_prewarm_worker_lock() {
+  sync_repo
+  echo "Testing the real prewarm Worker process lock in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prewarm-worker-lock-smoke-test.sh'"
+}
+
 control_plane_service() {
   action="$1"
   require_vm_host
@@ -669,6 +683,9 @@ case "${command}" in
     ;;
   prewarm-worker-reconcile-smoke-test)
     smoke_test_prewarm_worker_reconcile
+    ;;
+  prewarm-worker-lock-smoke-test)
+    smoke_test_prewarm_worker_lock
     ;;
   control-plane-start)
     control_plane_service start
