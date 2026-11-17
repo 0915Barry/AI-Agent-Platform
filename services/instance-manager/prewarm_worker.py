@@ -73,6 +73,14 @@ class ReconcileResult:
     retired_runtime_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class HealthResult:
+    """一次稳态 ready 进程健康检查结果。"""
+
+    healthy_runtime_ids: tuple[str, ...]
+    retired_runtime_ids: tuple[str, ...]
+
+
 class PrewarmWorker:
     """根据配置、数据库状态和 Host 容量计算补池数量。"""
 
@@ -301,6 +309,45 @@ class PrewarmWorker:
 
         return ReconcileResult(
             kept_runtime_ids=tuple(kept),
+            retired_runtime_ids=tuple(retired),
+        )
+
+    def check_ready_health(self) -> HealthResult:
+        """核对当前仍可领取的 ``ready`` Firecracker 进程代次。
+
+        TTL 回收由 ``reap_expired_ready`` 先执行，因此这里仅检查尚未过期的项目。
+        进程死亡或元数据消失时安全清理并退休；活进程的代次不一致时只转为
+        ``draining`` 并硬失败，防止 PID 复用导致误杀其他进程。
+        """
+        if self.builder is None:
+            raise PrewarmWorkerError("prewarm builder is not configured")
+
+        healthy: list[str] = []
+        retired: list[str] = []
+        for item in self.prewarm_store.list_ready(self.profile_key):
+            runtime_id = str(item["runtime_id"])
+            runtime_status = self.builder.status(runtime_id)
+            if self._runtime_generation_matches(item, runtime_status):
+                healthy.append(runtime_id)
+                continue
+
+            if runtime_status is not None and runtime_status.get("processAlive") is True:
+                self.prewarm_store.mark_draining(runtime_id)
+                raise PrewarmWorkerError(
+                    f"refusing to stop mismatched prewarm runtime generation: {runtime_id}"
+                )
+
+            if not self.prewarm_store.mark_draining(runtime_id):
+                continue
+            self.builder.destroy(runtime_id, preserve_volume=True)
+            if not self.prewarm_store.retire(runtime_id):
+                raise PrewarmWorkerError(
+                    f"unhealthy prewarm item did not retire: {runtime_id}"
+                )
+            retired.append(runtime_id)
+
+        return HealthResult(
+            healthy_runtime_ids=tuple(healthy),
             retired_runtime_ids=tuple(retired),
         )
 

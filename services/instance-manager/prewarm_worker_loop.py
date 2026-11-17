@@ -5,13 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-from prewarm_worker import FillResult, ReconcileResult
+from prewarm_worker import FillResult, HealthResult, ReconcileResult
 
 
 class FillTarget(Protocol):
     def reconcile_public(self) -> ReconcileResult: ...
 
     def reap_expired_ready(self) -> tuple[str, ...]: ...
+
+    def check_ready_health(self) -> HealthResult: ...
 
     def fill_once_from_host(self) -> FillResult: ...
 
@@ -77,7 +79,12 @@ class PrewarmWorkerLoop:
     def run_once(self) -> WorkerCycle:
         """执行一轮并返回下次等待时间；异常不穿透后台主循环。"""
         try:
-            retired_runtime_ids = self.worker.reap_expired_ready()
+            expired_runtime_ids = self.worker.reap_expired_ready()
+            health = self.worker.check_ready_health()
+            retired_runtime_ids = (
+                *expired_runtime_ids,
+                *health.retired_runtime_ids,
+            )
             result = self.worker.fill_once_from_host()
         except Exception as error:
             return self._error_cycle("cycle", error)

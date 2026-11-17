@@ -394,6 +394,39 @@ class PrewarmWorkerTests(unittest.TestCase):
         self.assertEqual(self.builder.stopped, [])
         self.assertEqual(self.builder.destroyed, [])
 
+    def test_health_check_keeps_matching_ready_runtime(self) -> None:
+        self.preparing("ready-healthy")
+        self.assertTrue(
+            self.store.record_runtime_generation("ready-healthy", 1234, 5678)
+        )
+        self.assertTrue(self.store.mark_ready("ready-healthy", ttl_seconds=900))
+        self.runtime_status("ready-healthy")
+        result = self.worker(with_builder=True).check_ready_health()
+        self.assertEqual(result.healthy_runtime_ids, ("ready-healthy",))
+        self.assertEqual(result.retired_runtime_ids, ())
+
+    def test_health_check_retires_dead_ready_runtime(self) -> None:
+        self.preparing("ready-dead")
+        self.assertTrue(self.store.record_runtime_generation("ready-dead", 1234, 5678))
+        self.assertTrue(self.store.mark_ready("ready-dead", ttl_seconds=900))
+        self.runtime_status("ready-dead", alive=False)
+        result = self.worker(with_builder=True).check_ready_health()
+        self.assertEqual(result.retired_runtime_ids, ("ready-dead",))
+        self.assertEqual(self.store.get("ready-dead")["status"], "retired")
+        self.assertEqual(self.builder.destroyed, [("ready-dead", True)])
+
+    def test_health_check_quarantines_generation_mismatch(self) -> None:
+        self.preparing("ready-mismatch")
+        self.assertTrue(
+            self.store.record_runtime_generation("ready-mismatch", 1234, 5678)
+        )
+        self.assertTrue(self.store.mark_ready("ready-mismatch", ttl_seconds=900))
+        self.runtime_status("ready-mismatch", pid=9999, start_ticks=7777)
+        with self.assertRaisesRegex(PrewarmWorkerError, "refusing to stop mismatched"):
+            self.worker(with_builder=True).check_ready_health()
+        self.assertEqual(self.store.get("ready-mismatch")["status"], "draining")
+        self.assertEqual(self.builder.destroyed, [])
+
 
 if __name__ == "__main__":
     unittest.main()
