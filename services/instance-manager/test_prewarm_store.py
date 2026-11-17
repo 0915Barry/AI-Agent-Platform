@@ -52,6 +52,47 @@ class PrewarmStoreTests(unittest.TestCase):
             ["expired"],
         )
 
+    def test_reconcile_list_excludes_user_owned_and_terminal_states(self) -> None:
+        self.store.create_item("preparing", "profile-a")
+        self._ready_item("claiming")
+        self.store.claim(
+            "profile-a",
+            "logical-1",
+            "user-1",
+            "/vol/1.ext4",
+            "operation-1",
+            "activation-1",
+        )
+        self._ready_item("assigned")
+        self.store.claim(
+            "profile-a",
+            "logical-2",
+            "user-2",
+            "/vol/2.ext4",
+            "operation-2",
+            "activation-2",
+        )
+        self.assertTrue(self.store.mark_assigned("assigned", "operation-2"))
+        self._ready_item("ready")
+        self._ready_item("draining")
+        self.assertTrue(self.store.mark_draining("draining"))
+        self._ready_item("retired")
+        self.assertTrue(self.store.mark_draining("retired"))
+        self.assertTrue(self.store.retire("retired"))
+
+        statuses = {
+            item["runtime_id"]: item["status"]
+            for item in self.store.list_public_for_reconcile("profile-a")
+        }
+        self.assertEqual(
+            statuses,
+            {
+                "preparing": "preparing",
+                "ready": "ready",
+                "draining": "draining",
+            },
+        )
+
     def test_record_runtime_generation_only_while_preparing(self) -> None:
         self.store.create_item("rt-1", "profile-a")
         self.assertTrue(self.store.record_runtime_generation("rt-1", 123, 456))

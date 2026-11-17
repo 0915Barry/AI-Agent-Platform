@@ -38,6 +38,8 @@ class PrewarmBuilder(Protocol):
 
     def stop(self, instance_id: str, reason: str = "api") -> dict: ...
 
+    def status(self, instance_id: str) -> dict | None: ...
+
 
 class CapacityProbe(Protocol):
     def snapshot(self) -> HostCapacity: ...
@@ -61,6 +63,14 @@ class FillResult:
 
     plan: FillPlan
     created_runtime_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    """Worker 重启时公共池核对结果。"""
+
+    kept_runtime_ids: tuple[str, ...]
+    retired_runtime_ids: tuple[str, ...]
 
 
 class PrewarmWorker:
@@ -219,6 +229,94 @@ class PrewarmWorker:
                 raise PrewarmWorkerError(str(error)[-4000:]) from error
             retired.append(runtime_id)
         return tuple(retired)
+
+    def reconcile_public(self) -> ReconcileResult:
+        """核对 Worker 所属公共池，清理未完成或已经失联的项目。
+
+        - 健康且代次一致的 ``ready`` 保留；
+        - 重启遗留的 ``preparing/error/draining`` 清理并退休；
+        - 元数据缺失或进程已死亡的 ``ready`` 清理并退休；
+        - 活进程的 PID/启动代次与 SQLite 不一致时只隔离为 ``draining`` 并硬失败，
+          绝不停止无法确认归属的进程。
+
+        ``claiming/assigned`` 不在本方法查询范围内。
+        """
+        if self.builder is None:
+            raise PrewarmWorkerError("prewarm builder is not configured")
+
+        kept: list[str] = []
+        retired: list[str] = []
+        for item in self.prewarm_store.list_public_for_reconcile(self.profile_key):
+            runtime_id = str(item["runtime_id"])
+            item_status = str(item["status"])
+            runtime_status = self.builder.status(runtime_id)
+
+            if item_status == "ready" and self._runtime_generation_matches(
+                item,
+                runtime_status,
+            ):
+                kept.append(runtime_id)
+                continue
+
+            if (
+                runtime_status is not None
+                and runtime_status.get("processAlive") is True
+                and not self._runtime_generation_matches(item, runtime_status)
+            ):
+                if item_status in {"ready", "error"}:
+                    self.prewarm_store.mark_draining(runtime_id)
+                elif item_status == "preparing":
+                    self.prewarm_store.mark_prepare_error(
+                        runtime_id,
+                        "runtime generation mismatch during reconcile",
+                    )
+                    self.prewarm_store.mark_draining(runtime_id)
+                raise PrewarmWorkerError(
+                    f"refusing to stop mismatched prewarm runtime generation: {runtime_id}"
+                )
+
+            if item_status == "preparing":
+                self.prewarm_store.mark_prepare_error(
+                    runtime_id,
+                    "worker restarted before prewarm item became ready",
+                )
+                item_status = "error"
+            if item_status in {"ready", "error"}:
+                if not self.prewarm_store.mark_draining(runtime_id):
+                    continue
+
+            runtime_status = self.builder.status(runtime_id)
+            if runtime_status is not None and runtime_status.get("processAlive") is True:
+                stopped = self.builder.stop(runtime_id, reason="prewarm_reconcile")
+                if stopped.get("status") != "stopped":
+                    raise PrewarmWorkerError(
+                        f"reconciled prewarm runtime did not stop: {runtime_id}"
+                    )
+            self.builder.destroy(runtime_id, preserve_volume=True)
+            if not self.prewarm_store.retire(runtime_id):
+                raise PrewarmWorkerError(
+                    f"reconciled prewarm item did not retire: {runtime_id}"
+                )
+            retired.append(runtime_id)
+
+        return ReconcileResult(
+            kept_runtime_ids=tuple(kept),
+            retired_runtime_ids=tuple(retired),
+        )
+
+    @staticmethod
+    def _runtime_generation_matches(item: dict, runtime_status: dict | None) -> bool:
+        """ready 项只有在进程存活且 PID/start ticks 完全一致时才可继续使用。"""
+        if runtime_status is None or runtime_status.get("processAlive") is not True:
+            return False
+        expected_pid = item.get("vmm_pid")
+        expected_ticks = item.get("process_start_ticks")
+        if expected_pid is None or expected_ticks is None:
+            return False
+        return (
+            int(runtime_status.get("pid", -1)) == int(expected_pid)
+            and int(runtime_status.get("processStartTicks", -1)) == int(expected_ticks)
+        )
 
     def plan_fill(self, *, available_mib: int, free_network_slots: int) -> FillPlan:
         """计算本轮创建数，不写数据库、不启动 microVM。

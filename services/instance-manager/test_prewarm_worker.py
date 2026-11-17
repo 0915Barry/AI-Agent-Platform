@@ -31,6 +31,7 @@ class PrewarmWorkerTests(unittest.TestCase):
             self.prepared: list[tuple[str, str, int]] = []
             self.stopped: list[tuple[str, str]] = []
             self.destroyed: list[tuple[str, bool]] = []
+            self.statuses: dict[str, dict | None] = {}
 
         def prepare_prewarmer(
             self,
@@ -55,7 +56,16 @@ class PrewarmWorkerTests(unittest.TestCase):
             self.stopped.append((instance_id, reason))
             if self.fail_stop:
                 raise RuntimeError("stop failed")
+            existing = self.statuses.get(instance_id) or {"id": instance_id}
+            self.statuses[instance_id] = {
+                **existing,
+                "status": "stopped",
+                "processAlive": False,
+            }
             return {"id": instance_id, "status": "stopped"}
+
+        def status(self, instance_id: str) -> dict | None:
+            return self.statuses.get(instance_id)
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -314,6 +324,75 @@ class PrewarmWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(PrewarmWorkerError, "destroy failed"):
             self.worker(with_builder=True).reap_expired_ready()
         self.assertEqual(self.store.get("expired-1")["status"], "draining")
+
+    def runtime_status(
+        self,
+        runtime_id: str,
+        *,
+        pid: int = 1234,
+        start_ticks: int = 5678,
+        alive: bool = True,
+    ) -> None:
+        self.builder.statuses[runtime_id] = {
+            "id": runtime_id,
+            "status": "running" if alive else "stopped",
+            "processAlive": alive,
+            "pid": pid,
+            "processStartTicks": start_ticks,
+        }
+
+    def test_reconcile_keeps_healthy_ready_generation(self) -> None:
+        self.preparing("ready-1")
+        self.assertTrue(self.store.record_runtime_generation("ready-1", 1234, 5678))
+        self.assertTrue(self.store.mark_ready("ready-1", ttl_seconds=900))
+        self.runtime_status("ready-1")
+        result = self.worker(with_builder=True).reconcile_public()
+        self.assertEqual(result.kept_runtime_ids, ("ready-1",))
+        self.assertEqual(result.retired_runtime_ids, ())
+        self.assertEqual(self.builder.stopped, [])
+
+    def test_reconcile_retires_dead_ready_runtime(self) -> None:
+        self.preparing("ready-dead")
+        self.assertTrue(self.store.record_runtime_generation("ready-dead", 1234, 5678))
+        self.assertTrue(self.store.mark_ready("ready-dead", ttl_seconds=900))
+        self.runtime_status("ready-dead", alive=False)
+        result = self.worker(with_builder=True).reconcile_public()
+        self.assertEqual(result.retired_runtime_ids, ("ready-dead",))
+        self.assertEqual(self.store.get("ready-dead")["status"], "retired")
+        self.assertEqual(self.builder.stopped, [])
+        self.assertEqual(self.builder.destroyed, [("ready-dead", True)])
+
+    def test_reconcile_cleans_interrupted_preparing_runtime(self) -> None:
+        self.preparing("building-1")
+        self.assertTrue(self.store.record_runtime_generation("building-1", 1234, 5678))
+        self.runtime_status("building-1")
+        result = self.worker(with_builder=True).reconcile_public()
+        self.assertEqual(result.retired_runtime_ids, ("building-1",))
+        self.assertEqual(
+            self.builder.stopped,
+            [("building-1", "prewarm_reconcile")],
+        )
+        self.assertEqual(self.store.get("building-1")["status"], "retired")
+
+    def test_reconcile_retires_existing_draining_item(self) -> None:
+        self.ready("draining-1")
+        self.assertTrue(self.store.mark_draining("draining-1"))
+        result = self.worker(with_builder=True).reconcile_public()
+        self.assertEqual(result.retired_runtime_ids, ("draining-1",))
+        self.assertEqual(self.store.get("draining-1")["status"], "retired")
+
+    def test_reconcile_quarantines_generation_mismatch_without_stopping(self) -> None:
+        self.preparing("ready-mismatch")
+        self.assertTrue(
+            self.store.record_runtime_generation("ready-mismatch", 1234, 5678)
+        )
+        self.assertTrue(self.store.mark_ready("ready-mismatch", ttl_seconds=900))
+        self.runtime_status("ready-mismatch", pid=9999, start_ticks=7777)
+        with self.assertRaisesRegex(PrewarmWorkerError, "refusing to stop mismatched"):
+            self.worker(with_builder=True).reconcile_public()
+        self.assertEqual(self.store.get("ready-mismatch")["status"], "draining")
+        self.assertEqual(self.builder.stopped, [])
+        self.assertEqual(self.builder.destroyed, [])
 
 
 if __name__ == "__main__":

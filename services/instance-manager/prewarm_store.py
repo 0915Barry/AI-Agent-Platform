@@ -219,6 +219,24 @@ class PrewarmStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_public_for_reconcile(self, profile_key: str) -> list[dict]:
+        """列出由 Worker 管理、可在重启时核对的公共池状态。
+
+        ``claiming`` 和 ``assigned`` 已经进入用户启动链路，必须交给启动操作与
+        Control Plane 协调，公共池 Worker 不得在这里停止它们。
+        """
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM prewarm_items
+                WHERE profile_key=?
+                  AND status IN ('preparing','ready','draining','error')
+                ORDER BY created_at,runtime_id
+                """,
+                (profile_key,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def mark_ready(
         self,
         runtime_id: str,
