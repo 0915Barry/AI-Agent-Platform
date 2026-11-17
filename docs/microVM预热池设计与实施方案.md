@@ -4,7 +4,7 @@
 >
 > 当前进度日期：2026-11-17。
 >
-> 当前结论：数据库状态机、数据盘独占、真实 Runtime 接管、Control Plane 启停清理和自动补池 Worker 已经落地。Worker 已具备容量守卫、TTL 回收、稳态健康检查、重启协调、缩容、配置热重载、单进程锁和独立服务管理；超时领取已完成只读分类，并只对尚未接触用户数据盘的 `pre_attach_timeout` 启用安全补偿。真实超时领取 smoke test、其余故障分类的补偿策略和阶段 5 压力验收尚未完成。预热功能继续默认关闭。
+> 当前结论：数据库状态机、数据盘独占、真实 Runtime 接管、Control Plane 启停清理和自动补池 Worker 已经落地。Worker 已具备容量守卫、TTL 回收、稳态健康检查、重启协调、缩容、配置热重载、单进程锁和独立服务管理；超时领取已完成只读分类，并只对尚未接触用户数据盘的 `pre_attach_timeout` 启用安全补偿，该补偿已通过真实 smoke test（`prewarm-claim-compensation-smoke-test`）。其余故障分类（`reserved_timeout`/`activation_timeout`/`commit_pending`）的补偿策略和阶段 5 压力验收尚未完成。预热功能继续默认关闭。
 
 ## 1. 目标与边界
 
@@ -742,18 +742,18 @@ PREWARM_ENABLED=0
 
 ### 18.2 下一项开发任务
 
-下一步不是继续扩大自动补偿范围，而是先为现有 `pre_attach_timeout` 补偿增加真实 smoke test：
+`pre_attach_timeout` 补偿的真实 smoke test（`prewarm-claim-compensation-smoke-test`）已完成并验证通过：
 
-1. 使用独立数据库和状态目录启动一台真实空白预热 Guest；
-2. 创建 `startup_operations` 并将 `ready` 项领取为 `claiming`；
+1. 独立数据库/状态目录启动真实空白预热 Guest；
+2. 创建 `startup_operations` 并把 `ready` 项领取为 `claiming`；
 3. 不创建 `volume_attachments` 和 `runtime_bindings`，把 `claimed_at` 调整为超时；
 4. 执行真实 Worker `--once`；
-5. 验证启动操作变为 `failed`、预热项变为 `retired`；
-6. 验证 Firecracker、网络租约、TAP、nftables、占位盘和 Jailer 目录全部清理；
-7. 验证日志包含 `PREWARM_WORKER_CLAIM_RECOVERY compensated=1`。
+5. 验证启动操作 `failed`、预热项 `retired`；
+6. 验证 Firecracker、网络租约、TAP、nftables、占位盘、Jailer 全清；
+7. 验证日志含 `PREWARM_WORKER_CLAIM_RECOVERY compensated=1`。
 
-该 smoke test 通过后，再按风险从低到高分别设计 `reserved_timeout`、
-`activation_timeout` 和 `commit_pending` 的补偿。不得把这些分类复用为同一套“直接停止并释放”逻辑，
+下一步按风险从低到高分别设计 `reserved_timeout`、`activation_timeout` 和
+`commit_pending` 的补偿。不得把这些分类复用为同一套「直接停止并释放」逻辑，
 因为它们可能已经接触用户数据盘。
 
 ### 18.3 接手后的基础检查
