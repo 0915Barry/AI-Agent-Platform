@@ -1,4 +1,4 @@
-"""对尚未接触用户数据盘的超时预热领取执行安全补偿。"""
+"""对尚未确认 Guest 挂载用户盘的超时预热领取执行安全补偿。"""
 
 from __future__ import annotations
 
@@ -30,8 +30,20 @@ class ClaimCompensationResult:
     status: str
 
 
-class PreAttachClaimCompensator:
-    """只处理没有 attachment、没有 binding 的 ``pre_attach_timeout``。"""
+class PreActivationClaimCompensator:
+    """处理尚未确认 Guest 挂载用户盘的超时领取：``pre_attach_timeout`` 与 ``reserved_timeout``。
+
+    - ``pre_attach_timeout``：没有 ``volume_attachments``，Guest 一定还停在占位盘；
+    - ``reserved_timeout``：``volume_attachments`` 已 ``reserved`` 但未 ``attached``，
+      Guest 可能已被 PATCH 切到用户盘。
+
+    两者都停在「确认挂载」这个安全边界之前，因此统一按「停 VMM → 销毁运行时 →
+    释放 reserved 附件（若存在）→ 退休预热项 → 结束启动操作」回滚；区别只在
+    是否释放 reserved 附件。``activation_timeout`` / ``commit_pending`` 已确认
+    挂载或已提交，不在这里处理。
+    """
+
+    SUPPORTED_CLASSIFICATIONS = ("pre_attach_timeout", "reserved_timeout")
 
     def __init__(
         self,
@@ -49,7 +61,7 @@ class PreAttachClaimCompensator:
         self.runtime = runtime
 
     def compensate(self, audit: StaleClaimAudit) -> ClaimCompensationResult:
-        if audit.classification != "pre_attach_timeout":
+        if audit.classification not in self.SUPPORTED_CLASSIFICATIONS:
             raise ClaimCompensationError(
                 f"automatic compensation is not allowed for {audit.classification}"
             )
@@ -63,7 +75,7 @@ class PreAttachClaimCompensator:
             operation_status,
             "compensating",
             runtime_id=audit.runtime_id,
-            error="stale pre-attach prewarm claim",
+            error="stale pre-activation prewarm claim",
         ):
             raise ClaimCompensationError("startup operation changed before compensation")
 
@@ -82,11 +94,21 @@ class PreAttachClaimCompensator:
             or item.get("logical_instance_id") != audit.logical_instance_id
             or operation is None
             or operation.get("status") != "compensating"
-            or attachment is not None
             or binding is not None
         ):
             raise ClaimCompensationError(
                 "claim state changed after entering compensation; ownership remains isolated"
+            )
+
+        attachment_status = None if attachment is None else str(attachment.get("status"))
+        if audit.classification == "pre_attach_timeout":
+            if attachment is not None:
+                raise ClaimCompensationError(
+                    "volume attachment appeared after compensation; ownership remains isolated"
+                )
+        elif attachment is None or attachment_status != "reserved":
+            raise ClaimCompensationError(
+                "reserved volume attachment is missing or changed; ownership remains isolated"
             )
 
         runtime_status = self.runtime.status(audit.runtime_id)
@@ -95,18 +117,28 @@ class PreAttachClaimCompensator:
                 raise ClaimCompensationError(
                     "refusing to stop mismatched prewarm runtime generation"
                 )
-            stopped = self.runtime.stop(
-                audit.runtime_id,
-                reason="prewarm_claim_timeout_pre_attach",
+            reason = (
+                "prewarm_claim_timeout_pre_attach"
+                if audit.classification == "pre_attach_timeout"
+                else "prewarm_claim_timeout_reserved"
             )
+            stopped = self.runtime.stop(audit.runtime_id, reason=reason)
             if stopped.get("status") != "stopped":
-                raise ClaimCompensationError("pre-attach runtime did not stop")
+                raise ClaimCompensationError("pre-activation runtime did not stop")
         self.runtime.destroy(audit.runtime_id, preserve_volume=True)
+
+        if audit.classification == "reserved_timeout":
+            if not self.attachment_store.release(
+                str(item["volume_path"]), audit.operation_id
+            ):
+                raise ClaimCompensationError(
+                    "failed to release reserved volume attachment after runtime cleanup"
+                )
 
         if not self.prewarm_store.mark_error(
             audit.runtime_id,
             audit.operation_id,
-            "stale pre-attach prewarm claim",
+            "stale pre-activation prewarm claim",
         ):
             raise ClaimCompensationError("claim generation changed after runtime cleanup")
         if not self.prewarm_store.mark_draining(audit.runtime_id):
@@ -115,7 +147,7 @@ class PreAttachClaimCompensator:
             raise ClaimCompensationError("failed to retire compensated prewarm item")
         if not self.startup_store.mark_failed(
             audit.operation_id,
-            "stale pre-attach prewarm claim was cleaned",
+            "stale pre-activation prewarm claim was cleaned",
         ):
             raise ClaimCompensationError("failed to finalize compensated startup operation")
         return ClaimCompensationResult(

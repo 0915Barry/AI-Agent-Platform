@@ -16,7 +16,7 @@ from typing import Callable, Protocol
 
 from prewarm_capacity import HostCapacity
 from prewarm_claim_audit import PrewarmClaimAuditor
-from prewarm_claim_compensation import PreAttachClaimCompensator
+from prewarm_claim_compensation import PreActivationClaimCompensator
 from prewarm_config import PrewarmConfig
 from prewarm_store import PrewarmStore
 
@@ -107,7 +107,7 @@ class PrewarmWorker:
         new_runtime_id: Callable[[], str] | None = None,
         new_claim_token: Callable[[], str] | None = None,
         claim_auditor: PrewarmClaimAuditor | None = None,
-        claim_compensator: PreAttachClaimCompensator | None = None,
+        claim_compensator: PreActivationClaimCompensator | None = None,
     ) -> None:
         self.config = config
         self.prewarm_store = prewarm_store
@@ -125,11 +125,13 @@ class PrewarmWorker:
         )
 
     def recover_stale_claims(self) -> ClaimRecoveryResult:
-        """审计超时领取，并只补偿尚未接触用户数据盘的项目。
+        """审计超时领取，并补偿尚未确认 Guest 挂载用户盘的项目。
 
-        领取已经进入数据盘预留、挂载或 Runtime 绑定阶段时，本方法只报告分类，
-        不推断所有权也不执行清理。单项补偿失败同样只记录错误，使公共池的 TTL、
-        健康检查和补池仍可继续运行；失败项保持隔离状态，等待下一轮或人工检查。
+        ``pre_attach_timeout`` 与 ``reserved_timeout`` 由补偿器回滚；领取已经进入
+        「确认挂载」或「提交」阶段（``activation_timeout`` / ``commit_pending``）时，
+        本方法只报告分类，不推断所有权也不执行清理。单项补偿失败同样只记录错误，
+        使公共池的 TTL、健康检查和补池仍可继续运行；失败项保持隔离状态，等待
+        下一轮或人工检查。
         """
         if self.claim_auditor is None or self.claim_compensator is None:
             return ClaimRecoveryResult((), (), ())
@@ -138,7 +140,7 @@ class PrewarmWorker:
         deferred: list[str] = []
         errors: list[str] = []
         for audit in self.claim_auditor.audit(self.config.claim_timeout_seconds):
-            if audit.classification != "pre_attach_timeout":
+            if audit.classification not in ("pre_attach_timeout", "reserved_timeout"):
                 deferred.append(f"{audit.runtime_id}:{audit.classification}")
                 continue
             try:

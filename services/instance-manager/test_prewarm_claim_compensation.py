@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from prewarm_claim_audit import PrewarmClaimAuditor
-from prewarm_claim_compensation import ClaimCompensationError, PreAttachClaimCompensator
+from prewarm_claim_compensation import ClaimCompensationError, PreActivationClaimCompensator
 from prewarm_store import PrewarmStore
 from runtime_store import RuntimeStore, VolumeAttachmentStore
 from startup_store import StartupStore
@@ -36,7 +36,7 @@ class FakeRuntime:
         self.destroyed.append((instance_id, preserve_volume))
 
 
-class PreAttachClaimCompensatorTests(unittest.TestCase):
+class PreActivationClaimCompensatorTests(unittest.TestCase):
     NOW = 10_000
 
     def setUp(self) -> None:
@@ -55,7 +55,7 @@ class PreAttachClaimCompensatorTests(unittest.TestCase):
             runtime_store=self.runtimes,
             profile_key="profile-a",
         )
-        self.compensator = PreAttachClaimCompensator(
+        self.compensator = PreActivationClaimCompensator(
             prewarm_store=self.prewarm,
             startup_store=self.startups,
             attachment_store=self.attachments,
@@ -143,8 +143,7 @@ class PreAttachClaimCompensatorTests(unittest.TestCase):
         self.assertEqual(self.prewarm.get("runtime-1")["status"], "claiming")
         self.assertEqual(self.startups.get("operation-1")["status"], "compensating")
 
-    def test_non_pre_attach_classification_is_rejected(self) -> None:
-        audit = self.audit()
+    def _reserve_attachment(self) -> None:
         self.attachments.reserve(
             "/vol/user-1.ext4",
             "user-1",
@@ -152,12 +151,64 @@ class PreAttachClaimCompensatorTests(unittest.TestCase):
             "runtime-1",
             "operation-1",
         )
-        reserved_audit = self.auditor.audit(30, now=self.NOW)[0]
-        self.assertEqual(reserved_audit.classification, "reserved_timeout")
+
+    def _save_binding(self, status: str) -> None:
+        self.runtimes.save_binding(
+            {
+                "logicalInstanceId": "logical-1",
+                "runtimeId": "runtime-1",
+                "userId": "user-1",
+                "volumePath": "/vol/user-1.ext4",
+                "activationId": "activation-1",
+                "status": status,
+            }
+        )
+
+    def test_reserved_timeout_is_compensated_and_releases_attachment(self) -> None:
+        self._reserve_attachment()
+        audit = self.auditor.audit(30, now=self.NOW)[0]
+        self.assertEqual(audit.classification, "reserved_timeout")
+
+        result = self.compensator.compensate(audit)
+        self.assertEqual(result.status, "retired")
+        self.assertEqual(self.prewarm.get("runtime-1")["status"], "retired")
+        self.assertEqual(self.startups.get("operation-1")["status"], "failed")
+        self.assertIsNone(self.attachments.get("/vol/user-1.ext4"))
+        self.assertEqual(
+            self.runtime.stopped,
+            [("runtime-1", "prewarm_claim_timeout_reserved")],
+        )
+        self.assertEqual(self.runtime.destroyed, [("runtime-1", True)])
+
+    def test_activation_timeout_classification_is_rejected(self) -> None:
+        self._reserve_attachment()
+        self.attachments.mark_attached("/vol/user-1.ext4", "operation-1")
+        self._save_binding("activating")
+        audit = self.auditor.audit(30, now=self.NOW)[0]
+        self.assertEqual(audit.classification, "activation_timeout")
         with self.assertRaisesRegex(ClaimCompensationError, "not allowed"):
-            self.compensator.compensate(reserved_audit)
-        self.assertEqual(audit.classification, "pre_attach_timeout")
+            self.compensator.compensate(audit)
         self.assertEqual(self.runtime.stopped, [])
+
+    def test_reserved_attachment_race_prevents_cleanup(self) -> None:
+        self._reserve_attachment()
+        original = self.startups.transition
+
+        def transition_with_race(*args, **kwargs):
+            changed = original(*args, **kwargs)
+            if changed and args[2] == "compensating":
+                # 附件从 reserved 越过到 attached，补偿必须放弃清理。
+                self.attachments.mark_attached("/vol/user-1.ext4", "operation-1")
+            return changed
+
+        with patch.object(self.startups, "transition", side_effect=transition_with_race):
+            with self.assertRaisesRegex(
+                ClaimCompensationError,
+                "reserved volume attachment is missing or changed",
+            ):
+                self.compensator.compensate(self.auditor.audit(30, now=self.NOW)[0])
+        self.assertEqual(self.runtime.stopped, [])
+        self.assertEqual(self.prewarm.get("runtime-1")["status"], "claiming")
 
 
 if __name__ == "__main__":

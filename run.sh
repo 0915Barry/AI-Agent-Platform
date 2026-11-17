@@ -71,6 +71,8 @@ Commands:
                          Verify Worker restart reconcile and automatic replenishment
   prewarm-claim-compensation-smoke-test
                          Verify stale pre-attach claim compensation and cleanup
+  prewarm-reserved-timeout-smoke-test
+                         Verify stale reserved claim compensation and attachment release
   prewarm-worker-lock-smoke-test
                          Verify the real Worker process lock and clean rejection
   prewarm-worker-service-smoke-test
@@ -549,6 +551,18 @@ smoke_test_prewarm_worker_claim_compensation() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/prewarm-claim-compensation-smoke-test.sh'"
 }
 
+smoke_test_prewarm_reserved_timeout() {
+  sync_repo
+  echo "Testing real reserved claim timeout compensation in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/prewarm-reserved-timeout-smoke-test.sh'"
+}
+
 smoke_test_prewarm_worker_lock() {
   sync_repo
   echo "Testing the real prewarm Worker process lock in ${VM_USER}@${VM_HOST}..."
@@ -764,6 +778,9 @@ case "${command}" in
     ;;
   prewarm-claim-compensation-smoke-test)
     smoke_test_prewarm_worker_claim_compensation
+    ;;
+  prewarm-reserved-timeout-smoke-test)
+    smoke_test_prewarm_reserved_timeout
     ;;
   prewarm-worker-lock-smoke-test)
     smoke_test_prewarm_worker_lock

@@ -147,11 +147,12 @@ class PrewarmWorkerTests(unittest.TestCase):
             binding_status=None,
         )
 
-    def test_stale_claim_recovery_only_compensates_pre_attach_timeout(self) -> None:
+    def test_stale_claim_recovery_compensates_pre_activation_timeouts(self) -> None:
         auditor = self.FakeClaimAuditor(
             (
                 self.claim_audit("safe-1", "pre_attach_timeout"),
                 self.claim_audit("reserved-1", "reserved_timeout"),
+                self.claim_audit("activating-1", "activation_timeout"),
             )
         )
         compensator = self.FakeClaimCompensator()
@@ -161,11 +162,11 @@ class PrewarmWorkerTests(unittest.TestCase):
             PREWARM_CLAIM_TIMEOUT_SECONDS="45",
         ).recover_stale_claims()
         self.assertEqual(auditor.timeouts, [45])
-        self.assertEqual(compensator.calls, ["safe-1"])
-        self.assertEqual(result.compensated_runtime_ids, ("safe-1",))
+        self.assertEqual(compensator.calls, ["safe-1", "reserved-1"])
+        self.assertEqual(result.compensated_runtime_ids, ("safe-1", "reserved-1"))
         self.assertEqual(
             result.deferred_classifications,
-            ("reserved-1:reserved_timeout",),
+            ("activating-1:activation_timeout",),
         )
         self.assertEqual(result.errors, ())
 

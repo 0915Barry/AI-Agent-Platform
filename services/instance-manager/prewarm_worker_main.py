@@ -11,7 +11,7 @@ from typing import Callable
 
 from prewarm_capacity import LinuxHostCapacityProbe
 from prewarm_claim_audit import PrewarmClaimAuditor
-from prewarm_claim_compensation import PreAttachClaimCompensator
+from prewarm_claim_compensation import PreActivationClaimCompensator
 from prewarm_config import DEFAULT_CONFIG_PATH, PrewarmConfig
 from prewarm_store import PrewarmStore
 from prewarm_worker import PrewarmWorker
@@ -81,7 +81,7 @@ def run(
             runtime_store=runtime_store,
             profile_key=args.profile_key,
         )
-        claim_compensator = PreAttachClaimCompensator(
+        claim_compensator = PreActivationClaimCompensator(
             prewarm_store=prewarm_store,
             startup_store=startup_store,
             attachment_store=attachment_store,
