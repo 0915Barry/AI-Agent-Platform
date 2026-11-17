@@ -15,6 +15,7 @@ class PrewarmWorkerTests(unittest.TestCase):
     class FakeBuilder:
         def __init__(self) -> None:
             self.fail_prepare = False
+            self.fail_on_call: int | None = None
             self.prepared: list[tuple[str, str, int]] = []
             self.destroyed: list[tuple[str, bool]] = []
 
@@ -28,7 +29,7 @@ class PrewarmWorkerTests(unittest.TestCase):
             self.prepared.append(
                 (runtime_id, claim_token, min_free_network_slots)
             )
-            if self.fail_prepare:
+            if self.fail_prepare or self.fail_on_call == len(self.prepared):
                 raise RuntimeError("prepare failed")
             return {"pid": 1234, "processStartTicks": 5678}
 
@@ -40,6 +41,11 @@ class PrewarmWorkerTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.store = PrewarmStore(Path(self.temporary.name) / "control-plane.db")
         self.builder = self.FakeBuilder()
+        self.runtime_index = 0
+
+    def next_runtime_id(self) -> str:
+        self.runtime_index += 1
+        return f"prewarm-test-{self.runtime_index}"
 
     def worker(self, *, with_builder: bool = False, **overrides: str) -> PrewarmWorker:
         values = {
@@ -57,7 +63,7 @@ class PrewarmWorkerTests(unittest.TestCase):
             profile_key="profile-a",
             builder=self.builder if with_builder else None,
             host_id="host-test",
-            new_runtime_id=lambda: "prewarm-test-1",
+            new_runtime_id=self.next_runtime_id,
             new_claim_token=lambda: "raw-claim-token",
         )
 
@@ -184,6 +190,48 @@ class PrewarmWorkerTests(unittest.TestCase):
     def test_prepare_one_requires_builder(self) -> None:
         with self.assertRaisesRegex(PrewarmWorkerError, "not configured"):
             self.worker().prepare_one()
+
+    def test_fill_once_creates_planned_number_of_items(self) -> None:
+        result = self.worker(with_builder=True).fill_once(
+            available_mib=4096,
+            free_network_slots=10,
+        )
+        self.assertEqual(result.plan.create_count, 2)
+        self.assertEqual(
+            result.created_runtime_ids,
+            ("prewarm-test-1", "prewarm-test-2"),
+        )
+        self.assertEqual(self.store.get("prewarm-test-1")["status"], "ready")
+        self.assertEqual(self.store.get("prewarm-test-2")["status"], "ready")
+
+    def test_fill_once_only_creates_current_deficit(self) -> None:
+        self.ready("existing-ready")
+        result = self.worker(with_builder=True).fill_once(
+            available_mib=4096,
+            free_network_slots=10,
+        )
+        self.assertEqual(result.plan.create_count, 1)
+        self.assertEqual(result.created_runtime_ids, ("prewarm-test-1",))
+
+    def test_fill_once_does_nothing_when_disabled(self) -> None:
+        result = self.worker(
+            with_builder=True,
+            PREWARM_ENABLED="0",
+        ).fill_once(available_mib=4096, free_network_slots=10)
+        self.assertEqual(result.plan.reason, "disabled")
+        self.assertEqual(result.created_runtime_ids, ())
+        self.assertEqual(self.builder.prepared, [])
+
+    def test_fill_once_stops_after_first_prepare_failure(self) -> None:
+        self.builder.fail_on_call = 2
+        with self.assertRaisesRegex(PrewarmWorkerError, "prepare failed"):
+            self.worker(with_builder=True).fill_once(
+                available_mib=4096,
+                free_network_slots=10,
+            )
+        self.assertEqual(len(self.builder.prepared), 2)
+        self.assertEqual(self.store.get("prewarm-test-1")["status"], "ready")
+        self.assertEqual(self.store.get("prewarm-test-2")["status"], "error")
 
 
 if __name__ == "__main__":

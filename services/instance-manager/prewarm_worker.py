@@ -48,6 +48,14 @@ class FillPlan:
     total_public: int
 
 
+@dataclass(frozen=True)
+class FillResult:
+    """一次补池巡检已经完成的创建结果。"""
+
+    plan: FillPlan
+    created_runtime_ids: tuple[str, ...]
+
+
 class PrewarmWorker:
     """根据配置、数据库状态和 Host 容量计算补池数量。"""
 
@@ -139,6 +147,23 @@ class PrewarmWorker:
         if item is None or item.get("status") != "ready":
             raise PrewarmWorkerError("prepared item disappeared after ready commit")
         return item
+
+    def fill_once(self, *, available_mib: int, free_network_slots: int) -> FillResult:
+        """执行一次补池巡检，按同一份计划同步准备所需空白 Guest。
+
+        本方法没有定时循环，也不会自行重试。任一创建失败会立即停止本轮，已经
+        成功发布的项保持 ``ready``，失败项由 ``prepare_one`` 记录为 ``error``；
+        上层 Worker 服务后续可据此执行退避，避免故障期间持续创建资源。
+        """
+        plan = self.plan_fill(
+            available_mib=available_mib,
+            free_network_slots=free_network_slots,
+        )
+        created: list[str] = []
+        for _ in range(plan.create_count):
+            item = self.prepare_one()
+            created.append(str(item["runtime_id"]))
+        return FillResult(plan=plan, created_runtime_ids=tuple(created))
 
     def plan_fill(self, *, available_mib: int, free_network_slots: int) -> FillPlan:
         """计算本轮创建数，不写数据库、不启动 microVM。
