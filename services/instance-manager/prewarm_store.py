@@ -346,6 +346,21 @@ class PrewarmStore:
             )
         return cursor.rowcount == 1
 
+    def mark_prepare_error(self, runtime_id: str, error: str) -> bool:
+        """``preparing → error``：空白 Guest 创建失败后记录诊断信息。"""
+        now = int(time.time())
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE prewarm_items
+                SET status='error', updated_at=?, last_error=?
+                WHERE runtime_id=? AND status='preparing'
+                """,
+                (now, error[-4000:], runtime_id),
+            )
+        return cursor.rowcount == 1
+
     def mark_draining(self, runtime_id: str) -> bool:
         """``ready|error → draining``：Worker 回收或下线时调用。"""
         now = int(time.time())

@@ -3,20 +3,45 @@
 
 import tempfile
 import unittest
+import hashlib
 from pathlib import Path
 
 from prewarm_config import PrewarmConfig
 from prewarm_store import PrewarmStore
-from prewarm_worker import PrewarmWorker
+from prewarm_worker import PrewarmWorker, PrewarmWorkerError
 
 
 class PrewarmWorkerTests(unittest.TestCase):
+    class FakeBuilder:
+        def __init__(self) -> None:
+            self.fail_prepare = False
+            self.prepared: list[tuple[str, str, int]] = []
+            self.destroyed: list[tuple[str, bool]] = []
+
+        def prepare_prewarmer(
+            self,
+            runtime_id: str,
+            claim_token: str,
+            *,
+            min_free_network_slots: int,
+        ) -> dict:
+            self.prepared.append(
+                (runtime_id, claim_token, min_free_network_slots)
+            )
+            if self.fail_prepare:
+                raise RuntimeError("prepare failed")
+            return {"pid": 1234, "processStartTicks": 5678}
+
+        def destroy(self, instance_id: str, *, preserve_volume: bool = True) -> None:
+            self.destroyed.append((instance_id, preserve_volume))
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.store = PrewarmStore(Path(self.temporary.name) / "control-plane.db")
+        self.builder = self.FakeBuilder()
 
-    def worker(self, **overrides: str) -> PrewarmWorker:
+    def worker(self, *, with_builder: bool = False, **overrides: str) -> PrewarmWorker:
         values = {
             "PREWARM_ENABLED": "1",
             "PREWARM_TARGET_READY": "2",
@@ -30,6 +55,10 @@ class PrewarmWorkerTests(unittest.TestCase):
             PrewarmConfig.from_env(values),
             prewarm_store=self.store,
             profile_key="profile-a",
+            builder=self.builder if with_builder else None,
+            host_id="host-test",
+            new_runtime_id=lambda: "prewarm-test-1",
+            new_claim_token=lambda: "raw-claim-token",
         )
 
     def preparing(self, runtime_id: str) -> None:
@@ -119,6 +148,42 @@ class PrewarmWorkerTests(unittest.TestCase):
         self.assertTrue(self.store.mark_ready("other-1", ttl_seconds=900))
         plan = self.worker().plan_fill(available_mib=4096, free_network_slots=10)
         self.assertEqual(plan.create_count, 2)
+
+    def test_prepare_one_publishes_ready_item_with_runtime_generation(self) -> None:
+        item = self.worker(with_builder=True).prepare_one()
+        self.assertEqual(item["runtime_id"], "prewarm-test-1")
+        self.assertEqual(item["status"], "ready")
+        self.assertEqual(item["host_id"], "host-test")
+        self.assertEqual(item["vmm_pid"], 1234)
+        self.assertEqual(item["process_start_ticks"], 5678)
+        self.assertEqual(
+            item["claim_token_hash"],
+            hashlib.sha256(b"raw-claim-token").hexdigest(),
+        )
+        self.assertNotEqual(item["claim_token_hash"], "raw-claim-token")
+        self.assertEqual(
+            self.builder.prepared,
+            [("prewarm-test-1", "raw-claim-token", 2)],
+        )
+        self.assertEqual(self.builder.destroyed, [])
+
+    def test_prepare_failure_records_error_without_publishing_ready(self) -> None:
+        self.builder.fail_prepare = True
+        with self.assertRaisesRegex(PrewarmWorkerError, "prepare failed"):
+            self.worker(with_builder=True).prepare_one()
+        item = self.store.get("prewarm-test-1")
+        self.assertEqual(item["status"], "error")
+        self.assertEqual(item["last_error"], "prepare failed")
+        self.assertEqual(self.builder.destroyed, [])
+
+    def test_prepare_one_rejects_disabled_worker(self) -> None:
+        with self.assertRaisesRegex(PrewarmWorkerError, "disabled"):
+            self.worker(with_builder=True, PREWARM_ENABLED="0").prepare_one()
+        self.assertIsNone(self.store.get("prewarm-test-1"))
+
+    def test_prepare_one_requires_builder(self) -> None:
+        with self.assertRaisesRegex(PrewarmWorkerError, "not configured"):
+            self.worker().prepare_one()
 
 
 if __name__ == "__main__":
