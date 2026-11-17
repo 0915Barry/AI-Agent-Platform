@@ -8,11 +8,37 @@ from pathlib import Path
 
 from prewarm_config import PrewarmConfig
 from prewarm_capacity import HostCapacity
+from prewarm_claim_audit import StaleClaimAudit
+from prewarm_claim_compensation import ClaimCompensationResult
 from prewarm_store import PrewarmStore
 from prewarm_worker import PrewarmWorker, PrewarmWorkerError
 
 
 class PrewarmWorkerTests(unittest.TestCase):
+    class FakeClaimAuditor:
+        def __init__(self, audits) -> None:
+            self.audits = tuple(audits)
+            self.timeouts: list[int] = []
+
+        def audit(self, timeout_seconds: int):
+            self.timeouts.append(timeout_seconds)
+            return self.audits
+
+    class FakeClaimCompensator:
+        def __init__(self, failures=()) -> None:
+            self.failures = set(failures)
+            self.calls: list[str] = []
+
+        def compensate(self, audit: StaleClaimAudit) -> ClaimCompensationResult:
+            self.calls.append(audit.runtime_id)
+            if audit.runtime_id in self.failures:
+                raise RuntimeError("generation mismatch")
+            return ClaimCompensationResult(
+                runtime_id=audit.runtime_id,
+                operation_id=audit.operation_id,
+                status="retired",
+            )
+
     class FakeCapacityProbe:
         def __init__(self, available_mib: int, free_network_slots: int) -> None:
             self.capacity = HostCapacity(available_mib, free_network_slots)
@@ -83,6 +109,8 @@ class PrewarmWorkerTests(unittest.TestCase):
         *,
         with_builder: bool = False,
         capacity_probe=None,
+        claim_auditor=None,
+        claim_compensator=None,
         **overrides: str,
     ) -> PrewarmWorker:
         values = {
@@ -103,7 +131,60 @@ class PrewarmWorkerTests(unittest.TestCase):
             host_id="host-test",
             new_runtime_id=self.next_runtime_id,
             new_claim_token=lambda: "raw-claim-token",
+            claim_auditor=claim_auditor,
+            claim_compensator=claim_compensator,
         )
+
+    @staticmethod
+    def claim_audit(runtime_id: str, classification: str) -> StaleClaimAudit:
+        return StaleClaimAudit(
+            runtime_id=runtime_id,
+            logical_instance_id=f"logical-{runtime_id}",
+            operation_id=f"operation-{runtime_id}",
+            classification=classification,
+            operation_status="executing",
+            attachment_status=None,
+            binding_status=None,
+        )
+
+    def test_stale_claim_recovery_only_compensates_pre_attach_timeout(self) -> None:
+        auditor = self.FakeClaimAuditor(
+            (
+                self.claim_audit("safe-1", "pre_attach_timeout"),
+                self.claim_audit("reserved-1", "reserved_timeout"),
+            )
+        )
+        compensator = self.FakeClaimCompensator()
+        result = self.worker(
+            claim_auditor=auditor,
+            claim_compensator=compensator,
+            PREWARM_CLAIM_TIMEOUT_SECONDS="45",
+        ).recover_stale_claims()
+        self.assertEqual(auditor.timeouts, [45])
+        self.assertEqual(compensator.calls, ["safe-1"])
+        self.assertEqual(result.compensated_runtime_ids, ("safe-1",))
+        self.assertEqual(
+            result.deferred_classifications,
+            ("reserved-1:reserved_timeout",),
+        )
+        self.assertEqual(result.errors, ())
+
+    def test_stale_claim_compensation_error_does_not_stop_remaining_items(self) -> None:
+        auditor = self.FakeClaimAuditor(
+            (
+                self.claim_audit("failed-1", "pre_attach_timeout"),
+                self.claim_audit("safe-2", "pre_attach_timeout"),
+            )
+        )
+        compensator = self.FakeClaimCompensator(failures=("failed-1",))
+        result = self.worker(
+            claim_auditor=auditor,
+            claim_compensator=compensator,
+        ).recover_stale_claims()
+        self.assertEqual(compensator.calls, ["failed-1", "safe-2"])
+        self.assertEqual(result.compensated_runtime_ids, ("safe-2",))
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("failed-1:pre_attach_timeout:generation mismatch", result.errors[0])
 
     def preparing(self, runtime_id: str) -> None:
         self.store.create_item(runtime_id, "profile-a")

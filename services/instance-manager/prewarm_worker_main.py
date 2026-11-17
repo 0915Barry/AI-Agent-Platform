@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Callable
 
 from prewarm_capacity import LinuxHostCapacityProbe
+from prewarm_claim_audit import PrewarmClaimAuditor
+from prewarm_claim_compensation import PreAttachClaimCompensator
 from prewarm_config import DEFAULT_CONFIG_PATH, PrewarmConfig
 from prewarm_store import PrewarmStore
 from prewarm_worker import PrewarmWorker
@@ -20,6 +22,8 @@ from prewarm_worker_lock import (
 )
 from prewarm_worker_loop import PrewarmWorkerLoop
 from runtime import InstanceRuntime
+from runtime_store import RuntimeStore, VolumeAttachmentStore
+from startup_store import StartupStore
 
 
 DEFAULT_DATABASE = Path("/var/lib/fc/control-plane.db")
@@ -66,12 +70,32 @@ def run(
             state_root=args.state_root,
             state_database=args.database,
         )
+        prewarm_store = PrewarmStore(args.database)
+        startup_store = StartupStore(args.database)
+        attachment_store = VolumeAttachmentStore(args.database)
+        runtime_store = RuntimeStore(args.database)
+        claim_auditor = PrewarmClaimAuditor(
+            prewarm_store=prewarm_store,
+            startup_store=startup_store,
+            attachment_store=attachment_store,
+            runtime_store=runtime_store,
+            profile_key=args.profile_key,
+        )
+        claim_compensator = PreAttachClaimCompensator(
+            prewarm_store=prewarm_store,
+            startup_store=startup_store,
+            attachment_store=attachment_store,
+            runtime_store=runtime_store,
+            runtime=runtime,
+        )
         worker = PrewarmWorker(
             config,
-            prewarm_store=PrewarmStore(args.database),
+            prewarm_store=prewarm_store,
             profile_key=args.profile_key,
             builder=runtime,
             capacity_probe=capacity_probe_factory(runtime.network_manager),
+            claim_auditor=claim_auditor,
+            claim_compensator=claim_compensator,
         )
         loop = PrewarmWorkerLoop(
             worker,

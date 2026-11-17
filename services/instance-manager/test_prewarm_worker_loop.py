@@ -4,7 +4,13 @@
 import unittest
 
 from prewarm_config import PrewarmConfig
-from prewarm_worker import FillPlan, FillResult, HealthResult, ReconcileResult
+from prewarm_worker import (
+    ClaimRecoveryResult,
+    FillPlan,
+    FillResult,
+    HealthResult,
+    ReconcileResult,
+)
 from prewarm_worker_loop import PrewarmWorkerLoop
 
 
@@ -20,6 +26,7 @@ class FakeWorker:
         excess_retired=(),
         drain_error=None,
         reconcile_outcomes=None,
+        claim_recovery=None,
     ) -> None:
         self.outcomes = list(outcomes)
         self.retired = tuple(retired)
@@ -38,6 +45,8 @@ class FakeWorker:
             else [ReconcileResult((), ())]
         )
         self.reconcile_calls = 0
+        self.claim_recovery = claim_recovery or ClaimRecoveryResult((), (), ())
+        self.claim_recovery_calls = 0
         self.updated_configs: list[PrewarmConfig] = []
 
     def update_config(self, config: PrewarmConfig) -> bool:
@@ -59,6 +68,10 @@ class FakeWorker:
         if self.reap_error is not None:
             raise self.reap_error
         return self.retired
+
+    def recover_stale_claims(self) -> ClaimRecoveryResult:
+        self.claim_recovery_calls += 1
+        return self.claim_recovery
 
     def check_ready_health(self) -> HealthResult:
         self.health_calls += 1
@@ -132,10 +145,32 @@ class PrewarmWorkerLoopTests(unittest.TestCase):
         self.assertEqual(cycle.retired_runtime_ids, ("runtime-old",))
         self.assertEqual(cycle.created_runtime_ids, ("runtime-new",))
         self.assertEqual(worker.reap_calls, 1)
+        self.assertEqual(worker.claim_recovery_calls, 1)
         self.assertEqual(worker.health_calls, 1)
         self.assertEqual(worker.drain_calls, 1)
         self.assertEqual(worker.calls, 1)
         self.assertIn("retired=1", messages[0])
+
+    def test_claim_recovery_reports_results_and_does_not_block_cycle(self) -> None:
+        messages: list[str] = []
+        worker = FakeWorker(
+            [fill_result("runtime-new")],
+            claim_recovery=ClaimRecoveryResult(
+                ("runtime-retired",),
+                ("runtime-reserved:reserved_timeout",),
+                ("runtime-error:pre_attach_timeout:generation mismatch",),
+            ),
+        )
+        cycle = PrewarmWorkerLoop(
+            worker,
+            interval_seconds=5,
+            emit=messages.append,
+        ).run_once()
+        self.assertTrue(cycle.success)
+        self.assertEqual(cycle.created_runtime_ids, ("runtime-new",))
+        self.assertTrue(any("compensated=1 deferred=1 errors=1" in row for row in messages))
+        self.assertTrue(any("CLAIM_DEFERRED" in row for row in messages))
+        self.assertTrue(any("CLAIM_ERROR" in row for row in messages))
 
     def test_reap_failure_prevents_fill_and_enters_backoff(self) -> None:
         worker = FakeWorker(

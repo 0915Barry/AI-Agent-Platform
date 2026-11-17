@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from prewarm_config import PrewarmConfig
-from prewarm_worker import FillResult, HealthResult, ReconcileResult
+from prewarm_worker import ClaimRecoveryResult, FillResult, HealthResult, ReconcileResult
 
 
 class FillTarget(Protocol):
@@ -15,6 +15,8 @@ class FillTarget(Protocol):
     def reconcile_public(self) -> ReconcileResult: ...
 
     def reap_expired_ready(self) -> tuple[str, ...]: ...
+
+    def recover_stale_claims(self) -> ClaimRecoveryResult: ...
 
     def check_ready_health(self) -> HealthResult: ...
 
@@ -95,6 +97,22 @@ class PrewarmWorkerLoop:
                         f"max={config.max_total} min_mib={config.min_available_mib} "
                         f"min_network={config.min_free_network_slots}"
                     )
+            claim_recovery = self.worker.recover_stale_claims()
+            if (
+                claim_recovery.compensated_runtime_ids
+                or claim_recovery.deferred_classifications
+                or claim_recovery.errors
+            ):
+                self.emit(
+                    "PREWARM_WORKER_CLAIM_RECOVERY "
+                    f"compensated={len(claim_recovery.compensated_runtime_ids)} "
+                    f"deferred={len(claim_recovery.deferred_classifications)} "
+                    f"errors={len(claim_recovery.errors)}"
+                )
+                for entry in claim_recovery.deferred_classifications:
+                    self.emit(f"PREWARM_WORKER_CLAIM_DEFERRED item={entry}")
+                for entry in claim_recovery.errors:
+                    self.emit(f"PREWARM_WORKER_CLAIM_ERROR item={entry}")
             expired_runtime_ids = self.worker.reap_expired_ready()
             health = self.worker.check_ready_health()
             excess_runtime_ids = self.worker.drain_excess_ready()
