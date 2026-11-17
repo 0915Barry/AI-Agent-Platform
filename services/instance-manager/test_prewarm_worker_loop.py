@@ -16,6 +16,8 @@ class FakeWorker:
         reap_error=None,
         health_retired=(),
         health_error=None,
+        excess_retired=(),
+        drain_error=None,
         reconcile_outcomes=None,
     ) -> None:
         self.outcomes = list(outcomes)
@@ -26,6 +28,9 @@ class FakeWorker:
         self.health_retired = tuple(health_retired)
         self.health_error = health_error
         self.health_calls = 0
+        self.excess_retired = tuple(excess_retired)
+        self.drain_error = drain_error
+        self.drain_calls = 0
         self.reconcile_outcomes = list(
             reconcile_outcomes
             if reconcile_outcomes is not None
@@ -53,6 +58,12 @@ class FakeWorker:
         if self.health_error is not None:
             raise self.health_error
         return HealthResult((), self.health_retired)
+
+    def drain_excess_ready(self) -> tuple[str, ...]:
+        self.drain_calls += 1
+        if self.drain_error is not None:
+            raise self.drain_error
+        return self.excess_retired
 
     def fill_once_from_host(self) -> FillResult:
         outcome = self.outcomes[min(self.calls, len(self.outcomes) - 1)]
@@ -115,6 +126,7 @@ class PrewarmWorkerLoopTests(unittest.TestCase):
         self.assertEqual(cycle.created_runtime_ids, ("runtime-new",))
         self.assertEqual(worker.reap_calls, 1)
         self.assertEqual(worker.health_calls, 1)
+        self.assertEqual(worker.drain_calls, 1)
         self.assertEqual(worker.calls, 1)
         self.assertIn("retired=1", messages[0])
 
@@ -133,6 +145,7 @@ class PrewarmWorkerLoopTests(unittest.TestCase):
         self.assertEqual(cycle.next_delay_seconds, 5)
         self.assertEqual(worker.calls, 0)
         self.assertEqual(worker.health_calls, 0)
+        self.assertEqual(worker.drain_calls, 0)
 
     def test_health_check_retires_dead_item_before_filling(self) -> None:
         worker = FakeWorker(
@@ -154,6 +167,37 @@ class PrewarmWorkerLoopTests(unittest.TestCase):
         worker = FakeWorker(
             [fill_result("must-not-start")],
             health_error=RuntimeError("generation mismatch"),
+        )
+        loop = PrewarmWorkerLoop(
+            worker,
+            interval_seconds=5,
+            emit=lambda _message: None,
+        )
+        cycle = loop.run_once()
+        self.assertFalse(cycle.success)
+        self.assertEqual(worker.calls, 0)
+        self.assertEqual(worker.drain_calls, 0)
+
+    def test_cycle_drains_excess_before_recalculating_fill(self) -> None:
+        worker = FakeWorker(
+            [fill_result(reason="target_satisfied")],
+            excess_retired=("ready-extra",),
+        )
+        loop = PrewarmWorkerLoop(
+            worker,
+            interval_seconds=5,
+            emit=lambda _message: None,
+        )
+        cycle = loop.run_once()
+        self.assertTrue(cycle.success)
+        self.assertEqual(cycle.retired_runtime_ids, ("ready-extra",))
+        self.assertEqual(worker.drain_calls, 1)
+        self.assertEqual(worker.calls, 1)
+
+    def test_resize_failure_prevents_fill(self) -> None:
+        worker = FakeWorker(
+            [fill_result("must-not-start")],
+            drain_error=RuntimeError("resize failed"),
         )
         loop = PrewarmWorkerLoop(
             worker,

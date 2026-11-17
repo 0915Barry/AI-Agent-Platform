@@ -15,6 +15,8 @@ class FillTarget(Protocol):
 
     def check_ready_health(self) -> HealthResult: ...
 
+    def drain_excess_ready(self) -> tuple[str, ...]: ...
+
     def fill_once_from_host(self) -> FillResult: ...
 
 
@@ -81,9 +83,11 @@ class PrewarmWorkerLoop:
         try:
             expired_runtime_ids = self.worker.reap_expired_ready()
             health = self.worker.check_ready_health()
+            excess_runtime_ids = self.worker.drain_excess_ready()
             retired_runtime_ids = (
                 *expired_runtime_ids,
                 *health.retired_runtime_ids,
+                *excess_runtime_ids,
             )
             result = self.worker.fill_once_from_host()
         except Exception as error:

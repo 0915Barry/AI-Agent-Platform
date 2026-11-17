@@ -194,6 +194,8 @@ class PrewarmWorker:
 
     def fill_once_from_host(self) -> FillResult:
         """读取一次真实 Host 容量快照并执行单轮补池。"""
+        if not self.config.enabled:
+            return self.fill_once(available_mib=0, free_network_slots=0)
         if self.capacity_probe is None:
             raise PrewarmWorkerError("prewarm capacity probe is not configured")
         capacity = self.capacity_probe.snapshot()
@@ -350,6 +352,47 @@ class PrewarmWorker:
             healthy_runtime_ids=tuple(healthy),
             retired_runtime_ids=tuple(retired),
         )
+
+    def drain_excess_ready(self) -> tuple[str, ...]:
+        """按当前目标回收多余公共 ``ready``；关闭时目标视为零。
+
+        ``list_ready`` 只返回仍可领取的公共项，天然排除 ``claiming/assigned``。
+        回收前再次执行 ``ready → draining`` 条件转换，若并发领取已经发生则跳过，
+        不会停止用户实例。
+        """
+        if self.builder is None:
+            raise PrewarmWorkerError("prewarm builder is not configured")
+        target = self.config.target_ready if self.config.enabled else 0
+        ready_items = self.prewarm_store.list_ready(self.profile_key)
+        excess = max(0, len(ready_items) - target)
+        retired: list[str] = []
+        for item in ready_items[:excess]:
+            runtime_id = str(item["runtime_id"])
+            if not self.prewarm_store.mark_draining(runtime_id):
+                continue
+            try:
+                runtime_status = self.builder.status(runtime_id)
+                if runtime_status is not None and runtime_status.get("processAlive") is True:
+                    if not self._runtime_generation_matches(item, runtime_status):
+                        raise PrewarmWorkerError(
+                            f"refusing to stop mismatched prewarm runtime generation: {runtime_id}"
+                        )
+                    stopped = self.builder.stop(runtime_id, reason="prewarm_pool_resize")
+                    if stopped.get("status") != "stopped":
+                        raise PrewarmWorkerError(
+                            f"excess prewarm runtime did not stop: {runtime_id}"
+                        )
+                self.builder.destroy(runtime_id, preserve_volume=True)
+                if not self.prewarm_store.retire(runtime_id):
+                    raise PrewarmWorkerError(
+                        f"excess prewarm item did not retire: {runtime_id}"
+                    )
+            except Exception as error:
+                if isinstance(error, PrewarmWorkerError):
+                    raise
+                raise PrewarmWorkerError(str(error)[-4000:]) from error
+            retired.append(runtime_id)
+        return tuple(retired)
 
     @staticmethod
     def _runtime_generation_matches(item: dict, runtime_status: dict | None) -> bool:

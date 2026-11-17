@@ -285,6 +285,14 @@ class PrewarmWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(PrewarmWorkerError, "probe is not configured"):
             self.worker(with_builder=True).fill_once_from_host()
 
+    def test_disabled_fill_skips_capacity_probe(self) -> None:
+        result = self.worker(
+            with_builder=True,
+            PREWARM_ENABLED="0",
+        ).fill_once_from_host()
+        self.assertEqual(result.plan.reason, "disabled")
+        self.assertEqual(result.created_runtime_ids, ())
+
     def test_reap_expired_ready_stops_destroys_and_retires(self) -> None:
         self.ready("expired-1", ttl_seconds=-1)
         self.ready("valid-1", ttl_seconds=900)
@@ -426,6 +434,65 @@ class PrewarmWorkerTests(unittest.TestCase):
             self.worker(with_builder=True).check_ready_health()
         self.assertEqual(self.store.get("ready-mismatch")["status"], "draining")
         self.assertEqual(self.builder.destroyed, [])
+
+    def ready_with_generation(self, runtime_id: str) -> None:
+        self.preparing(runtime_id)
+        self.assertTrue(self.store.record_runtime_generation(runtime_id, 1234, 5678))
+        self.assertTrue(self.store.mark_ready(runtime_id, ttl_seconds=900))
+        self.runtime_status(runtime_id)
+
+    def test_disabled_worker_drains_all_public_ready_items(self) -> None:
+        self.ready_with_generation("ready-1")
+        self.ready_with_generation("ready-2")
+        retired = self.worker(
+            with_builder=True,
+            PREWARM_ENABLED="0",
+        ).drain_excess_ready()
+        self.assertEqual(retired, ("ready-1", "ready-2"))
+        self.assertEqual(self.store.get("ready-1")["status"], "retired")
+        self.assertEqual(self.store.get("ready-2")["status"], "retired")
+
+    def test_downscale_drains_only_excess_ready_items(self) -> None:
+        self.ready_with_generation("ready-1")
+        self.ready_with_generation("ready-2")
+        self.ready_with_generation("ready-3")
+        retired = self.worker(
+            with_builder=True,
+            PREWARM_TARGET_READY="1",
+            PREWARM_MAX_TOTAL="3",
+        ).drain_excess_ready()
+        self.assertEqual(retired, ("ready-1", "ready-2"))
+        self.assertEqual(self.store.get("ready-3")["status"], "ready")
+
+    def test_resize_does_not_touch_claiming_item(self) -> None:
+        self.ready_with_generation("claimed-1")
+        self.assertIsNotNone(
+            self.store.claim(
+                "profile-a",
+                "logical-1",
+                "user-1",
+                "/vol/1.ext4",
+                "operation-1",
+                "activation-1",
+            )
+        )
+        retired = self.worker(
+            with_builder=True,
+            PREWARM_ENABLED="0",
+        ).drain_excess_ready()
+        self.assertEqual(retired, ())
+        self.assertEqual(self.store.get("claimed-1")["status"], "claiming")
+        self.assertEqual(self.builder.stopped, [])
+
+    def test_resize_stop_failure_leaves_item_draining(self) -> None:
+        self.ready_with_generation("ready-1")
+        self.builder.fail_stop = True
+        with self.assertRaisesRegex(PrewarmWorkerError, "stop failed"):
+            self.worker(
+                with_builder=True,
+                PREWARM_ENABLED="0",
+            ).drain_excess_ready()
+        self.assertEqual(self.store.get("ready-1")["status"], "draining")
 
 
 if __name__ == "__main__":
