@@ -237,6 +237,30 @@ class PrewarmStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_stale_claiming(
+        self,
+        profile_key: str,
+        timeout_seconds: int,
+        *,
+        now: int | None = None,
+    ) -> list[dict]:
+        """列出超过领取时限的 ``claiming``，不做任何状态转换。"""
+        if timeout_seconds < 1:
+            raise ValueError("claim timeout must be positive")
+        current_time = int(time.time()) if now is None else now
+        cutoff = current_time - timeout_seconds
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM prewarm_items
+                WHERE profile_key=? AND status='claiming'
+                  AND claimed_at IS NOT NULL AND claimed_at <= ?
+                ORDER BY claimed_at,runtime_id
+                """,
+                (profile_key, cutoff),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def mark_ready(
         self,
         runtime_id: str,
