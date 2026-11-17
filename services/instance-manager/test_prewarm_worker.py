@@ -111,6 +111,7 @@ class PrewarmWorkerTests(unittest.TestCase):
         capacity_probe=None,
         claim_auditor=None,
         claim_compensator=None,
+        activation_compensator=None,
         **overrides: str,
     ) -> PrewarmWorker:
         values = {
@@ -133,6 +134,7 @@ class PrewarmWorkerTests(unittest.TestCase):
             new_claim_token=lambda: "raw-claim-token",
             claim_auditor=claim_auditor,
             claim_compensator=claim_compensator,
+            activation_compensator=activation_compensator,
         )
 
     @staticmethod
@@ -147,26 +149,33 @@ class PrewarmWorkerTests(unittest.TestCase):
             binding_status=None,
         )
 
-    def test_stale_claim_recovery_compensates_pre_activation_timeouts(self) -> None:
+    def test_stale_claim_recovery_routes_by_classification(self) -> None:
         auditor = self.FakeClaimAuditor(
             (
                 self.claim_audit("safe-1", "pre_attach_timeout"),
                 self.claim_audit("reserved-1", "reserved_timeout"),
                 self.claim_audit("activating-1", "activation_timeout"),
+                self.claim_audit("committing-1", "commit_pending"),
             )
         )
-        compensator = self.FakeClaimCompensator()
+        pre_activation = self.FakeClaimCompensator()
+        activation = self.FakeClaimCompensator()
         result = self.worker(
             claim_auditor=auditor,
-            claim_compensator=compensator,
+            claim_compensator=pre_activation,
+            activation_compensator=activation,
             PREWARM_CLAIM_TIMEOUT_SECONDS="45",
         ).recover_stale_claims()
         self.assertEqual(auditor.timeouts, [45])
-        self.assertEqual(compensator.calls, ["safe-1", "reserved-1"])
-        self.assertEqual(result.compensated_runtime_ids, ("safe-1", "reserved-1"))
+        self.assertEqual(pre_activation.calls, ["safe-1", "reserved-1"])
+        self.assertEqual(activation.calls, ["activating-1"])
+        self.assertEqual(
+            result.compensated_runtime_ids,
+            ("safe-1", "reserved-1", "activating-1"),
+        )
         self.assertEqual(
             result.deferred_classifications,
-            ("activating-1:activation_timeout",),
+            ("committing-1:commit_pending",),
         )
         self.assertEqual(result.errors, ())
 

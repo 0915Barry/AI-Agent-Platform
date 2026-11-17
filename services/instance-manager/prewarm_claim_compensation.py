@@ -166,3 +166,133 @@ class PreActivationClaimCompensator:
             int(runtime_status.get("pid", -1)) == int(expected_pid)
             and int(runtime_status.get("processStartTicks", -1)) == int(expected_ticks)
         )
+
+
+class ActivationTimeoutClaimCompensator:
+    """处理已确认挂载但从未提交的 ``activation_timeout`` 领取。
+
+    Guest 已挂载用户盘、binding 已建立为 ``activating``，但 commit 从未发生。
+    补偿是完整回滚：停 VMM → 销毁运行时 → 释放 ``attached`` 附件 → 删除 binding
+    → 退休预热项 → 结束启动操作。附件与 binding 必须在 VMM 停止后释放，避免
+    用户盘仍被挂载时就解锁给其他实例。
+    """
+
+    def __init__(
+        self,
+        *,
+        prewarm_store: PrewarmStore,
+        startup_store: StartupStore,
+        attachment_store: VolumeAttachmentStore,
+        runtime_store: RuntimeStore,
+        runtime: ClaimRuntime,
+    ) -> None:
+        self.prewarm_store = prewarm_store
+        self.startup_store = startup_store
+        self.attachment_store = attachment_store
+        self.runtime_store = runtime_store
+        self.runtime = runtime
+
+    def compensate(self, audit: StaleClaimAudit) -> ClaimCompensationResult:
+        if audit.classification != "activation_timeout":
+            raise ClaimCompensationError(
+                f"automatic compensation is not allowed for {audit.classification}"
+            )
+        operation = self.startup_store.get(audit.operation_id)
+        if operation is None or operation.get("status") not in ACTIVE_STARTUP_STATUSES:
+            raise ClaimCompensationError("startup operation is no longer active")
+
+        operation_status = str(operation["status"])
+        if operation_status != "compensating" and not self.startup_store.transition(
+            audit.operation_id,
+            operation_status,
+            "compensating",
+            runtime_id=audit.runtime_id,
+            error="stale activation prewarm claim",
+        ):
+            raise ClaimCompensationError("startup operation changed before compensation")
+
+        item = self.prewarm_store.get(audit.runtime_id)
+        operation = self.startup_store.get(audit.operation_id)
+        attachment = (
+            self.attachment_store.get(str(item.get("volume_path") or ""))
+            if item is not None
+            else None
+        )
+        binding = self.runtime_store.get_binding(audit.logical_instance_id)
+        if (
+            item is None
+            or item.get("status") != "claiming"
+            or item.get("operation_id") != audit.operation_id
+            or item.get("logical_instance_id") != audit.logical_instance_id
+            or operation is None
+            or operation.get("status") != "compensating"
+        ):
+            raise ClaimCompensationError(
+                "claim state changed after entering compensation; ownership remains isolated"
+            )
+        if attachment is None or str(attachment.get("status")) != "attached":
+            raise ClaimCompensationError(
+                "attached volume attachment is missing or changed; ownership remains isolated"
+            )
+        if (
+            binding is None
+            or binding.get("runtimeId") != audit.runtime_id
+            or binding.get("status") != "activating"
+            or binding.get("activationId") != str(item.get("activation_id"))
+        ):
+            raise ClaimCompensationError(
+                "activating runtime binding is missing or changed; ownership remains isolated"
+            )
+
+        runtime_status = self.runtime.status(audit.runtime_id)
+        if runtime_status is not None and runtime_status.get("processAlive") is True:
+            if not self._generation_matches(item, runtime_status):
+                raise ClaimCompensationError(
+                    "refusing to stop mismatched prewarm runtime generation"
+                )
+            stopped = self.runtime.stop(
+                audit.runtime_id, reason="prewarm_claim_timeout_activation"
+            )
+            if stopped.get("status") != "stopped":
+                raise ClaimCompensationError("activation runtime did not stop")
+        self.runtime.destroy(audit.runtime_id, preserve_volume=True)
+
+        if not self.attachment_store.release(
+            str(item["volume_path"]), audit.operation_id
+        ):
+            raise ClaimCompensationError(
+                "failed to release attached volume attachment after runtime cleanup"
+            )
+        self.runtime_store.delete_binding(audit.logical_instance_id)
+
+        if not self.prewarm_store.mark_error(
+            audit.runtime_id,
+            audit.operation_id,
+            "stale activation prewarm claim",
+        ):
+            raise ClaimCompensationError("claim generation changed after runtime cleanup")
+        if not self.prewarm_store.mark_draining(audit.runtime_id):
+            raise ClaimCompensationError("failed to enter draining after claim cleanup")
+        if not self.prewarm_store.retire(audit.runtime_id):
+            raise ClaimCompensationError("failed to retire compensated prewarm item")
+        if not self.startup_store.mark_failed(
+            audit.operation_id,
+            "stale activation prewarm claim was cleaned",
+        ):
+            raise ClaimCompensationError("failed to finalize compensated startup operation")
+        return ClaimCompensationResult(
+            runtime_id=audit.runtime_id,
+            operation_id=audit.operation_id,
+            status="retired",
+        )
+
+    @staticmethod
+    def _generation_matches(item: dict, runtime_status: dict) -> bool:
+        expected_pid = item.get("vmm_pid")
+        expected_ticks = item.get("process_start_ticks")
+        if expected_pid is None or expected_ticks is None:
+            return False
+        return (
+            int(runtime_status.get("pid", -1)) == int(expected_pid)
+            and int(runtime_status.get("processStartTicks", -1)) == int(expected_ticks)
+        )

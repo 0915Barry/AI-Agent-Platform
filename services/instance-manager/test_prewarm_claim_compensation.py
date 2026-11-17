@@ -7,7 +7,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from prewarm_claim_audit import PrewarmClaimAuditor
-from prewarm_claim_compensation import ClaimCompensationError, PreActivationClaimCompensator
+from prewarm_claim_compensation import (
+    ActivationTimeoutClaimCompensator,
+    ClaimCompensationError,
+    PreActivationClaimCompensator,
+)
 from prewarm_store import PrewarmStore
 from runtime_store import RuntimeStore, VolumeAttachmentStore
 from startup_store import StartupStore
@@ -56,6 +60,13 @@ class PreActivationClaimCompensatorTests(unittest.TestCase):
             profile_key="profile-a",
         )
         self.compensator = PreActivationClaimCompensator(
+            prewarm_store=self.prewarm,
+            startup_store=self.startups,
+            attachment_store=self.attachments,
+            runtime_store=self.runtimes,
+            runtime=self.runtime,
+        )
+        self.activation_compensator = ActivationTimeoutClaimCompensator(
             prewarm_store=self.prewarm,
             startup_store=self.startups,
             attachment_store=self.attachments,
@@ -207,6 +218,52 @@ class PreActivationClaimCompensatorTests(unittest.TestCase):
                 "reserved volume attachment is missing or changed",
             ):
                 self.compensator.compensate(self.auditor.audit(30, now=self.NOW)[0])
+        self.assertEqual(self.runtime.stopped, [])
+        self.assertEqual(self.prewarm.get("runtime-1")["status"], "claiming")
+
+    def _make_activation_claim(self) -> None:
+        self._reserve_attachment()
+        self.attachments.mark_attached("/vol/user-1.ext4", "operation-1")
+        self._save_binding("activating")
+
+    def test_activation_timeout_is_compensated_and_releases_attachment_and_binding(self) -> None:
+        self._make_activation_claim()
+        audit = self.auditor.audit(30, now=self.NOW)[0]
+        self.assertEqual(audit.classification, "activation_timeout")
+
+        result = self.activation_compensator.compensate(audit)
+        self.assertEqual(result.status, "retired")
+        self.assertEqual(self.prewarm.get("runtime-1")["status"], "retired")
+        self.assertEqual(self.startups.get("operation-1")["status"], "failed")
+        self.assertIsNone(self.attachments.get("/vol/user-1.ext4"))
+        self.assertIsNone(self.runtimes.get_binding("logical-1"))
+        self.assertEqual(
+            self.runtime.stopped,
+            [("runtime-1", "prewarm_claim_timeout_activation")],
+        )
+        self.assertEqual(self.runtime.destroyed, [("runtime-1", True)])
+
+    def test_activation_binding_race_prevents_cleanup(self) -> None:
+        self._make_activation_claim()
+        original = self.startups.transition
+
+        def transition_with_race(*args, **kwargs):
+            changed = original(*args, **kwargs)
+            if changed and args[2] == "compensating":
+                # binding 状态被并发改成 error，越过安全边界。
+                binding = self.runtimes.get_binding("logical-1")
+                binding["status"] = "error"
+                self.runtimes.save_binding(binding)
+            return changed
+
+        with patch.object(self.startups, "transition", side_effect=transition_with_race):
+            with self.assertRaisesRegex(
+                ClaimCompensationError,
+                "activating runtime binding is missing or changed",
+            ):
+                self.activation_compensator.compensate(
+                    self.auditor.audit(30, now=self.NOW)[0]
+                )
         self.assertEqual(self.runtime.stopped, [])
         self.assertEqual(self.prewarm.get("runtime-1")["status"], "claiming")
 

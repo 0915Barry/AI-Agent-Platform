@@ -11,7 +11,10 @@ from typing import Callable
 
 from prewarm_capacity import LinuxHostCapacityProbe
 from prewarm_claim_audit import PrewarmClaimAuditor
-from prewarm_claim_compensation import PreActivationClaimCompensator
+from prewarm_claim_compensation import (
+    ActivationTimeoutClaimCompensator,
+    PreActivationClaimCompensator,
+)
 from prewarm_config import DEFAULT_CONFIG_PATH, PrewarmConfig
 from prewarm_store import PrewarmStore
 from prewarm_worker import PrewarmWorker
@@ -88,6 +91,13 @@ def run(
             runtime_store=runtime_store,
             runtime=runtime,
         )
+        activation_compensator = ActivationTimeoutClaimCompensator(
+            prewarm_store=prewarm_store,
+            startup_store=startup_store,
+            attachment_store=attachment_store,
+            runtime_store=runtime_store,
+            runtime=runtime,
+        )
         worker = PrewarmWorker(
             config,
             prewarm_store=prewarm_store,
@@ -96,6 +106,7 @@ def run(
             capacity_probe=capacity_probe_factory(runtime.network_manager),
             claim_auditor=claim_auditor,
             claim_compensator=claim_compensator,
+            activation_compensator=activation_compensator,
         )
         loop = PrewarmWorkerLoop(
             worker,

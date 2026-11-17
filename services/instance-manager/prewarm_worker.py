@@ -16,7 +16,10 @@ from typing import Callable, Protocol
 
 from prewarm_capacity import HostCapacity
 from prewarm_claim_audit import PrewarmClaimAuditor
-from prewarm_claim_compensation import PreActivationClaimCompensator
+from prewarm_claim_compensation import (
+    ActivationTimeoutClaimCompensator,
+    PreActivationClaimCompensator,
+)
 from prewarm_config import PrewarmConfig
 from prewarm_store import PrewarmStore
 
@@ -108,6 +111,7 @@ class PrewarmWorker:
         new_claim_token: Callable[[], str] | None = None,
         claim_auditor: PrewarmClaimAuditor | None = None,
         claim_compensator: PreActivationClaimCompensator | None = None,
+        activation_compensator: ActivationTimeoutClaimCompensator | None = None,
     ) -> None:
         self.config = config
         self.prewarm_store = prewarm_store
@@ -116,6 +120,7 @@ class PrewarmWorker:
         self.capacity_probe = capacity_probe
         self.claim_auditor = claim_auditor
         self.claim_compensator = claim_compensator
+        self.activation_compensator = activation_compensator
         self.host_id = host_id or socket.gethostname()
         self._new_runtime_id = new_runtime_id or (
             lambda: f"prewarm-{uuid.uuid4().hex[:20]}"
@@ -125,26 +130,33 @@ class PrewarmWorker:
         )
 
     def recover_stale_claims(self) -> ClaimRecoveryResult:
-        """审计超时领取，并补偿尚未确认 Guest 挂载用户盘的项目。
+        """审计超时领取，并按分类分发给对应补偿器。
 
-        ``pre_attach_timeout`` 与 ``reserved_timeout`` 由补偿器回滚；领取已经进入
-        「确认挂载」或「提交」阶段（``activation_timeout`` / ``commit_pending``）时，
-        本方法只报告分类，不推断所有权也不执行清理。单项补偿失败同样只记录错误，
-        使公共池的 TTL、健康检查和补池仍可继续运行；失败项保持隔离状态，等待
-        下一轮或人工检查。
+        ``pre_attach_timeout`` / ``reserved_timeout`` 由 PreActivationClaimCompensator
+        回滚；``activation_timeout`` 由 ActivationTimeoutClaimCompensator 完整回滚
+        （含 attached 附件与 binding）；``commit_pending`` 只报告分类不自动补偿。
+        单项补偿失败只记录错误，使公共池的 TTL、健康检查和补池仍可继续运行；
+        失败项保持隔离状态，等待下一轮或人工检查。
         """
-        if self.claim_auditor is None or self.claim_compensator is None:
+        if self.claim_auditor is None:
             return ClaimRecoveryResult((), (), ())
 
         compensated: list[str] = []
         deferred: list[str] = []
         errors: list[str] = []
         for audit in self.claim_auditor.audit(self.config.claim_timeout_seconds):
-            if audit.classification not in ("pre_attach_timeout", "reserved_timeout"):
+            if audit.classification in ("pre_attach_timeout", "reserved_timeout"):
+                compensator = self.claim_compensator
+            elif audit.classification == "activation_timeout":
+                compensator = self.activation_compensator
+            else:
+                compensator = None
+
+            if compensator is None:
                 deferred.append(f"{audit.runtime_id}:{audit.classification}")
                 continue
             try:
-                result = self.claim_compensator.compensate(audit)
+                result = compensator.compensate(audit)
                 compensated.append(result.runtime_id)
             except Exception as error:
                 message = str(error).replace("\n", " ")[-1000:]
