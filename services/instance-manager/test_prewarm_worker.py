@@ -112,6 +112,7 @@ class PrewarmWorkerTests(unittest.TestCase):
         claim_auditor=None,
         claim_compensator=None,
         activation_compensator=None,
+        commit_pending_compensator=None,
         **overrides: str,
     ) -> PrewarmWorker:
         values = {
@@ -135,6 +136,7 @@ class PrewarmWorkerTests(unittest.TestCase):
             claim_auditor=claim_auditor,
             claim_compensator=claim_compensator,
             activation_compensator=activation_compensator,
+            commit_pending_compensator=commit_pending_compensator,
         )
 
     @staticmethod
@@ -156,26 +158,30 @@ class PrewarmWorkerTests(unittest.TestCase):
                 self.claim_audit("reserved-1", "reserved_timeout"),
                 self.claim_audit("activating-1", "activation_timeout"),
                 self.claim_audit("committing-1", "commit_pending"),
+                self.claim_audit("odd-1", "inconsistent"),
             )
         )
         pre_activation = self.FakeClaimCompensator()
         activation = self.FakeClaimCompensator()
+        commit_pending = self.FakeClaimCompensator()
         result = self.worker(
             claim_auditor=auditor,
             claim_compensator=pre_activation,
             activation_compensator=activation,
+            commit_pending_compensator=commit_pending,
             PREWARM_CLAIM_TIMEOUT_SECONDS="45",
         ).recover_stale_claims()
         self.assertEqual(auditor.timeouts, [45])
         self.assertEqual(pre_activation.calls, ["safe-1", "reserved-1"])
         self.assertEqual(activation.calls, ["activating-1"])
+        self.assertEqual(commit_pending.calls, ["committing-1"])
         self.assertEqual(
             result.compensated_runtime_ids,
-            ("safe-1", "reserved-1", "activating-1"),
+            ("safe-1", "reserved-1", "activating-1", "committing-1"),
         )
         self.assertEqual(
             result.deferred_classifications,
-            ("committing-1:commit_pending",),
+            ("odd-1:inconsistent",),
         )
         self.assertEqual(result.errors, ())
 

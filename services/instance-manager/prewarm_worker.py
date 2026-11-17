@@ -18,6 +18,7 @@ from prewarm_capacity import HostCapacity
 from prewarm_claim_audit import PrewarmClaimAuditor
 from prewarm_claim_compensation import (
     ActivationTimeoutClaimCompensator,
+    CommitPendingClaimCompensator,
     PreActivationClaimCompensator,
 )
 from prewarm_config import PrewarmConfig
@@ -112,6 +113,7 @@ class PrewarmWorker:
         claim_auditor: PrewarmClaimAuditor | None = None,
         claim_compensator: PreActivationClaimCompensator | None = None,
         activation_compensator: ActivationTimeoutClaimCompensator | None = None,
+        commit_pending_compensator: CommitPendingClaimCompensator | None = None,
     ) -> None:
         self.config = config
         self.prewarm_store = prewarm_store
@@ -121,6 +123,7 @@ class PrewarmWorker:
         self.claim_auditor = claim_auditor
         self.claim_compensator = claim_compensator
         self.activation_compensator = activation_compensator
+        self.commit_pending_compensator = commit_pending_compensator
         self.host_id = host_id or socket.gethostname()
         self._new_runtime_id = new_runtime_id or (
             lambda: f"prewarm-{uuid.uuid4().hex[:20]}"
@@ -133,8 +136,9 @@ class PrewarmWorker:
         """审计超时领取，并按分类分发给对应补偿器。
 
         ``pre_attach_timeout`` / ``reserved_timeout`` 由 PreActivationClaimCompensator
-        回滚；``activation_timeout`` 由 ActivationTimeoutClaimCompensator 完整回滚
-        （含 attached 附件与 binding）；``commit_pending`` 只报告分类不自动补偿。
+        回滚；``activation_timeout`` 由 ActivationTimeoutClaimCompensator 完整回滚；
+        ``commit_pending`` 由 CommitPendingClaimCompensator 向前修复。其余异常分类
+        （operation_missing / commit_incomplete / inconsistent 等）只报告不自动补偿。
         单项补偿失败只记录错误，使公共池的 TTL、健康检查和补池仍可继续运行；
         失败项保持隔离状态，等待下一轮或人工检查。
         """
@@ -149,6 +153,8 @@ class PrewarmWorker:
                 compensator = self.claim_compensator
             elif audit.classification == "activation_timeout":
                 compensator = self.activation_compensator
+            elif audit.classification == "commit_pending":
+                compensator = self.commit_pending_compensator
             else:
                 compensator = None
 

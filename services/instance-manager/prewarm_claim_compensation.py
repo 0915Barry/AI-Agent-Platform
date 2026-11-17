@@ -296,3 +296,74 @@ class ActivationTimeoutClaimCompensator:
             int(runtime_status.get("pid", -1)) == int(expected_pid)
             and int(runtime_status.get("processStartTicks", -1)) == int(expected_ticks)
         )
+
+
+class CommitPendingClaimCompensator:
+    """处理已提交但最后一笔记账缺失的 ``commit_pending`` 领取（向前修复）。
+
+    Guest 已挂载用户盘、binding 已 ``running``，只差 item 未置 ``assigned``。
+    补偿不碰任何运行中的资源：不停 VMM、不释放附件、不删 binding，只补两笔
+    条件写——item ``claiming→assigned``、操作 ``committing→succeeded``。
+    """
+
+    def __init__(
+        self,
+        *,
+        prewarm_store: PrewarmStore,
+        startup_store: StartupStore,
+        attachment_store: VolumeAttachmentStore,
+        runtime_store: RuntimeStore,
+    ) -> None:
+        self.prewarm_store = prewarm_store
+        self.startup_store = startup_store
+        self.attachment_store = attachment_store
+        self.runtime_store = runtime_store
+
+    def compensate(self, audit: StaleClaimAudit) -> ClaimCompensationResult:
+        if audit.classification != "commit_pending":
+            raise ClaimCompensationError(
+                f"automatic compensation is not allowed for {audit.classification}"
+            )
+        operation = self.startup_store.get(audit.operation_id)
+        if operation is None or operation.get("status") != "committing":
+            raise ClaimCompensationError("startup operation is not committing")
+
+        item = self.prewarm_store.get(audit.runtime_id)
+        attachment = (
+            self.attachment_store.get(str(item.get("volume_path") or ""))
+            if item is not None
+            else None
+        )
+        binding = self.runtime_store.get_binding(audit.logical_instance_id)
+        if (
+            item is None
+            or item.get("status") != "claiming"
+            or item.get("operation_id") != audit.operation_id
+            or item.get("logical_instance_id") != audit.logical_instance_id
+        ):
+            raise ClaimCompensationError(
+                "claim state changed before commit repair; ownership remains isolated"
+            )
+        if attachment is None or str(attachment.get("status")) != "attached":
+            raise ClaimCompensationError(
+                "attached volume attachment is missing or changed; ownership remains isolated"
+            )
+        if (
+            binding is None
+            or binding.get("runtimeId") != audit.runtime_id
+            or binding.get("status") != "running"
+            or binding.get("activationId") != str(item.get("activation_id"))
+        ):
+            raise ClaimCompensationError(
+                "running runtime binding is missing or changed; ownership remains isolated"
+            )
+
+        if not self.prewarm_store.mark_assigned(audit.runtime_id, audit.operation_id):
+            raise ClaimCompensationError("claim generation changed during commit repair")
+        if not self.startup_store.mark_succeeded(audit.operation_id):
+            raise ClaimCompensationError("startup operation changed during commit repair")
+        return ClaimCompensationResult(
+            runtime_id=audit.runtime_id,
+            operation_id=audit.operation_id,
+            status="assigned",
+        )

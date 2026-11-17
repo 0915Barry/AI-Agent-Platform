@@ -13,6 +13,7 @@ from prewarm_capacity import LinuxHostCapacityProbe
 from prewarm_claim_audit import PrewarmClaimAuditor
 from prewarm_claim_compensation import (
     ActivationTimeoutClaimCompensator,
+    CommitPendingClaimCompensator,
     PreActivationClaimCompensator,
 )
 from prewarm_config import DEFAULT_CONFIG_PATH, PrewarmConfig
@@ -98,6 +99,12 @@ def run(
             runtime_store=runtime_store,
             runtime=runtime,
         )
+        commit_pending_compensator = CommitPendingClaimCompensator(
+            prewarm_store=prewarm_store,
+            startup_store=startup_store,
+            attachment_store=attachment_store,
+            runtime_store=runtime_store,
+        )
         worker = PrewarmWorker(
             config,
             prewarm_store=prewarm_store,
@@ -107,6 +114,7 @@ def run(
             claim_auditor=claim_auditor,
             claim_compensator=claim_compensator,
             activation_compensator=activation_compensator,
+            commit_pending_compensator=commit_pending_compensator,
         )
         loop = PrewarmWorkerLoop(
             worker,

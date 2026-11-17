@@ -10,6 +10,7 @@ from prewarm_claim_audit import PrewarmClaimAuditor
 from prewarm_claim_compensation import (
     ActivationTimeoutClaimCompensator,
     ClaimCompensationError,
+    CommitPendingClaimCompensator,
     PreActivationClaimCompensator,
 )
 from prewarm_store import PrewarmStore
@@ -72,6 +73,12 @@ class PreActivationClaimCompensatorTests(unittest.TestCase):
             attachment_store=self.attachments,
             runtime_store=self.runtimes,
             runtime=self.runtime,
+        )
+        self.commit_pending_compensator = CommitPendingClaimCompensator(
+            prewarm_store=self.prewarm,
+            startup_store=self.startups,
+            attachment_store=self.attachments,
+            runtime_store=self.runtimes,
         )
         self._create_stale_claim()
 
@@ -266,6 +273,41 @@ class PreActivationClaimCompensatorTests(unittest.TestCase):
                 )
         self.assertEqual(self.runtime.stopped, [])
         self.assertEqual(self.prewarm.get("runtime-1")["status"], "claiming")
+
+    def _make_commit_pending_claim(self) -> None:
+        self._reserve_attachment()
+        self.attachments.mark_attached("/vol/user-1.ext4", "operation-1")
+        self._save_binding("running")
+        self.assertTrue(
+            self.startups.transition(
+                "operation-1", "executing", "committing", runtime_id="runtime-1"
+            )
+        )
+
+    def test_commit_pending_is_repaired_forward_without_touching_runtime(self) -> None:
+        self._make_commit_pending_claim()
+        audit = self.auditor.audit(30, now=self.NOW)[0]
+        self.assertEqual(audit.classification, "commit_pending")
+
+        result = self.commit_pending_compensator.compensate(audit)
+        self.assertEqual(result.status, "assigned")
+        self.assertEqual(self.prewarm.get("runtime-1")["status"], "assigned")
+        self.assertEqual(self.startups.get("operation-1")["status"], "succeeded")
+        # 向前修复不停 VMM、不释放附件、不删 binding。
+        self.assertEqual(self.runtime.stopped, [])
+        self.assertEqual(self.runtime.destroyed, [])
+        self.assertIsNotNone(self.attachments.get("/vol/user-1.ext4"))
+        self.assertIsNotNone(self.runtimes.get_binding("logical-1"))
+
+    def test_commit_pending_rejects_non_committing_operation(self) -> None:
+        # op 仍停在 executing（未推进到 committing），补偿器应拒绝。
+        self._reserve_attachment()
+        self.attachments.mark_attached("/vol/user-1.ext4", "operation-1")
+        self._save_binding("running")
+        audit = self.auditor.audit(30, now=self.NOW)[0]
+        self.assertEqual(audit.classification, "commit_pending")
+        with self.assertRaisesRegex(ClaimCompensationError, "not committing"):
+            self.commit_pending_compensator.compensate(audit)
 
 
 if __name__ == "__main__":

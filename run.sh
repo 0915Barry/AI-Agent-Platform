@@ -75,6 +75,8 @@ Commands:
                          Verify stale reserved claim compensation and attachment release
   prewarm-activation-timeout-smoke-test
                          Verify stale activation claim rollback and binding cleanup
+  prewarm-commit-pending-smoke-test
+                         Verify stale commit-pending forward repair keeps runtime alive
   prewarm-worker-lock-smoke-test
                          Verify the real Worker process lock and clean rejection
   prewarm-worker-service-smoke-test
@@ -577,6 +579,18 @@ smoke_test_prewarm_activation_timeout() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/prewarm-activation-timeout-smoke-test.sh'"
 }
 
+smoke_test_prewarm_commit_pending() {
+  sync_repo
+  echo "Testing real commit-pending claim forward repair in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/prewarm-commit-pending-smoke-test.sh'"
+}
+
 smoke_test_prewarm_worker_lock() {
   sync_repo
   echo "Testing the real prewarm Worker process lock in ${VM_USER}@${VM_HOST}..."
@@ -798,6 +812,9 @@ case "${command}" in
     ;;
   prewarm-activation-timeout-smoke-test)
     smoke_test_prewarm_activation_timeout
+    ;;
+  prewarm-commit-pending-smoke-test)
+    smoke_test_prewarm_commit_pending
     ;;
   prewarm-worker-lock-smoke-test)
     smoke_test_prewarm_worker_lock
