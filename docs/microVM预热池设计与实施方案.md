@@ -1,10 +1,10 @@
 # microVM 预热池设计与实施方案
 
-> 文档状态：阶段 3 接入中，尚未允许生产启用。
+> 文档状态：阶段 4 核心功能完成，阶段 5 故障补偿接入中，尚未允许生产启用。
 >
-> 当前进度日期：2026-11-16。
+> 当前进度日期：2026-11-17。
 >
-> 当前结论：数据库状态机、数据盘独占、真实 Runtime 预热接管和 Control Plane 启动策略已经落地；自动补池、Control Plane 停止/销毁清理和预热故障协调尚未完成。预热功能默认关闭，现有冷启动和快照恢复继续作为可用基线。
+> 当前结论：数据库状态机、数据盘独占、真实 Runtime 接管、Control Plane 启停清理和自动补池 Worker 已经落地。Worker 已具备容量守卫、TTL 回收、稳态健康检查、重启协调、缩容、配置热重载、单进程锁和独立服务管理；超时领取已完成只读分类，并只对尚未接触用户数据盘的 `pre_attach_timeout` 启用安全补偿。真实超时领取 smoke test、其余故障分类的补偿策略和阶段 5 压力验收尚未完成。预热功能继续默认关闭。
 
 ## 1. 目标与边界
 
@@ -49,15 +49,21 @@
 - 正式 `NetworkManager`、`RuntimeStore` 和 `InstanceRuntime` 上的空白 Guest 创建、热切盘、激活和提交；
 - 快照暂停保留网络槽位，恢复时复用原租约；
 - `StartupCoordinator` 的预热优先、池空冷启动回退和激活失败禁止回退；
-- Control Plane 启动入口接入上述策略，默认关闭回归保持通过。
+- Control Plane 启动入口接入上述策略，停止和销毁路径能够清理附件、绑定与预热项；
+- 自动补池 Worker 的目标容量、最大数量、Host 内存和网络槽位守卫；
+- TTL 回收、`ready` Firecracker 代次健康检查、Worker 重启协调和自动补位；
+- Worker 单进程锁、独立服务启停、配置热重载和目标缩容；
+- 超时 `claiming` 的状态分类，以及 `pre_attach_timeout` 的代次校验和安全补偿；
+- 默认关闭时 CLI、冷启动、快照和恢复链路保持通过。
 
 仍未完成：
 
-- Control Plane 停止和销毁路径调用 `complete_stop()` 释放附件、绑定与预热项；
-- 自动补池、TTL/健康回收和重启 Reconcile Worker；
-- 启用预热后的 Control Plane 全链路压力与故障测试。
+- 真实 Firecracker 环境下的超时领取补偿 smoke test；
+- `reserved_timeout`、`activation_timeout`、`commit_pending` 等已接触数据盘阶段的自动补偿；
+- 多请求并发领取、Worker/Control Plane 中断和至少 100 轮领取补位压力测试；
+- 性能样本、灰度策略、监控指标和生产部署方式。
 
-因此当前代码已完成单台人工预热接管，但仍不能直接打开 `PREWARM_ENABLED=1` 投入使用。
+因此当前代码已经形成可手动运行和测试的完整预热链路，但尚未满足生产开启条件，`PREWARM_ENABLED` 继续保持 `0`。
 
 ## 3. 设计原则
 
@@ -153,28 +159,53 @@ Worker 和 Reconcile 共用同一套条件转换，避免每个调用点各自�
 
 ### 5.3 PrewarmManager：单项编排
 
-`prewarm_manager.py` 作为单项编排入口，已实现领取、激活、提交和停止后归属清理；自动补池相关方法仍留待 Worker 阶段：
+`prewarm_manager.py` 作为用户领取侧的单项编排入口，已实现领取、激活、提交和停止后归属清理：
 
-- `prepare_one()`：创建一台空白 Guest；
 - `claim()`：领取一条 `ready` 记录；
 - `activate()`：切盘并执行 Guest 激活；
 - `commit()`：确认逻辑实例、物理运行时和数据盘绑定；
-- `retire()`：销毁不可继续使用的池项；
-- `reconcile()`：核对数据库与真实资源。
+- `complete_stop()`：用户实例停止后释放附件和绑定，并退休已分配预热项。
+
+公共池的 `prepare_one()`、健康检查、回收和 reconcile 已归入 `PrewarmWorker`，避免用户请求编排与后台容量维护混在同一模块。
 
 ### 5.4 PrewarmWorker：后台补池
 
-建议新增 `services/instance-manager/prewarm_worker.py`。它只负责公共池维护：
+`services/instance-manager/prewarm_worker.py` 已实现公共池维护：
 
-- 周期检查 `ready` 数量；
-- 在预算允许时补池；
-- 健康检查和 TTL 回收；
-- 清理 `error`、过期 `claiming` 和失联 VMM；
-- Control Plane 重启后执行 reconcile。
+- 根据 `target/max/build_concurrency` 和 Host 容量计算补池数量；
+- 创建真实空白 Guest，并在数据库提交失败时执行补偿清理；
+- 执行 TTL 回收、`ready` 进程代次健康检查和目标缩容；
+- Worker 启动时先 reconcile，再进入周期巡检和失败退避；
+- 热重载 `config/prewarm.env`，无需重启即可调整目标数量或关闭池；
+- 审计超时 `claiming`，只自动补偿尚未产生 attachment/binding 的项目。
 
 Worker 不接收用户请求，也不能直接修改业务实例状态。
 
-### 5.5 ActivationClient：Host 激活客户端
+相关进程入口为 `prewarm_worker_main.py`，手动服务管理位于
+`scripts/linux/prewarm-worker-service.sh`。当前使用 `flock` 保证单 Host 同时只有一个
+Worker；它不是多 Host Leader Election，扩展到服务器集群前仍需替换为分布式租约。
+
+### 5.5 超时领取审计与补偿
+
+`prewarm_claim_audit.py` 组合 `prewarm_items`、`startup_operations`、
+`volume_attachments` 和 `runtime_bindings`，将超时领取分类为：
+
+- `pre_attach_timeout`；
+- `reserved_timeout`；
+- `activation_timeout`；
+- `commit_pending`；
+- `operation_missing/operation_mismatch`；
+- `failed_requires_cleanup/terminal_inconsistent/attachment_error/inconsistent`。
+
+`prewarm_claim_compensation.py` 当前只自动处理 `pre_attach_timeout`。它先把本代启动操作
+条件转换为 `compensating`，再重新读取预热项、attachment 和 binding；只有确认数据盘尚未
+被预留或挂载、逻辑/物理绑定尚未建立，并且 Firecracker PID 与 `process_start_ticks` 完全匹配
+时，才停止并销毁该 Runtime，最后把预热项转为 `retired`、启动操作转为 `failed`。
+
+任何竞争、代次不一致或已接触数据盘的分类都不会自动停止 Runtime，而是记录
+`PREWARM_WORKER_CLAIM_DEFERRED` 或 `PREWARM_WORKER_CLAIM_ERROR`，等待后续专项补偿。
+
+### 5.6 ActivationClient：Host 激活客户端
 
 Host 侧固定协议已封装在 `prewarm_activation.py`，负责：
 
@@ -186,7 +217,7 @@ Host 侧固定协议已封装在 `prewarm_activation.py`，负责：
 
 Guest 继续使用现有 `scripts/guest/prewarm-activate.sh`，不得接受任意 Shell 命令或 `eval`。
 
-### 5.6 复用现有模块
+### 5.7 复用现有模块
 
 | 模块 | 预热中的职责 |
 |---|---|
@@ -456,6 +487,10 @@ running复用 → 有效快照恢复 → ready预热领取 → 冷启动
 | Guest 激活成功、Host 提交失败 | 进入补偿状态；数据盘仍保持独占，reconcile 后提交或销毁 |
 | Host 提交成功、COMMIT 响应丢失 | 数据库绑定有效；重连查询，不重复领取 |
 | Worker 与 TTL 回收并发 | 回收只允许 `ready→draining`，不能处理 `claiming` |
+| `claiming` 超时且尚无 attachment/binding | 条件进入 `compensating`，复查归属与进程代次后停止、销毁并退休 |
+| `claiming` 超时但已预留或挂载数据盘 | 只分类并记录 deferred，不自动释放数据盘或停止 Runtime |
+| 补偿开始后并发出现 attachment/binding | 立即中止清理，保持隔离状态，禁止误停正在激活的实例 |
+| Firecracker PID 或启动代次不匹配 | 硬拒绝停止，记录错误并等待人工或后续 reconcile |
 | 预热项健康检查超时 | `ready→error→draining`，不交给用户 |
 | 快照原槽位被占用 | 自动预热启用前通过槽位保留解决；否则安全拒绝恢复 |
 | Control Plane 重启 | 根据 operation、binding、runtime、lease 和真实 PID 执行 reconcile |
@@ -471,7 +506,9 @@ running复用 → 有效快照恢复 → ready预热领取 → 冷启动
 
 - 数据库 `preparing`，但 VMM 不存在：标记 `error` 并清理租约；
 - 数据库 `ready`，但 `PROBE_V1` 失败：进入 `draining`；
-- 数据库 `claiming` 超时：不直接重新分配，先判断数据盘是否已切换或挂载；
+- 数据库 `claiming` 超时：先由 `PrewarmClaimAuditor` 组合 operation、attachment 和 binding 分类；
+- `pre_attach_timeout`：允许 `PreAttachClaimCompensator` 在二次校验和进程代次匹配后清理；
+- `reserved_timeout/activation_timeout/commit_pending`：只报告，不自动清理或重新分配；
 - 数据库 `assigned`，但没有 binding：进入人工/自动补偿，不回公共池；
 - binding 存在但业务实例未 `running`：按 `operation_id` 判断继续提交还是停止；
 - 无数据库记录但存在预热 VMM：作为孤儿资源清理，不自动认领；
@@ -598,7 +635,7 @@ prewarm_activate_seconds
 - 用户请求能够领取、激活、提交和正常停止；
 - 暂不启动自动补池。
 
-当前进度：Runtime 真实领取、Pi RPC 验证、提交和停止清理专项测试已通过；Control Plane 启动策略已接入并在默认关闭下通过 CLI 回归。Control Plane 停止/销毁清理尚未接入。
+当前进度：功能实现已完成。Runtime 真实领取、Pi RPC 验证、提交和停止清理专项测试已通过；Control Plane 已接入启动策略和退出清理闭环，默认关闭时 CLI 回归保持通过。连续领取压力验收归入阶段 5 统一执行。
 
 验收：连续至少 30 次真实领取；错误 Token/UUID/重复激活全部硬失败；数据盘和网络无残留。
 
@@ -607,6 +644,17 @@ prewarm_activate_seconds
 - 实现 target/max、TTL、健康检查、内存门槛和退避；
 - Worker 重启先 reconcile；
 - 用户请求优先，领取后异步补位。
+
+当前进度：核心功能已完成。已实现容量计划、单台准备、Host 容量探针、后台循环、指数退避、TTL 回收、启动 reconcile、`ready` 健康检查、自动补位、目标缩容、配置热重载、单进程锁和独立服务管理。
+
+已通过真实环境验收：
+
+- `prewarm-worker-smoke-test`：Worker `--once` 创建真实 `ready` 项并安全清理；
+- `prewarm-worker-reconcile-smoke-test`：清理中断项并自动补位；
+- `prewarm-worker-health-smoke-test`：发现死亡 Firecracker、退休旧项并补位；
+- `prewarm-worker-reload-smoke-test`：热重载目标为 `0` 并清空公共池；
+- `prewarm-worker-lock-smoke-test`：拒绝并发 Worker 且无副作用；
+- `prewarm-worker-service-smoke-test`：独立服务启动、状态、日志与安全停止。
 
 验收：调整目标数量不改代码；Worker 重启无重复项；资源紧张时停止补池；关闭开关能 drain 公共项。
 
@@ -618,6 +666,8 @@ prewarm_activate_seconds
 - 快照、预热和冷启动同时竞争网络；
 - rootfs 升级和旧池 drain；
 - 至少 100 轮领取、停止和补位。
+
+当前进度：已开始。超时 `claiming` 只读审计、`pre_attach_timeout` 安全补偿和 Worker 周期接入已完成，Instance Manager 当前 194 项单元测试通过。真实 Firecracker 超时领取补偿 smoke test 尚未完成，其他已接触数据盘阶段仍只做分类和隔离。
 
 验收：无同卷双写、无重复绑定、无网络槽位冲突、无孤儿 VMM/TAP/nftables/Sidecar。
 
@@ -635,9 +685,14 @@ prewarm_activate_seconds
 | 文件 | 计划 |
 |---|---|
 | `services/instance-manager/prewarm_config.py` | 已有，继续作为配置解析器 |
-| `services/instance-manager/prewarm_manager.py` | 已有骨架，逐阶段实现 |
+| `services/instance-manager/prewarm_manager.py` | 已实现，领取、激活、提交与停止清理 |
 | `services/instance-manager/prewarm_store.py` | 已实现，状态机与原子领取 |
-| `services/instance-manager/prewarm_worker.py` | 新增，补池与巡检 |
+| `services/instance-manager/prewarm_worker.py` | 已实现，补池、回收、健康检查与领取补偿调度 |
+| `services/instance-manager/prewarm_worker_loop.py` | 已实现，周期巡检、配置热重载与退避 |
+| `services/instance-manager/prewarm_worker_main.py` | 已实现，Worker 依赖装配与手动入口 |
+| `services/instance-manager/prewarm_worker_lock.py` | 已实现，单 Host Worker 进程锁 |
+| `services/instance-manager/prewarm_claim_audit.py` | 已实现，超时领取只读分类 |
+| `services/instance-manager/prewarm_claim_compensation.py` | 已实现，仅补偿 `pre_attach_timeout` |
 | `services/instance-manager/startup_coordinator.py` | 已实现并接入 Control Plane 启动路径 |
 | `services/instance-manager/prewarm_activation.py` | 已实现，Host 激活协议客户端 |
 | `services/instance-manager/runtime_store.py` | 已实现 `volume_attachments`、绑定和代次约束 |
@@ -646,6 +701,9 @@ prewarm_activate_seconds
 | `scripts/guest/agent-init.sh` | 已有预热分支，后续只做必要修正 |
 | `scripts/guest/prewarm-activate.sh` | 已有技术探针实现，固化协议与安全检查 |
 | `scripts/linux/prewarm-smoke-test.sh` | 已有底层探针，后续保留为专项测试 |
+| `scripts/linux/prewarm-worker-smoke-test.sh` | 已实现，真实单轮自动补池验收 |
+| `scripts/linux/prewarm-worker-service.sh` | 已实现，手动管理 Worker 服务 |
+| `scripts/linux/prewarm-worker-*-smoke-test.sh` | 已实现，补池、协调、健康、锁、服务和热重载验收 |
 | `config/prewarm.env` | 已有，默认关闭 |
 
 ## 17. 发布、关闭与回滚
@@ -670,16 +728,46 @@ PREWARM_ENABLED=0
 
 关闭预热不能停止已经分配给用户的实例。发生严重故障时，新的启动请求直接回退现有冷启动路径。
 
-## 18. 下一项开发任务
+## 18. 交接状态与下一项开发任务
 
-阶段 1、阶段 2、阶段 2A 和阶段 3 的启动侧已经完成：数据库状态机、快照槽位保留、真实 Runtime 接管、启动策略选择和 Control Plane 启动入口均已落地。`prewarm-runtime-smoke-test` 已验证 prepare、claim、activate、commit、Pi RPC、stop 及底层资源清理；默认关闭时 `cli-smoke-test` 保持通过。
+### 18.1 当前可用状态
 
-下一项开发任务是补齐阶段 3 的 Control Plane 退出侧：
+- 开发分支：`prewarm-pool`；
+- 当前功能基线提交：`8892d81 feat(prewarm): 接入超时领取安全补偿`；
+- 总开关：`config/prewarm.env` 中 `PREWARM_ENABLED=0`，不得直接改为生产默认开启；
+- 阶段 1、2、2A、3 已完成，阶段 4 核心 Worker 已完成；
+- 阶段 5 已完成超时领取分类、`pre_attach_timeout` 补偿和 Worker 循环接入；
+- 最近一次本地验收：Instance Manager 194 项单元测试全部通过；
+- 最近一轮真实验收已覆盖 Runtime、Control Plane、自动补池、重启协调、健康补位、进程锁、独立服务、配置热重载与缩容。
 
-1. `stop/destroy` 识别逻辑实例是否来自预热分配；
-2. Firecracker 确认停止后调用 `PrewarmManager.complete_stop()`；
-3. 条件释放 `volume_attachments`、`runtime_bindings` 并把预热项转为 `retired`；
-4. 增加停止失败、重复停止和旧 `operation_id` 不得误清理新归属的测试；
-5. 完成 Control Plane 启用预热后的真实端到端验收。
+### 18.2 下一项开发任务
 
-上述清理闭环通过前继续保持 `PREWARM_ENABLED=0`，暂不启动自动 Worker。
+下一步不是继续扩大自动补偿范围，而是先为现有 `pre_attach_timeout` 补偿增加真实 smoke test：
+
+1. 使用独立数据库和状态目录启动一台真实空白预热 Guest；
+2. 创建 `startup_operations` 并将 `ready` 项领取为 `claiming`；
+3. 不创建 `volume_attachments` 和 `runtime_bindings`，把 `claimed_at` 调整为超时；
+4. 执行真实 Worker `--once`；
+5. 验证启动操作变为 `failed`、预热项变为 `retired`；
+6. 验证 Firecracker、网络租约、TAP、nftables、占位盘和 Jailer 目录全部清理；
+7. 验证日志包含 `PREWARM_WORKER_CLAIM_RECOVERY compensated=1`。
+
+该 smoke test 通过后，再按风险从低到高分别设计 `reserved_timeout`、
+`activation_timeout` 和 `commit_pending` 的补偿。不得把这些分类复用为同一套“直接停止并释放”逻辑，
+因为它们可能已经接触用户数据盘。
+
+### 18.3 接手后的基础检查
+
+```bash
+python3 -m unittest discover \
+  -s services/instance-manager \
+  -p 'test_*.py'
+
+./run.sh prewarm-worker-smoke-test
+./run.sh prewarm-worker-reconcile-smoke-test
+./run.sh prewarm-worker-health-smoke-test
+./run.sh prewarm-worker-reload-smoke-test
+```
+
+继续开发前应确认长期运行的 Control Plane 和 Prewarm Worker 已停止，避免专项 smoke test 与正式
+`/var/lib/fc/control-plane.db`、网络槽位或 Worker 锁发生竞争。
