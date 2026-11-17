@@ -693,48 +693,130 @@ A/B 测试 → 性能判定 → 灰度控制 → 关闭与回滚”，不能在�
 
 #### 阶段 6.1：冻结指标与统一计时
 
-冷启动当前已有 `startupTiming.totalMs` 和 Host/Guest 分阶段计时，但预热领取路径尚未返回等价
-结构。首先由 `StartupCoordinator` 统一记录一次启动操作的端到端时间，内部阶段由
-`InstanceRuntime` 和 `PrewarmManager` 提供。冷启动和预热必须采用相同起止边界：
+冷启动当前已有 `startupTiming.totalMs` 和 Host/Guest 分阶段计时，但该对象只覆盖
+`InstanceRuntime.start()` 内部，不包含 Control Plane 策略决策、业务状态更新和最终提交；预热领取
+路径也尚未返回等价结构。因此阶段 6 不改变旧对象的含义，而是新增跨策略的
+`startupOperationTiming`。
+
+两个对象并存并明确分工：
+
+| 对象 | 作用 | 兼容策略 |
+|---|---|---|
+| `startupTiming` | 现有冷启动 Runtime/Guest 内部诊断 | 保持 `{outcome,totalMs,host,guest}` 不变 |
+| `startupOperationTiming` | 冷启动与预热统一的端到端比较 | 新增版本化结构，阶段 6 主体使用 |
+
+CLI 和其他调用方迁移时优先读取 `startupOperationTiming.totalMs`，新对象不存在时回退到旧
+`startupTiming.totalMs`。在所有调用者完成迁移前，不删除旧对象，也不修改旧 `totalMs` 的语义。
+
+统一操作计时的边界固定为：
 
 ```text
 开始：Control Plane 已取得实例锁，准备选择启动策略
 结束：业务实例已置为 running，启动操作已提交，Pi RPC 可以连接
 ```
 
-同时保留测试客户端围绕 `POST /start` 测得的 `clientObservedMs`，用于发现 HTTP、锁竞争和
-序列化开销。两种策略统一返回以下结构：
+这里的“Pi RPC 可以连接”在阶段 6.1 中严格定义为“Guest 已声明 RPC 监听器就绪”：冷启动收到
+`PI_RPC_READY`，预热激活收到 `BOUND_READY`。启动路径不会额外执行 `connect + get_state`，因为
+建立 RPC 连接会触发 socat 派生 wrapper 和 Pi Agent 进程，混入 Pi 进程启动与 Session 加载耗时。
+Host 首次 RPC 响应作为独立体验指标测量。
+
+测试客户端另外围绕 localhost `POST /start` 记录 `clientObservedMs`，用于覆盖 HTTP 处理和响应
+开销。该值属于性能测试样本，不写入服务端 `startupOperationTiming`。
+
+`startupOperationTiming` 的权威结构如下；示例和实现不能省略字段：
 
 ```json
 {
-  "strategy": "cold | prewarm",
-  "totalMs": 0,
-  "phases": {
-    "decisionMs": 0,
-    "claimMs": 0,
-    "volumePrepareMs": 0,
-    "gatewayReadyMs": 0,
-    "drivePatchMs": 0,
-    "guestActivateMs": 0,
-    "piRpcReadyMs": 0,
-    "commitMs": 0
+  "startupOperationTiming": {
+    "version": 1,
+    "strategy": "cold",
+    "totalMs": 0,
+    "phases": {
+      "decisionMs": 0,
+      "claimMs": 0,
+      "volumePrepareMs": 0,
+      "networkReadyMs": 0,
+      "gatewayReadyMs": 0,
+      "runtimeReadyMs": 0,
+      "drivePatchMs": 0,
+      "guestActivateMs": 0,
+      "commitMs": 0,
+      "unattributedMs": 0
+    },
+    "milestones": {
+      "guestDeclaredRpcReadyMs": 0
+    }
   }
 }
 ```
 
-不适用于某一策略的阶段可以省略，但不能用不同起止点生成同名 `totalMs`。启动响应还必须明确
-返回实际使用的 `strategy`，性能脚本不能仅根据开关配置推断是否命中预热。
+字段语义固定如下：
+
+- `phases` 是互不重叠的阶段增量；不适用的阶段固定为 `0`，不能省略；
+- `milestones` 是从统一操作起点开始的累计偏移，不能参与 phases 求和；
+- `unattributedMs` 不是底层模块计时的独立阶段，而是 Control Plane 最终计算的余数；
+- `unattributedMs = max(0, totalMs - 其余已知 phases 之和)`；
+- 除毫秒取整误差外，`sum(phases) = totalMs`；
+- 启动响应必须返回实际 `strategy`，性能脚本不能根据配置推断是否命中预热。
+
+九个业务阶段的权威映射为：
+
+| Phase | 冷启动来源 | 预热命中来源 |
+|---|---|---|
+| `decisionMs` | 启动策略判断 | 灰度资格、策略判断和池可用性判断 |
+| `claimMs` | `0` | 原子领取预热项和数据盘附件预留 |
+| `volumePrepareMs` | create volume、e2fsck、configure volume | create volume、e2fsck、configure volume |
+| `networkReadyMs` | 网络槽位分配和 TAP/nftables 配置 | `0`，公共 Guest 后台准备时已完成 |
+| `gatewayReadyMs` | 启动模型网关 | 激活时启动模型网关 |
+| `runtimeReadyMs` | Jailer、Firecracker、内核、Guest 初始化和 lifecycle 登记 | `0`，公共 Guest 后台准备时已完成 |
+| `drivePatchMs` | `0` | 数据盘链接替换和 Firecracker `PATCH /drives/data` |
+| `guestActivateMs` | `0` | `ACTIVATE_V1` 到 `BOUND_READY`，包含 Guest mount/bind 和 RPC 监听启动 |
+| `commitMs` | running 状态和 startup operation 提交 | running、Guest COMMIT、binding/prewarm 和 startup operation 提交 |
+
+模型网关和数据盘准备是冷启动与预热共同的用户侧成本。预热主要提前完成网络资源和
+`runtimeReadyMs`，不能把 gateway、e2fsck、PATCH 或安全提交从用户侧计时中删除。
+
+跨层产出契约固定为：
+
+| 层级 | 产出职责 |
+|---|---|
+| `InstanceRuntime` | 自己执行的数据盘、网络、gateway、Runtime、PATCH 和 Guest 激活局部增量 |
+| `PrewarmManager` | 原子领取、附件预留及预热提交的局部增量，并向上合并 Runtime 报告 |
+| `StartupCoordinator` | 记录实际 strategy、策略决策耗时，携带并汇总下层局部报告 |
+| `Control Plane` | 记录统一起点、running 状态提交和最终结束点，生成 `totalMs`、milestones 与余数 |
+| 性能测试客户端 | 独立生成 localhost `clientObservedMs`，不回写服务端对象 |
+
+底层 Runtime/Manager 只上报自己拥有的局部增量，不生成最终 `totalMs`，也不计算
+`unattributedMs`。局部计时只随本次 `StartupResult` 向上传递，不作为新的资源状态，也不能覆盖
+SQLite 中的生命周期权威记录。
 
 阶段 6 指标分为三层：
 
 | 指标 | 定义 | 用途 |
 |---|---|---|
-| 实例准备耗时 | `POST /start` 到 `running + Pi RPC ready` | 主要验收指标 |
+| `clientObservedMs` | localhost 发出 `POST /start` 到收到成功响应 | 40% 平台侧主验收指标 |
+| `startupOperationTiming.totalMs` | 取得实例锁到 running 与 commit 完成 | 平台内部对照与瓶颈分析 |
+| `guestDeclaredRpcReadyMs` | 统一起点到 Guest 声明 RPC 监听就绪 | Runtime/Guest 诊断里程碑 |
 | 历史展示耗时 | 打开会话到历史消息可显示 | 辅助体验指标，与 Session/缓存有关 |
-| 模型首字耗时 | 提交消息到收到第一个 `message.delta` | 辅助体验指标，受外部模型和网络影响 |
+| Host 首次 RPC 响应 | 建连、派生 Pi、加载 Session 到 RPC 返回 | 辅助体验指标，不属于 microVM 准备耗时 |
+| 模型首字耗时 | 提交消息到收到第一个 `message.delta` | 辅助体验指标，受外部模型和公网影响 |
 
-历史展示和模型首字不得计入“预热至少提升 40%”的主结论。模型首字需要使用真实 SSE
-`message.delta`，不能把 `model_started` 当作首字。
+40% 门槛明确指同一 Host 上 localhost 测得的平台侧启动耗时，不包含终端用户到服务器的公网
+往返，不能表述为“线上用户等待时间降低 40%”。历史展示、首次 RPC 和模型首字均不得计入该
+门槛；模型首字必须使用真实 SSE `message.delta`，不能把 `model_started` 当作首字。
+
+阶段 6.1 按以下顺序实施，每一步单独提交和验收：
+
+| 步骤 | 实施内容 | 最小验收 |
+|---|---|---|
+| 6.1A | 定义版本化 timing 数据结构、phase 合并器、余数计算和不变量校验 | 纯单元测试覆盖缺字段、负数、重复 phase 和舍入 |
+| 6.1B | 把现有冷启动 `host/guest` 映射到统一 phases，保留旧 `startupTiming` | 冷启动 API/CLI 兼容测试通过 |
+| 6.1C | 给预热 Runtime/Manager 增加局部计时并通过 `StartupResult` 向上传递 | fake Runtime/Manager 验证九项字段和值域 |
+| 6.1D | Control Plane 生成最终 `startupOperationTiming`、strategy、milestone 和余数 | 冷/热响应结构一致，`sum(phases)=totalMs` |
+| 6.1E | CLI 优先读取新对象、缺失时回退旧对象，并执行真实回归 | CLI、Control Plane、预热专项与三轮压力通过 |
+
+阶段 6.1 不实现 rollout，不修改灰度百分比，也不开始正式 30+30 A/B 采样；这些工作分别属于
+阶段 6.4 和 6.2，避免计时、灰度和性能脚本一次性跨层变更。
 
 验收：冷启动和预热启动响应均包含可解析的策略、统一总耗时和分阶段计时；现有 CLI、冷启动、
 快照、预热和 100 轮压力回归保持通过。
@@ -752,7 +834,7 @@ A/B 测试 → 性能判定 → 灰度控制 → 关闭与回滚”，不能在�
 
 1. 记录代码提交、rootfs Build ID、内核、Firecracker 版本、CPU、内存和预热配置；
 2. 创建固定测试用户、逻辑实例和持久数据盘，避免把首次创建数据盘混入某一组；
-3. 分别执行至少 5 轮不计入结果的预热样本，使文件缓存和服务初始化趋于稳定；
+3. 冷启动与预热命中分别执行至少 5 轮不计入结果的热身样本，使文件缓存和服务初始化趋于稳定；
 4. 冷启动和预热命中各采集至少 30 个有效样本；
 5. 按 `cold → prewarm → prewarm → cold` 或等价交错顺序执行，避免时间漂移偏向某组；
 6. 预热样本开始计时前必须确认存在兼容 `ready` 项，后台准备时间不计入用户请求耗时；
@@ -787,7 +869,10 @@ P95 使用固定算法：将有效样本升序排列，取 `ceil(0.95 × N)` 对
 
 初始通过条件：
 
-- `prewarm P95 <= cold P95 × 0.60`，即实例准备耗时至少降低 40%；
+- `prewarm clientObservedMs P95 <= cold clientObservedMs P95 × 0.60`，即同一 Host 上的
+  localhost 平台侧启动耗时至少降低 40%；
+- 同时报告 `startupOperationTiming.totalMs` 和 `guestDeclaredRpcReadyMs` 的 P50/P95，用于解释
+  平台内部耗时和 Guest 里程碑，但二者不替代主门槛；
 - 冷启动和预热启动成功率均为 100%；
 - 预热命中样本的实际策略均为 `prewarm`；
 - 池空时立即走 `cold`，不能等待正在 `preparing` 的 Guest；
@@ -797,24 +882,38 @@ P95 使用固定算法：将有效样本升序排列，取 `ceil(0.95 × N)` 对
 报告必须单列“每台空闲预热机资源成本”和按 `target_ready` 推算的 Host 容量影响；即使启动 P95
 达标，也不能省略常驻内存、网络槽位和后台补池 CPU/I/O 成本。
 
-如果未达到 40%，先根据 phases 判断瓶颈是在数据盘检查、模型网关、drive PATCH、Guest 激活还是
-提交阶段，不允许通过删除必要安全检查来换取通过。
+如果 `clientObservedMs` 未达到 40%，先比较其与 `totalMs` 的差值，再根据 phases 判断瓶颈是在
+数据盘检查、模型网关、Runtime、drive PATCH、Guest 激活还是提交阶段，不允许通过删除必要安全
+检查来换取通过。报告标题和结论必须使用“平台侧启动耗时”，不得直接外推为线上用户等待时间。
 
 #### 阶段 6.4：增加可控灰度策略
 
-当前 `PREWARM_ENABLED` 是全局开关，不能直接满足“只对测试用户开启”。灰度前增加独立的领取
-策略配置，建议至少包括：
+当前 `PREWARM_ENABLED` 是 Worker 和领取链路共用的全局开关，不能直接满足“只对测试用户开启”。
+灰度资格只决定某个用户请求能否领取公共 Guest，不属于 Worker 容量配置。阶段 6.4 新增独立的
+`PrewarmRolloutPolicy`，由 `StartupCoordinator` 在 `_run_prewarm()` 前调用；Worker 和直接测试
+`PrewarmStore/PrewarmManager` 的底层路径不读取灰度策略。
+
+建议配置为显式互斥模式：
 
 ```text
+PREWARM_ROLLOUT_MODE=all|allowlist|percentage
 PREWARM_ALLOWED_USER_IDS=
-PREWARM_ROLLOUT_PERCENT=100
+PREWARM_ROLLOUT_PERCENT=
 ```
 
-决策顺序为：总开关关闭时禁止领取；Allowlist 命中时允许领取；其余用户根据稳定哈希落入
-`ROLLOUT_PERCENT`。哈希输入使用稳定 `user_id`，不能逐请求随机，保证同一用户在同一灰度比例下
-行为稳定。该字段缺失时按 `100` 处理，以保持现有测试和显式开启预热后的兼容语义；进行
-Allowlist 灰度时必须显式设置为 `0`。灰度未命中、池为空或容量不足都立即走现有冷启动，不向
-用户暴露新的 API 语义。仓库默认配置仍保持总开关 `PREWARM_ENABLED=0`。
+规则固定为：
+
+- 总开关关闭时禁止领取；
+- `PREWARM_ENABLED=1` 时必须显式提供 rollout mode，缺失时安全拒绝配置；
+- `mode=all` 不允许同时配置 Allowlist 或百分比；
+- `mode=allowlist` 要求名单非空，百分比必须为空；
+- `mode=percentage` 要求百分比为 `1～100`，Allowlist 必须为空；
+- 百分比使用稳定 `user_id` 哈希，不能逐请求随机；
+- 配置热重载失败时保留上一份完整有效快照并报警，不能部分应用。
+
+灰度未命中、池为空或容量不足都立即走现有冷启动，不向用户暴露新的 API 语义。仓库默认配置
+继续保持 `PREWARM_ENABLED=0`。现有通过 Control Plane 领取预热项的 smoke test 在显式启用时
+补充 `PREWARM_ROLLOUT_MODE=all`；Worker smoke 和直接状态机测试不需要该字段。
 
 灰度日志和指标至少包含：
 
@@ -824,8 +923,8 @@ Allowlist 灰度时必须显式设置为 `0`。灰度未命中、池为空或容
 - Host 可用内存和空闲网络槽位；
 - 按策略分组的启动 P50/P95。
 
-验收：Allowlist 用户可以命中预热，非 Allowlist 用户保持冷启动；百分比决策稳定且边界值
-`0/100` 正确；任何灰度用户都不能绕过单用户配额和数据盘独占。
+验收：Allowlist 用户可以命中预热，非 Allowlist 用户保持冷启动；百分比决策稳定，`0` 被配置
+校验拒绝、`100` 覆盖全部用户；任何灰度用户都不能绕过单用户配额和数据盘独占。
 
 #### 阶段 6.5：实现动态关闭与回滚
 
@@ -862,7 +961,8 @@ Worker 已支持配置热重载，但 Control Plane 当前只在启动时读取�
 → 100%
 ```
 
-每一级至少观察 24 小时且取得不少于 100 次有效启动；测试流量不足时以两项条件都满足为准。
+每一级至少观察 24 小时且取得不少于 100 次有效启动；测试流量不足时延长观察期，直到两项条件
+同时满足。
 以下任一条件触发立即回滚到 `PREWARM_ENABLED=0`：
 
 - 数据盘双挂、绑定冲突或跨用户数据风险；
@@ -889,11 +989,13 @@ Worker 已支持配置热重载，但 Control Plane 当前只在启动时读取�
 | `services/instance-manager/prewarm_worker_lock.py` | 已实现，单 Host Worker 进程锁 |
 | `services/instance-manager/prewarm_claim_audit.py` | 已实现，超时领取只读分类 |
 | `services/instance-manager/prewarm_claim_compensation.py` | 已实现，四类超时补偿（回滚×3 + 向前修复×1） |
-| `services/instance-manager/startup_coordinator.py` | 已实现启动仲裁；阶段 6 增加冷启动/预热统一计时 |
+| `services/instance-manager/startup_coordinator.py` | 已实现启动仲裁；阶段 6.1 汇总 strategy、decision 和下层局部计时 |
+| `services/instance-manager/startup_operation_timing.py` | 阶段 6.1 新增，定义版本化结构、phase 合并、余数计算与不变量校验 |
+| `services/instance-manager/prewarm_rollout_policy.py` | 阶段 6.4 新增，仅负责 Control Plane 领取资格，不进入 Worker 容量配置 |
 | `services/instance-manager/prewarm_activation.py` | 已实现，Host 激活协议客户端 |
 | `services/instance-manager/runtime_store.py` | 已实现 `volume_attachments`、绑定和代次约束 |
 | `services/instance-manager/network_manager.py` | 增加快照槽位保留及预热容量查询 |
-| `services/control-plane/server.py` | 已接 StartupCoordinator；阶段 6 接入灰度策略热重载与统一计时响应 |
+| `services/control-plane/server.py` | 已接 StartupCoordinator；阶段 6.1 生成统一计时响应，阶段 6.4/6.5 再接灰度与热重载 |
 | `scripts/guest/agent-init.sh` | 已有预热分支，后续只做必要修正 |
 | `scripts/guest/prewarm-activate.sh` | 已有技术探针实现，固化协议与安全检查 |
 | `scripts/linux/prewarm-smoke-test.sh` | 已有底层探针，后续保留为专项测试 |
@@ -902,7 +1004,7 @@ Worker 已支持配置热重载，但 Control Plane 当前只在启动时读取�
 | `scripts/linux/prewarm-worker-*-smoke-test.sh` | 已实现，补池、协调、健康、锁、服务和热重载验收 |
 | `scripts/linux/prewarm-performance-test.sh` | 阶段 6 新增，冷启动/预热 A/B 样本采集与汇总 |
 | `scripts/linux/prewarm-rollout-smoke-test.sh` | 阶段 6 新增，Allowlist、动态关闭与回滚验收 |
-| `config/prewarm.env` | 已有且默认关闭；阶段 6 增加 Allowlist 与灰度比例 |
+| `config/prewarm.env` | 已有且默认关闭；阶段 6.4 增加显式 rollout mode 及其对应名单或比例 |
 
 ## 17. 发布、关闭与回滚
 
@@ -947,17 +1049,23 @@ PREWARM_ENABLED=0
 - `activation_timeout`（`prewarm-activation-timeout-smoke-test`）：完整回滚，额外释放 `attached` 附件 + 删除 `binding`；
 - `commit_pending`（`prewarm-commit-pending-smoke-test`）：向前修复，只补 `mark_assigned` + `mark_succeeded`，不停 VMM。
 
-下一步执行阶段 6.1“统一计时”，暂不直接运行 30+30 性能样本：
+下一步只执行阶段 6.1“统一计时”，不同时修改 rollout，也不直接运行 30+30 性能样本：
 
-1. 在 `StartupCoordinator` 记录冷启动和预热启动相同边界的 `totalMs`；
-2. 在预热激活路径增加领取、数据盘准备、模型网关、drive PATCH、Guest 激活和提交计时；
-3. 启动响应明确返回 `strategy=cold|prewarm`，不让测试脚本猜测是否命中；
-4. 保留现有冷启动 Host/Guest 计时，并映射到统一结构；
-5. 补充 fake Runtime 单元测试，验证计时字段、策略和异常路径；
-6. 运行现有 CLI、预热 Control Plane 和压力回归，确认诊断字段不会改变生命周期语义。
+1. **6.1A—计时骨架**：新增版本化 `startupOperationTiming` 数据结构、phase 合并器、
+   `unattributedMs` 余数计算和不变量校验；先用纯单元测试冻结字段及求和规则；
+2. **6.1B—冷启动接入**：把现有冷启动 Host/Guest 局部计时映射为九项 phase，同时原样保留
+   `startupTiming`，验证旧 CLI 和 API 调用方不受影响；
+3. **6.1C—预热接入**：在 Runtime/PrewarmManager 内分别测量领取、数据盘、gateway、PATCH、
+   Guest 激活和提交前局部增量，通过 `StartupResult` 向上交付，不让底层生成最终总耗时；
+4. **6.1D—Control Plane 收口**：由 Control Plane 记录公共起点和最终结束点，合并 strategy、
+   局部 phases、`guestDeclaredRpcReadyMs`，并统一计算 `totalMs` 与 `unattributedMs`；
+5. **6.1E—调用方迁移与回归**：CLI 优先读取新对象、缺失时回退旧对象；执行单元测试、CLI、
+   Control Plane、预热专项和三轮压力回归，确认计时不会改变生命周期语义。
 
-阶段 6.1 通过后再实现 `prewarm-performance-test`。在 A/B 数据证明达到 P95 门槛之前，不开始
-生产灰度；在 Control Plane 支持动态策略重载之前，不把 `PREWARM_ENABLED=0` 描述为完整的
+阶段 6.1 完成后进入 6.2，开发 `prewarm-performance-test` 并采集冷启动/预热各 30 个有效样本；
+6.3 根据 localhost `clientObservedMs` 的 P95 判定是否达到平台侧 40% 门槛；只有性能和正确性均
+达标，才进入 6.4 实现 `PrewarmRolloutPolicy`，随后在 6.5 完成动态关闭与回滚，最后按 6.6
+逐级灰度。在 Control Plane 支持动态策略重载之前，不把 `PREWARM_ENABLED=0` 描述为完整的
 即时关闭能力。
 
 ### 18.3 接手后的基础检查
