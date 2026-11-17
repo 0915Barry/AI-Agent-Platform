@@ -207,3 +207,15 @@ class StartupCoordinator:
     def commit_failure(self, operation_id: str, error: str) -> None:
         """调用方回滚业务状态后调用，结束本次操作并记录失败。"""
         self.startup_store.mark_failed(operation_id, error)
+
+    def prewarm_assignment(self, instance_id: str) -> dict | None:
+        """查询实例是否由预热 Runtime 承载，与当前开关状态无关。"""
+        if self.prewarm_manager is None:
+            return None
+        return self.prewarm_manager.assigned_context(instance_id)
+
+    def complete_prewarm_stop(self, instance_id: str) -> dict | None:
+        """物理 Runtime 已停止后释放本次预热归属。"""
+        if self.prewarm_manager is None:
+            return None
+        return self.prewarm_manager.complete_logical_stop(instance_id)

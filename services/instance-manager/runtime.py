@@ -1793,3 +1793,6 @@ class InstanceRuntime:
             shutil.rmtree(paths["jail"], ignore_errors=True)
         shutil.rmtree(paths["state"], ignore_errors=True)
         self.discard_snapshot(instance_id)
+        # 预热占位盘只属于物理 runtime。领取后的用户盘由 preserve_volume
+        # 单独保护；物理 runtime 退休时占位盘必须无条件清理。
+        paths["prewarm_placeholder"].unlink(missing_ok=True)

@@ -135,6 +135,8 @@ class FakePrewarmManager:
         self.fail_commit = fail_commit
         self.claims: list[tuple[str, str, str, str, str]] = []
         self.commits: list[tuple[str, str, str, str]] = []
+        self.assignment: dict | None = None
+        self.completed_stops: list[str] = []
 
     def claim(
         self,
@@ -176,6 +178,25 @@ class FakePrewarmManager:
         self.commits.append(
             (instance_id, runtime_id, operation_id, activation_id)
         )
+        self.assignment = {
+            "logicalInstanceId": instance_id,
+            "runtimeId": runtime_id,
+            "operationId": operation_id,
+            "volumePath": f"/srv/fc/volumes/users/{instance_id}.ext4",
+        }
+
+    def assigned_context(self, instance_id: str) -> dict | None:
+        if self.assignment is None or self.assignment["logicalInstanceId"] != instance_id:
+            return None
+        return dict(self.assignment)
+
+    def complete_logical_stop(self, instance_id: str) -> dict | None:
+        context = self.assigned_context(instance_id)
+        if context is None:
+            return None
+        self.completed_stops.append(instance_id)
+        self.assignment = None
+        return context
 
 
 class FakePiGateway:
@@ -451,6 +472,51 @@ class ControlPlaneTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row[0], "failed")
         self.assertIn("prewarm commit failed", row[1])
+
+    def test_stop_retires_prewarm_assignment_and_physical_runtime(self) -> None:
+        owner_id = "user-prewarm-stop"
+        instance_id = "agent-prewarm-stop"
+        manager = FakePrewarmManager()
+        control = SERVER.ControlPlane(
+            self.store,
+            self.runtime,
+            self.tasks,
+            workspaces=self.workspaces,
+            prewarm_manager=manager,  # type: ignore[arg-type]
+        )
+        control.create({"id": instance_id}, owner_id)
+        running = control.start(instance_id, owner_id)
+        # 真实 Runtime 通过 runtime_bindings 解析逻辑 ID；fake 仅保存同一状态。
+        self.runtime.instances[instance_id] = dict(running["runtime"])
+
+        stopped = control.stop(instance_id)
+
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(manager.completed_stops, [instance_id])
+        self.assertIn(("stop", instance_id), self.runtime.calls)
+        self.assertIn(("destroy", "prewarm-physical-1", True), self.runtime.calls)
+
+    def test_destroy_running_prewarm_closes_assignment_first(self) -> None:
+        owner_id = "user-prewarm-destroy"
+        instance_id = "agent-prewarm-destroy"
+        manager = FakePrewarmManager()
+        control = SERVER.ControlPlane(
+            self.store,
+            self.runtime,
+            self.tasks,
+            workspaces=self.workspaces,
+            prewarm_manager=manager,  # type: ignore[arg-type]
+        )
+        control.create({"id": instance_id}, owner_id)
+        running = control.start(instance_id, owner_id)
+        self.runtime.instances[instance_id] = dict(running["runtime"])
+
+        destroyed = control.destroy(instance_id)
+
+        self.assertEqual(destroyed["status"], "destroyed")
+        self.assertEqual(manager.completed_stops, [instance_id])
+        self.assertIn(("stop", instance_id), self.runtime.calls)
+        self.assertIn(("destroy", "prewarm-physical-1", True), self.runtime.calls)
 
     def test_ensure_running_resumes_suspended_instance(self) -> None:
         """suspended 实例在聊天时自动 resume，而不是冷启动或报错。"""

@@ -599,8 +599,22 @@ class ControlPlane:
                 return self.store.update(instance_id, "stopped")
             self.store.update(instance_id, "stopping")
             try:
+                prewarm_assignment = self.startup_coordinator.prewarm_assignment(instance_id)
                 runtime_status = self.runtime.stop(instance_id)
-            except (RuntimeFailure, subprocess.SubprocessError) as error:
+                if prewarm_assignment is not None:
+                    completed = self.startup_coordinator.complete_prewarm_stop(instance_id)
+                    if completed is None:
+                        raise PrewarmManagerError("prewarm assignment disappeared during stop")
+                    self.runtime.destroy(
+                        str(prewarm_assignment["runtimeId"]),
+                        preserve_volume=True,
+                    )
+            except (
+                RuntimeFailure,
+                PrewarmManagerError,
+                RuntimeError,
+                subprocess.SubprocessError,
+            ) as error:
                 self.store.update(instance_id, "failed", str(error)[-4000:])
                 raise ApiError(500, "instance_stop_failed", str(error)) from error
             self.tasks.fail_running(instance_id, "instance stopped before task completed")
@@ -679,8 +693,32 @@ class ControlPlane:
             record = self.store.get(instance_id)
             preserve_volume = record.get("ownerId") is not None
             try:
-                self.runtime.destroy(instance_id, preserve_volume=preserve_volume)
-            except (RuntimeFailure, subprocess.SubprocessError) as error:
+                prewarm_assignment = self.startup_coordinator.prewarm_assignment(instance_id)
+                if prewarm_assignment is not None:
+                    runtime_status = self.runtime.status(instance_id)
+                    if (
+                        runtime_status is not None
+                        and runtime_status.get("status") == "running"
+                        and runtime_status.get("processAlive", False)
+                    ):
+                        self.runtime.stop(instance_id)
+                    completed = self.startup_coordinator.complete_prewarm_stop(instance_id)
+                    if completed is None:
+                        raise PrewarmManagerError(
+                            "prewarm assignment disappeared during destroy"
+                        )
+                    self.runtime.destroy(
+                        str(prewarm_assignment["runtimeId"]),
+                        preserve_volume=preserve_volume,
+                    )
+                else:
+                    self.runtime.destroy(instance_id, preserve_volume=preserve_volume)
+            except (
+                RuntimeFailure,
+                PrewarmManagerError,
+                RuntimeError,
+                subprocess.SubprocessError,
+            ) as error:
                 self.store.update(instance_id, "failed", str(error)[-4000:])
                 raise ApiError(500, "instance_destroy_failed", str(error)) from error
             self.tasks.delete_instance(instance_id)

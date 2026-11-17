@@ -233,6 +233,8 @@ class PrewarmManagerTests(unittest.TestCase):
         self.manager.commit(
             "logical-1", "runtime-1", "operation-1", "activation-1"
         )
+        context = self.manager.assigned_context("logical-1")
+        self.assertEqual(context["runtimeId"], "runtime-1")
         with patch.object(
             self.runtime_store, "get", return_value={"status": "stopped"}
         ):
@@ -240,6 +242,24 @@ class PrewarmManagerTests(unittest.TestCase):
         self.assertEqual(self.prewarm_store.get("runtime-1")["status"], "retired")
         self.assertIsNone(self.attachment_store.get("/vol/user-1.ext4"))
         self.assertIsNone(self.runtime_store.get_binding("logical-1"))
+        self.assertIsNone(self.manager.assigned_context("logical-1"))
+
+    def test_complete_logical_stop_uses_current_operation(self) -> None:
+        self._ready()
+        result = self.manager.claim(
+            "profile-a", "logical-1", "user-1", "/vol/user-1.ext4", "operation-1"
+        )
+        self.manager.commit(
+            "logical-1", result.runtime_id, result.operation_id, result.activation_id
+        )
+
+        with patch.object(
+            self.runtime_store, "get", return_value={"status": "stopped"}
+        ):
+            context = self.manager.complete_logical_stop("logical-1")
+
+        self.assertEqual(context["operationId"], "operation-1")
+        self.assertEqual(self.prewarm_store.get("runtime-1")["status"], "retired")
 
     def test_complete_stop_rejects_live_runtime(self) -> None:
         self._ready()

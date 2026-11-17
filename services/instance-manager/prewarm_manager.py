@@ -265,6 +265,45 @@ class PrewarmManager:
         if not prewarm_store.retire(runtime_id):
             raise PrewarmManagerError("failed to retire stopped prewarm runtime")
 
+    def assigned_context(self, logical_instance_id: str) -> dict | None:
+        """返回逻辑实例当前的预热归属；普通冷启动实例返回 ``None``。
+
+        绑定存在但预热记录不一致时必须硬失败，不能把它当作普通实例清理，
+        否则可能绕过数据盘附件锁并遗留物理 runtime。
+        """
+        prewarm_store, _, runtime_store, _ = self._require_phase3_dependencies()
+        binding = runtime_store.get_binding(logical_instance_id)
+        if binding is None:
+            return None
+        runtime_id = str(binding["runtimeId"])
+        item = prewarm_store.get(runtime_id)
+        if (
+            item is None
+            or item.get("status") != "assigned"
+            or item.get("logical_instance_id") != logical_instance_id
+            or not item.get("operation_id")
+            or binding.get("status") != "running"
+        ):
+            raise PrewarmManagerError("prewarm assignment is incomplete or inconsistent")
+        return {
+            "logicalInstanceId": logical_instance_id,
+            "runtimeId": runtime_id,
+            "operationId": str(item["operation_id"]),
+            "volumePath": str(item["volume_path"]),
+        }
+
+    def complete_logical_stop(self, logical_instance_id: str) -> dict | None:
+        """物理 Runtime 停止后，按当前代次完成预热归属清理。"""
+        context = self.assigned_context(logical_instance_id)
+        if context is None:
+            return None
+        self.complete_stop(
+            logical_instance_id,
+            str(context["runtimeId"]),
+            str(context["operationId"]),
+        )
+        return context
+
     def fill_if_needed(self) -> None:
         """阶段 4 自动补池 Worker 才实现。"""
         raise NotImplementedError("automatic prewarm fill is not implemented yet")
