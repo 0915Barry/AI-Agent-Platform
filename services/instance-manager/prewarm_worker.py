@@ -36,6 +36,8 @@ class PrewarmBuilder(Protocol):
 
     def destroy(self, instance_id: str, *, preserve_volume: bool = True) -> None: ...
 
+    def stop(self, instance_id: str, reason: str = "api") -> dict: ...
+
 
 class CapacityProbe(Protocol):
     def snapshot(self) -> HostCapacity: ...
@@ -181,6 +183,42 @@ class PrewarmWorker:
             available_mib=capacity.available_mib,
             free_network_slots=capacity.free_network_slots,
         )
+
+    def reap_expired_ready(self) -> tuple[str, ...]:
+        """回收本 profile 已过期的 ``ready`` 公共预热机。
+
+        查询结果只是候选集合；真正操作前必须通过 ``mark_draining`` 再次匹配
+        ``status=ready``。如果并发领取已经将其改为 ``claiming``，转换失败后会
+        跳过该项，绝不会停止用户正在接管的 Runtime。
+
+        停止或销毁失败时记录保持 ``draining``，不重新发布到公共池，等待后续
+        reconcile 处理。
+        """
+        if self.builder is None:
+            raise PrewarmWorkerError("prewarm builder is not configured")
+
+        retired: list[str] = []
+        for item in self.prewarm_store.list_expired_ready(self.profile_key):
+            runtime_id = str(item["runtime_id"])
+            if not self.prewarm_store.mark_draining(runtime_id):
+                continue
+            try:
+                stopped = self.builder.stop(runtime_id, reason="prewarm_ttl_expired")
+                if stopped.get("status") != "stopped":
+                    raise PrewarmWorkerError(
+                        f"expired prewarm runtime did not stop: {runtime_id}"
+                    )
+                self.builder.destroy(runtime_id, preserve_volume=True)
+                if not self.prewarm_store.retire(runtime_id):
+                    raise PrewarmWorkerError(
+                        f"expired prewarm item did not retire: {runtime_id}"
+                    )
+            except Exception as error:
+                if isinstance(error, PrewarmWorkerError):
+                    raise
+                raise PrewarmWorkerError(str(error)[-4000:]) from error
+            retired.append(runtime_id)
+        return tuple(retired)
 
     def plan_fill(self, *, available_mib: int, free_network_slots: int) -> FillPlan:
         """计算本轮创建数，不写数据库、不启动 microVM。

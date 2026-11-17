@@ -41,6 +41,17 @@ class PrewarmStoreTests(unittest.TestCase):
         self.assertIsNotNone(item["expires_at"])
         self.assertEqual(item["claim_token_hash"], "tok")
 
+    def test_list_expired_ready_only_returns_expired_matching_profile(self) -> None:
+        self.store.create_item("expired", "profile-a")
+        self.assertTrue(self.store.mark_ready("expired", ttl_seconds=-1))
+        self._ready_item("valid", "profile-a")
+        self.store.create_item("other", "profile-b")
+        self.assertTrue(self.store.mark_ready("other", ttl_seconds=-1))
+        self.assertEqual(
+            [item["runtime_id"] for item in self.store.list_expired_ready("profile-a")],
+            ["expired"],
+        )
+
     def test_record_runtime_generation_only_while_preparing(self) -> None:
         self.store.create_item("rt-1", "profile-a")
         self.assertTrue(self.store.record_runtime_generation("rt-1", 123, 456))

@@ -204,6 +204,21 @@ class PrewarmStore:
             "claiming": int(row["claiming"] or 0),
         }
 
+    def list_expired_ready(self, profile_key: str) -> list[dict]:
+        """列出已经过期但尚未进入回收流程的公共预热项。"""
+        now = int(time.time())
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM prewarm_items
+                WHERE profile_key=? AND status='ready'
+                  AND expires_at IS NOT NULL AND expires_at <= ?
+                ORDER BY expires_at,runtime_id
+                """,
+                (profile_key, now),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def mark_ready(
         self,
         runtime_id: str,

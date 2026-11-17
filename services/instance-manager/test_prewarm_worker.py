@@ -26,7 +26,10 @@ class PrewarmWorkerTests(unittest.TestCase):
         def __init__(self) -> None:
             self.fail_prepare = False
             self.fail_on_call: int | None = None
+            self.fail_stop = False
+            self.fail_destroy = False
             self.prepared: list[tuple[str, str, int]] = []
+            self.stopped: list[tuple[str, str]] = []
             self.destroyed: list[tuple[str, bool]] = []
 
         def prepare_prewarmer(
@@ -44,7 +47,15 @@ class PrewarmWorkerTests(unittest.TestCase):
             return {"pid": 1234, "processStartTicks": 5678}
 
         def destroy(self, instance_id: str, *, preserve_volume: bool = True) -> None:
+            if self.fail_destroy:
+                raise RuntimeError("destroy failed")
             self.destroyed.append((instance_id, preserve_volume))
+
+        def stop(self, instance_id: str, reason: str = "api") -> dict:
+            self.stopped.append((instance_id, reason))
+            if self.fail_stop:
+                raise RuntimeError("stop failed")
+            return {"id": instance_id, "status": "stopped"}
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -263,6 +274,46 @@ class PrewarmWorkerTests(unittest.TestCase):
     def test_fill_once_from_host_requires_probe(self) -> None:
         with self.assertRaisesRegex(PrewarmWorkerError, "probe is not configured"):
             self.worker(with_builder=True).fill_once_from_host()
+
+    def test_reap_expired_ready_stops_destroys_and_retires(self) -> None:
+        self.ready("expired-1", ttl_seconds=-1)
+        self.ready("valid-1", ttl_seconds=900)
+        retired = self.worker(with_builder=True).reap_expired_ready()
+        self.assertEqual(retired, ("expired-1",))
+        self.assertEqual(
+            self.builder.stopped,
+            [("expired-1", "prewarm_ttl_expired")],
+        )
+        self.assertEqual(self.builder.destroyed, [("expired-1", True)])
+        self.assertEqual(self.store.get("expired-1")["status"], "retired")
+        self.assertEqual(self.store.get("valid-1")["status"], "ready")
+
+    def test_reap_skips_item_lost_to_concurrent_transition(self) -> None:
+        self.ready("expired-1", ttl_seconds=-1)
+        original = self.store.mark_draining
+        self.store.mark_draining = lambda _runtime_id: False  # type: ignore[method-assign]
+        try:
+            retired = self.worker(with_builder=True).reap_expired_ready()
+        finally:
+            self.store.mark_draining = original  # type: ignore[method-assign]
+        self.assertEqual(retired, ())
+        self.assertEqual(self.builder.stopped, [])
+        self.assertEqual(self.store.get("expired-1")["status"], "ready")
+
+    def test_reap_stop_failure_leaves_item_draining(self) -> None:
+        self.ready("expired-1", ttl_seconds=-1)
+        self.builder.fail_stop = True
+        with self.assertRaisesRegex(PrewarmWorkerError, "stop failed"):
+            self.worker(with_builder=True).reap_expired_ready()
+        self.assertEqual(self.store.get("expired-1")["status"], "draining")
+        self.assertEqual(self.builder.destroyed, [])
+
+    def test_reap_destroy_failure_leaves_item_draining(self) -> None:
+        self.ready("expired-1", ttl_seconds=-1)
+        self.builder.fail_destroy = True
+        with self.assertRaisesRegex(PrewarmWorkerError, "destroy failed"):
+            self.worker(with_builder=True).reap_expired_ready()
+        self.assertEqual(self.store.get("expired-1")["status"], "draining")
 
 
 if __name__ == "__main__":
