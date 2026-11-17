@@ -71,6 +71,10 @@ Commands:
                          Verify Worker restart reconcile and automatic replenishment
   prewarm-worker-lock-smoke-test
                          Verify the real Worker process lock and clean rejection
+  prewarm-worker-start   Start the manually managed prewarm Worker service
+  prewarm-worker-stop    Stop the Worker; existing pool items are preserved
+  prewarm-worker-status  Show whether the prewarm Worker is running
+  prewarm-worker-logs    Show the latest prewarm Worker log lines
   control-plane-start    Start the loopback-only API in the Linux VM
   control-plane-stop     Stop the API; running instances remain managed
   control-plane-status   Show whether the API service is running
@@ -537,6 +541,24 @@ smoke_test_prewarm_worker_lock() {
     "sudo '${REMOTE_DIR}/scripts/linux/prewarm-worker-lock-smoke-test.sh'"
 }
 
+prewarm_worker_service() {
+  action="$1"
+  require_vm_host
+  if [[ "${action}" == "start" || "${action}" == "restart" ]]; then
+    sync_repo
+    remote_command="sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/prewarm-worker-service.sh' '${action}'"
+  else
+    remote_command="sudo '${REMOTE_DIR}/scripts/linux/prewarm-worker-service.sh' '${action}'"
+  fi
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "${remote_command}"
+}
+
 control_plane_service() {
   action="$1"
   require_vm_host
@@ -686,6 +708,18 @@ case "${command}" in
     ;;
   prewarm-worker-lock-smoke-test)
     smoke_test_prewarm_worker_lock
+    ;;
+  prewarm-worker-start)
+    prewarm_worker_service start
+    ;;
+  prewarm-worker-stop)
+    prewarm_worker_service stop
+    ;;
+  prewarm-worker-status)
+    prewarm_worker_service status
+    ;;
+  prewarm-worker-logs)
+    prewarm_worker_service logs
     ;;
   control-plane-start)
     control_plane_service start
