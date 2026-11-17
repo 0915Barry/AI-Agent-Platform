@@ -53,15 +53,13 @@
 - 自动补池 Worker 的目标容量、最大数量、Host 内存和网络槽位守卫；
 - TTL 回收、`ready` Firecracker 代次健康检查、Worker 重启协调和自动补位；
 - Worker 单进程锁、独立服务启停、配置热重载和目标缩容；
-- 超时 `claiming` 的状态分类，以及 `pre_attach_timeout` 的代次校验和安全补偿；
+- 超时 `claiming` 的状态分类，以及四类超时的代次校验和安全补偿（回滚 + 向前修复）；
 - 默认关闭时 CLI、冷启动、快照和恢复链路保持通过。
 
 仍未完成：
 
-- 真实 Firecracker 环境下的超时领取补偿 smoke test；
-- `reserved_timeout`、`activation_timeout`、`commit_pending` 等已接触数据盘阶段的自动补偿；
-- 多请求并发领取、Worker/Control Plane 中断和至少 100 轮领取补位压力测试；
-- 性能样本、灰度策略、监控指标和生产部署方式。
+- 多用户并发领取、各阶段崩溃注入、快照/预热/冷启动网络竞争和 rootfs 升级 drain 的完整故障矩阵（四类超时补偿 smoke 与 100 轮压力已覆盖主要路径）；
+- 性能样本、灰度策略、监控指标和生产部署方式（阶段 6）。
 
 因此当前代码已经形成可手动运行和测试的完整预热链路，但尚未满足生产开启条件，`PREWARM_ENABLED` 继续保持 `0`。
 
@@ -177,7 +175,7 @@ Worker 和 Reconcile 共用同一套条件转换，避免每个调用点各自�
 - 执行 TTL 回收、`ready` 进程代次健康检查和目标缩容；
 - Worker 启动时先 reconcile，再进入周期巡检和失败退避；
 - 热重载 `config/prewarm.env`，无需重启即可调整目标数量或关闭池；
-- 审计超时 `claiming`，只自动补偿尚未产生 attachment/binding 的项目。
+- 审计超时 `claiming`，按分类自动补偿：回滚未确认挂载/已挂载/已激活的项目，向前修复已提交项目。
 
 Worker 不接收用户请求，也不能直接修改业务实例状态。
 
@@ -197,13 +195,18 @@ Worker；它不是多 Host Leader Election，扩展到服务器集群前仍需�
 - `operation_missing/operation_mismatch`；
 - `failed_requires_cleanup/terminal_inconsistent/attachment_error/inconsistent`。
 
-`prewarm_claim_compensation.py` 当前只自动处理 `pre_attach_timeout`。它先把本代启动操作
-条件转换为 `compensating`，再重新读取预热项、attachment 和 binding；只有确认数据盘尚未
-被预留或挂载、逻辑/物理绑定尚未建立，并且 Firecracker PID 与 `process_start_ticks` 完全匹配
-时，才停止并销毁该 Runtime，最后把预热项转为 `retired`、启动操作转为 `failed`。
+`prewarm_claim_compensation.py` 提供三个补偿器：
 
-任何竞争、代次不一致或已接触数据盘的分类都不会自动停止 Runtime，而是记录
-`PREWARM_WORKER_CLAIM_DEFERRED` 或 `PREWARM_WORKER_CLAIM_ERROR`，等待后续专项补偿。
+- `PreActivationClaimCompensator`：回滚 `pre_attach_timeout` / `reserved_timeout`，停 VMM → 销毁 → 释放 reserved 附件（若存在）→ 退休；
+- `ActivationTimeoutClaimCompensator`：回滚 `activation_timeout`，额外释放 attached 附件 + 删除 binding；
+- `CommitPendingClaimCompensator`：向前修复 `commit_pending`，只补 `mark_assigned` + `mark_succeeded`，不停 VMM。
+
+回滚类先把本代启动操作条件转换为 `compensating`，再重新读取预热项、attachment 和 binding；只有
+代次一致、附件/binding 状态匹配时才停止并销毁该 Runtime，最后把预热项转为 `retired`、启动操作转为
+`failed`。`commit_pending` 依赖「binding=running ⟹ 业务实例已 running」不变式，直接向前补账。
+
+任何竞争、代次不一致或 `operation_missing`/`commit_incomplete`/`inconsistent` 等异常分类都不会
+自动处理，而是记录 `PREWARM_WORKER_CLAIM_DEFERRED`，等待人工检查。
 
 ### 5.6 ActivationClient：Host 激活客户端
 
@@ -507,8 +510,10 @@ running复用 → 有效快照恢复 → ready预热领取 → 冷启动
 - 数据库 `preparing`，但 VMM 不存在：标记 `error` 并清理租约；
 - 数据库 `ready`，但 `PROBE_V1` 失败：进入 `draining`；
 - 数据库 `claiming` 超时：先由 `PrewarmClaimAuditor` 组合 operation、attachment 和 binding 分类；
-- `pre_attach_timeout`：允许 `PreAttachClaimCompensator` 在二次校验和进程代次匹配后清理；
-- `reserved_timeout/activation_timeout/commit_pending`：只报告，不自动清理或重新分配；
+- `pre_attach_timeout`：允许 `PreActivationClaimCompensator` 在二次校验和进程代次匹配后回滚清理；
+- `reserved_timeout/activation_timeout`：分别回滚，额外释放 reserved/attached 附件、删除 binding；
+- `commit_pending`：`CommitPendingClaimCompensator` 向前修复，只补 `mark_assigned` + `mark_succeeded`；
+- 其余异常分类（`operation_missing`/`commit_incomplete`/`inconsistent` 等）：只报告，不自动处理；
 - 数据库 `assigned`，但没有 binding：进入人工/自动补偿，不回公共池；
 - binding 存在但业务实例未 `running`：按 `operation_id` 判断继续提交还是停止；
 - 无数据库记录但存在预热 VMM：作为孤儿资源清理，不自动认领；
@@ -692,7 +697,7 @@ prewarm_activate_seconds
 | `services/instance-manager/prewarm_worker_main.py` | 已实现，Worker 依赖装配与手动入口 |
 | `services/instance-manager/prewarm_worker_lock.py` | 已实现，单 Host Worker 进程锁 |
 | `services/instance-manager/prewarm_claim_audit.py` | 已实现，超时领取只读分类 |
-| `services/instance-manager/prewarm_claim_compensation.py` | 已实现，仅补偿 `pre_attach_timeout` |
+| `services/instance-manager/prewarm_claim_compensation.py` | 已实现，四类超时补偿（回滚×3 + 向前修复×1） |
 | `services/instance-manager/startup_coordinator.py` | 已实现并接入 Control Plane 启动路径 |
 | `services/instance-manager/prewarm_activation.py` | 已实现，Host 激活协议客户端 |
 | `services/instance-manager/runtime_store.py` | 已实现 `volume_attachments`、绑定和代次约束 |
@@ -733,12 +738,12 @@ PREWARM_ENABLED=0
 ### 18.1 当前可用状态
 
 - 开发分支：`prewarm-pool`；
-- 当前功能基线提交：`8892d81 feat(prewarm): 接入超时领取安全补偿`；
+- 当前功能基线提交：`0a63a77`（阶段 5 完成，下一项阶段 6）；
 - 总开关：`config/prewarm.env` 中 `PREWARM_ENABLED=0`，不得直接改为生产默认开启；
-- 阶段 1、2、2A、3 已完成，阶段 4 核心 Worker 已完成；
-- 阶段 5 已完成超时领取分类、`pre_attach_timeout` 补偿和 Worker 循环接入；
-- 最近一次本地验收：Instance Manager 194 项单元测试全部通过；
-- 最近一轮真实验收已覆盖 Runtime、Control Plane、自动补池、重启协调、健康补位、进程锁、独立服务、配置热重载与缩容。
+- 阶段 0、1、2、2A、3、4、5 已完成；
+- 阶段 5 已完成四类超时补偿（回滚×3 + 向前修复×1）和 100 轮「领取/停止/补位」压力验收；
+- 最近一次本地验收：Instance Manager 200 项单元测试全部通过，Control Plane 40 项通过；
+- 最近一轮真实验收已覆盖 Runtime、Control Plane、自动补池、重启协调、健康补位、进程锁、独立服务、配置热重载、缩容、四类超时补偿与 100 轮压力。
 
 ### 18.2 下一项开发任务
 
