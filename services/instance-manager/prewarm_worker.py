@@ -109,6 +109,13 @@ class PrewarmWorker:
             lambda: secrets.token_urlsafe(32)
         )
 
+    def update_config(self, config: PrewarmConfig) -> bool:
+        """替换已经完整校验的新配置，返回配置是否发生变化。"""
+        if config == self.config:
+            return False
+        self.config = config
+        return True
+
     def prepare_one(self) -> dict:
         """创建一台空白 Guest，并在真实 Runtime 就绪后发布为 ``ready``。
 

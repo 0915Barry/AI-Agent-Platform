@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
+from prewarm_config import PrewarmConfig
 from prewarm_worker import FillResult, HealthResult, ReconcileResult
 
 
 class FillTarget(Protocol):
+    def update_config(self, config: PrewarmConfig) -> bool: ...
+
     def reconcile_public(self) -> ReconcileResult: ...
 
     def reap_expired_ready(self) -> tuple[str, ...]: ...
@@ -45,6 +48,7 @@ class PrewarmWorkerLoop:
         *,
         interval_seconds: int,
         max_backoff_seconds: int = 60,
+        config_loader: Callable[[], PrewarmConfig] | None = None,
         emit: Callable[[str], None] | None = None,
     ) -> None:
         if interval_seconds < 1:
@@ -54,6 +58,7 @@ class PrewarmWorkerLoop:
         self.worker = worker
         self.interval_seconds = interval_seconds
         self.max_backoff_seconds = max_backoff_seconds
+        self.config_loader = config_loader
         self.emit = emit or (lambda message: print(message, flush=True))
         self.consecutive_failures = 0
 
@@ -81,6 +86,15 @@ class PrewarmWorkerLoop:
     def run_once(self) -> WorkerCycle:
         """执行一轮并返回下次等待时间；异常不穿透后台主循环。"""
         try:
+            if self.config_loader is not None:
+                config = self.config_loader()
+                if self.worker.update_config(config):
+                    self.emit(
+                        "PREWARM_WORKER_CONFIG_RELOADED "
+                        f"enabled={int(config.enabled)} target={config.target_ready} "
+                        f"max={config.max_total} min_mib={config.min_available_mib} "
+                        f"min_network={config.min_free_network_slots}"
+                    )
             expired_runtime_ids = self.worker.reap_expired_ready()
             health = self.worker.check_ready_health()
             excess_runtime_ids = self.worker.drain_excess_ready()

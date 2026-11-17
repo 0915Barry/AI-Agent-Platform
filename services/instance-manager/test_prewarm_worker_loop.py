@@ -3,6 +3,7 @@
 
 import unittest
 
+from prewarm_config import PrewarmConfig
 from prewarm_worker import FillPlan, FillResult, HealthResult, ReconcileResult
 from prewarm_worker_loop import PrewarmWorkerLoop
 
@@ -37,6 +38,12 @@ class FakeWorker:
             else [ReconcileResult((), ())]
         )
         self.reconcile_calls = 0
+        self.updated_configs: list[PrewarmConfig] = []
+
+    def update_config(self, config: PrewarmConfig) -> bool:
+        changed = not self.updated_configs or self.updated_configs[-1] != config
+        self.updated_configs.append(config)
+        return changed
 
     def reconcile_public(self) -> ReconcileResult:
         outcome = self.reconcile_outcomes[
@@ -193,6 +200,46 @@ class PrewarmWorkerLoopTests(unittest.TestCase):
         self.assertEqual(cycle.retired_runtime_ids, ("ready-extra",))
         self.assertEqual(worker.drain_calls, 1)
         self.assertEqual(worker.calls, 1)
+
+    def test_cycle_reloads_config_before_resource_operations(self) -> None:
+        config = PrewarmConfig.from_env(
+            {
+                "PREWARM_ENABLED": "1",
+                "PREWARM_TARGET_READY": "2",
+                "PREWARM_MAX_TOTAL": "2",
+            }
+        )
+        messages: list[str] = []
+        worker = FakeWorker([fill_result(reason="target_satisfied")])
+        loop = PrewarmWorkerLoop(
+            worker,
+            interval_seconds=5,
+            config_loader=lambda: config,
+            emit=messages.append,
+        )
+        cycle = loop.run_once()
+        self.assertTrue(cycle.success)
+        self.assertEqual(worker.updated_configs, [config])
+        self.assertIn("PREWARM_WORKER_CONFIG_RELOADED", messages[0])
+
+    def test_invalid_reload_prevents_all_resource_operations(self) -> None:
+        worker = FakeWorker([fill_result("must-not-start")])
+
+        def invalid_config() -> PrewarmConfig:
+            raise ValueError("invalid config")
+
+        loop = PrewarmWorkerLoop(
+            worker,
+            interval_seconds=5,
+            config_loader=invalid_config,
+            emit=lambda _message: None,
+        )
+        cycle = loop.run_once()
+        self.assertFalse(cycle.success)
+        self.assertEqual(worker.reap_calls, 0)
+        self.assertEqual(worker.health_calls, 0)
+        self.assertEqual(worker.drain_calls, 0)
+        self.assertEqual(worker.calls, 0)
 
     def test_resize_failure_prevents_fill(self) -> None:
         worker = FakeWorker(

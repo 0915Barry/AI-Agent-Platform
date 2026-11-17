@@ -77,6 +77,7 @@ def run(
             worker,
             interval_seconds=config.health_interval_seconds,
             max_backoff_seconds=args.max_backoff,
+            config_loader=lambda: PrewarmConfig.from_file(args.prewarm_config),
             emit=output,
         )
         output(

@@ -52,23 +52,12 @@ find_worker_pid() {
   return 1
 }
 
-config_is_enabled() {
-  PYTHONPATH="${repo_dir}/services/instance-manager" python3 -c \
-    'import pathlib,sys; from prewarm_config import PrewarmConfig; raise SystemExit(0 if PrewarmConfig.from_file(pathlib.Path(sys.argv[1])).enabled else 1)' \
-    "${config_path}"
-}
-
 start_service() {
   local existing_pid=""
   if existing_pid="$(find_worker_pid 2>/dev/null)"; then
     printf '%s\n' "${existing_pid}" > "${pid_path}"
     echo "Prewarm Worker is already running with PID ${existing_pid}"
     return
-  fi
-  if ! config_is_enabled; then
-    echo "Prewarm Worker is disabled in ${config_path}" >&2
-    echo "Set PREWARM_ENABLED=1 only when the pool is ready to run." >&2
-    exit 1
   fi
   if [[ ! -f /srv/fc/artifacts/agent-rootfs.ext4 ]]; then
     echo "Runtime rootfs is missing; run build-rootfs first" >&2

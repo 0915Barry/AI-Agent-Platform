@@ -108,6 +108,14 @@ class PrewarmWorkerTests(unittest.TestCase):
     def preparing(self, runtime_id: str) -> None:
         self.store.create_item(runtime_id, "profile-a")
 
+    def test_update_config_replaces_only_changed_valid_config(self) -> None:
+        worker = self.worker(with_builder=True)
+        original = worker.config
+        self.assertFalse(worker.update_config(original))
+        disabled = PrewarmConfig.from_env({"PREWARM_ENABLED": "0"})
+        self.assertTrue(worker.update_config(disabled))
+        self.assertIs(worker.config, disabled)
+
     def ready(self, runtime_id: str, *, ttl_seconds: int = 900) -> None:
         self.preparing(runtime_id)
         self.assertTrue(self.store.mark_ready(runtime_id, ttl_seconds=ttl_seconds))
