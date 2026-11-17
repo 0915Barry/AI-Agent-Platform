@@ -73,6 +73,8 @@ Commands:
                          Verify the real Worker process lock and clean rejection
   prewarm-worker-service-smoke-test
                          Verify isolated Worker service start/status/logs/stop
+  prewarm-worker-health-smoke-test
+                         Verify steady-state dead-ready detection and replenishment
   prewarm-worker-start   Start the manually managed prewarm Worker service
   prewarm-worker-stop    Stop the Worker; existing pool items are preserved
   prewarm-worker-status  Show whether the prewarm Worker is running
@@ -555,6 +557,18 @@ smoke_test_prewarm_worker_service() {
     "sudo '${REMOTE_DIR}/scripts/linux/prewarm-worker-service-smoke-test.sh'"
 }
 
+smoke_test_prewarm_worker_health() {
+  sync_repo
+  echo "Testing steady-state prewarm Worker health recovery in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/prewarm-worker-health-smoke-test.sh'"
+}
+
 prewarm_worker_service() {
   action="$1"
   require_vm_host
@@ -725,6 +739,9 @@ case "${command}" in
     ;;
   prewarm-worker-service-smoke-test)
     smoke_test_prewarm_worker_service
+    ;;
+  prewarm-worker-health-smoke-test)
+    smoke_test_prewarm_worker_health
     ;;
   prewarm-worker-start)
     prewarm_worker_service start
