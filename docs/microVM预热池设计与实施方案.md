@@ -1,10 +1,10 @@
 # microVM 预热池设计与实施方案
 
-> 文档状态：阶段 4 核心功能完成，阶段 5 故障补偿接入中，尚未允许生产启用。
+> 文档状态：阶段 4 核心功能完成，阶段 5 故障补偿已全部接入，压力验收进行中，尚未允许生产启用。
 >
 > 当前进度日期：2026-11-17。
 >
-> 当前结论：数据库状态机、数据盘独占、真实 Runtime 接管、Control Plane 启停清理和自动补池 Worker 已经落地。Worker 已具备容量守卫、TTL 回收、稳态健康检查、重启协调、缩容、配置热重载、单进程锁和独立服务管理；超时领取已完成只读分类，并对 `pre_attach_timeout`、`reserved_timeout`、`activation_timeout` 三类启用安全补偿（分别通过 `prewarm-claim-compensation-smoke-test` / `prewarm-reserved-timeout-smoke-test` / `prewarm-activation-timeout-smoke-test`）。剩余 `commit_pending` 的补偿策略和阶段 5 压力验收尚未完成。预热功能继续默认关闭。
+> 当前结论：数据库状态机、数据盘独占、真实 Runtime 接管、Control Plane 启停清理和自动补池 Worker 已经落地。Worker 已具备容量守卫、TTL 回收、稳态健康检查、重启协调、缩容、配置热重载、单进程锁和独立服务管理；超时领取已完成只读分类，四类超时全部启用安全补偿并各自通过真实 smoke test——`pre_attach_timeout`/`reserved_timeout`/`activation_timeout` 回滚（`prewarm-claim-compensation-smoke-test` / `prewarm-reserved-timeout-smoke-test` / `prewarm-activation-timeout-smoke-test`），`commit_pending` 向前修复（`prewarm-commit-pending-smoke-test`）。剩余阶段 5 压力验收（至少 100 轮领取/停止/补位）尚未完成。预热功能继续默认关闭。
 
 ## 1. 目标与边界
 
@@ -742,15 +742,16 @@ PREWARM_ENABLED=0
 
 ### 18.2 下一项开发任务
 
-已完成三类超时领取的安全补偿，并各自通过真实 smoke test：
+四类超时领取的安全补偿已全部完成，并各自通过真实 smoke test：
 
 - `pre_attach_timeout`（`prewarm-claim-compensation-smoke-test`）：停 VMM → 销毁 → 退休，op 置 `failed`；
 - `reserved_timeout`（`prewarm-reserved-timeout-smoke-test`）：额外释放 `reserved` 附件锁；
-- `activation_timeout`（`prewarm-activation-timeout-smoke-test`）：完整回滚，额外释放 `attached` 附件 + 删除 `binding`。
+- `activation_timeout`（`prewarm-activation-timeout-smoke-test`）：完整回滚，额外释放 `attached` 附件 + 删除 `binding`；
+- `commit_pending`（`prewarm-commit-pending-smoke-test`）：向前修复，只补 `mark_assigned` + `mark_succeeded`，不停 VMM。
 
-前两类由 `PreActivationClaimCompensator` 回滚，第三类由 `ActivationTimeoutClaimCompensator` 回滚；`commit_pending` 仍只分类、不自动补偿。
+前三类分别由 `PreActivationClaimCompensator` / `ActivationTimeoutClaimCompensator` 回滚，第四类由 `CommitPendingClaimCompensator` 向前修复。`commit_pending` 依赖不变式「binding=running ⟹ 业务实例已 running」（binding 只在 commit() 内、且 commit() 只在 CP 置 running 之后被调用），因此无需读 instances 表即可安全补账。
 
-下一步是最后一个分类 `commit_pending` 的补偿。它已经「绑定 running、就差 item 置 assigned」，最接近成功，不能复用回滚逻辑：需要判断业务实例是否已 `running`——是则向前修复（直接 `mark_assigned` 补完提交），否则说明 CP 在置 running 前就死了，需要人工介入或谨慎回滚。
+下一步是阶段 5 剩余的压力验收：至少 100 轮「领取 → 停止 → 补位」真实 VM 循环，验证无孤儿进程、无死锁数据盘、状态机每轮都能回到干净终态。
 
 ### 18.3 接手后的基础检查
 
