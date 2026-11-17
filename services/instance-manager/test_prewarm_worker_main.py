@@ -99,7 +99,8 @@ class PrewarmWorkerMainTests(unittest.TestCase):
         counts = PrewarmStore(self.database).capacity_counts("profile-test")
         self.assertEqual(counts["claimable_ready"], 1)
         self.assertIn("PREWARM_WORKER_READY", messages[0])
-        self.assertIn("status=ok", messages[1])
+        self.assertIn("PREWARM_WORKER_RECONCILE", messages[1])
+        self.assertIn("status=ok", messages[2])
 
     def test_once_mode_is_noop_when_disabled(self) -> None:
         self.config.write_text("PREWARM_ENABLED=0\n", encoding="utf-8")

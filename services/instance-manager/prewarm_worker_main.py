@@ -72,6 +72,9 @@ def run(
         f"interval={config.health_interval_seconds}s mode={'once' if args.once else 'loop'}"
     )
     if args.once:
+        reconciliation = loop.reconcile_once()
+        if not reconciliation.success:
+            return 1
         cycle = loop.run_once()
         return 0 if cycle.success else 1
 

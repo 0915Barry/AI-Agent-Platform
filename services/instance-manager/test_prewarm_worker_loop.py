@@ -3,17 +3,39 @@
 
 import unittest
 
-from prewarm_worker import FillPlan, FillResult
+from prewarm_worker import FillPlan, FillResult, ReconcileResult
 from prewarm_worker_loop import PrewarmWorkerLoop
 
 
 class FakeWorker:
-    def __init__(self, outcomes, *, retired=(), reap_error=None) -> None:
+    def __init__(
+        self,
+        outcomes,
+        *,
+        retired=(),
+        reap_error=None,
+        reconcile_outcomes=None,
+    ) -> None:
         self.outcomes = list(outcomes)
         self.retired = tuple(retired)
         self.reap_error = reap_error
         self.calls = 0
         self.reap_calls = 0
+        self.reconcile_outcomes = list(
+            reconcile_outcomes
+            if reconcile_outcomes is not None
+            else [ReconcileResult((), ())]
+        )
+        self.reconcile_calls = 0
+
+    def reconcile_public(self) -> ReconcileResult:
+        outcome = self.reconcile_outcomes[
+            min(self.reconcile_calls, len(self.reconcile_outcomes) - 1)
+        ]
+        self.reconcile_calls += 1
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
     def reap_expired_ready(self) -> tuple[str, ...]:
         self.reap_calls += 1
@@ -111,6 +133,38 @@ class PrewarmWorkerLoopTests(unittest.TestCase):
         self.assertEqual(delays, [5, 10, 20, 20, 20])
         self.assertEqual(loop.consecutive_failures, 5)
 
+    def test_reconcile_success_reports_kept_and_retired(self) -> None:
+        messages: list[str] = []
+        worker = FakeWorker(
+            [fill_result()],
+            reconcile_outcomes=[ReconcileResult(("keep-1",), ("old-1",))],
+        )
+        loop = PrewarmWorkerLoop(worker, interval_seconds=5, emit=messages.append)
+        result = loop.reconcile_once()
+        self.assertTrue(result.success)
+        self.assertEqual(result.retired_runtime_ids, ("old-1",))
+        self.assertIn("kept=1", messages[0])
+        self.assertIn("retired=1", messages[0])
+
+    def test_run_retries_reconcile_before_any_fill(self) -> None:
+        worker = FakeWorker(
+            [fill_result(reason="target_satisfied")],
+            reconcile_outcomes=[
+                RuntimeError("database busy"),
+                ReconcileResult((), ()),
+            ],
+        )
+        signal = FakeStopSignal(stop_after_waits=2)
+        loop = PrewarmWorkerLoop(
+            worker,
+            interval_seconds=5,
+            emit=lambda _message: None,
+        )
+        loop.run(signal)
+        self.assertEqual(worker.reconcile_calls, 2)
+        self.assertEqual(worker.calls, 1)
+        self.assertEqual(signal.waits, [5, 5])
+
     def test_success_resets_failure_backoff(self) -> None:
         worker = FakeWorker(
             [RuntimeError("first"), RuntimeError("second"), fill_result(reason="target_satisfied")]
@@ -149,6 +203,7 @@ class PrewarmWorkerLoopTests(unittest.TestCase):
             emit=lambda _message: None,
         )
         loop.run(signal)
+        self.assertEqual(worker.reconcile_calls, 1)
         self.assertEqual(worker.calls, 2)
         self.assertEqual(signal.waits, [7, 7])
 
