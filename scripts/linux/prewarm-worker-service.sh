@@ -4,12 +4,12 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "${script_dir}/../.." && pwd)"
 worker_path="${repo_dir}/services/instance-manager/prewarm_worker_main.py"
-config_path="${repo_dir}/config/prewarm.env"
-database_path="/var/lib/fc/control-plane.db"
-state_root="/var/lib/fc"
-pid_path="/run/ai-agent-prewarm-worker.pid"
-lock_path="/run/ai-agent-prewarm-worker.lock"
-log_path="/var/log/ai-agent-prewarm-worker.log"
+config_path="${PREWARM_CONFIG_PATH:-${repo_dir}/config/prewarm.env}"
+database_path="${PREWARM_DATABASE_PATH:-/var/lib/fc/control-plane.db}"
+state_root="${PREWARM_STATE_ROOT:-/var/lib/fc}"
+pid_path="${PREWARM_PID_PATH:-/run/ai-agent-prewarm-worker.pid}"
+lock_path="${PREWARM_LOCK_PATH:-/run/ai-agent-prewarm-worker.lock}"
+log_path="${PREWARM_LOG_PATH:-/var/log/ai-agent-prewarm-worker.log}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this command with sudo" >&2
@@ -26,9 +26,11 @@ read_pid() {
 
 is_worker_process() {
   local process_pid="$1"
-  [[ -r "/proc/${process_pid}/cmdline" ]] \
-    && tr '\0' ' ' < "/proc/${process_pid}/cmdline" \
-      | grep -Fq -- "${worker_path}"
+  [[ -r "/proc/${process_pid}/cmdline" ]] || return 1
+  local command_line
+  command_line="$(tr '\0' ' ' < "/proc/${process_pid}/cmdline")"
+  [[ "${command_line}" == *"${worker_path}"* ]] \
+    && [[ "${command_line}" == *"--lock-file ${lock_path}"* ]]
 }
 
 find_worker_pid() {
@@ -51,8 +53,9 @@ find_worker_pid() {
 }
 
 config_is_enabled() {
-  python3 "${repo_dir}/services/instance-manager/prewarm_config.py" \
-    | grep -Fq 'enabled=1'
+  PYTHONPATH="${repo_dir}/services/instance-manager" python3 -c \
+    'import pathlib,sys; from prewarm_config import PrewarmConfig; raise SystemExit(0 if PrewarmConfig.from_file(pathlib.Path(sys.argv[1])).enabled else 1)' \
+    "${config_path}"
 }
 
 start_service() {
@@ -74,6 +77,7 @@ start_service() {
 
   rm -f "${pid_path}"
   install -d -o root -g root -m 0755 "${state_root}"
+  install -d -o root -g root -m 0755 "$(dirname "${log_path}")"
   touch "${log_path}"
   chmod 0640 "${log_path}"
   local log_start

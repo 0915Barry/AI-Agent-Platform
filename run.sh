@@ -71,6 +71,8 @@ Commands:
                          Verify Worker restart reconcile and automatic replenishment
   prewarm-worker-lock-smoke-test
                          Verify the real Worker process lock and clean rejection
+  prewarm-worker-service-smoke-test
+                         Verify isolated Worker service start/status/logs/stop
   prewarm-worker-start   Start the manually managed prewarm Worker service
   prewarm-worker-stop    Stop the Worker; existing pool items are preserved
   prewarm-worker-status  Show whether the prewarm Worker is running
@@ -541,6 +543,18 @@ smoke_test_prewarm_worker_lock() {
     "sudo '${REMOTE_DIR}/scripts/linux/prewarm-worker-lock-smoke-test.sh'"
 }
 
+smoke_test_prewarm_worker_service() {
+  sync_repo
+  echo "Testing the isolated prewarm Worker service lifecycle in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prewarm-worker-service-smoke-test.sh'"
+}
+
 prewarm_worker_service() {
   action="$1"
   require_vm_host
@@ -708,6 +722,9 @@ case "${command}" in
     ;;
   prewarm-worker-lock-smoke-test)
     smoke_test_prewarm_worker_lock
+    ;;
+  prewarm-worker-service-smoke-test)
+    smoke_test_prewarm_worker_service
     ;;
   prewarm-worker-start)
     prewarm_worker_service start
