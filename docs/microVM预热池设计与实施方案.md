@@ -1,10 +1,10 @@
 # microVM 预热池设计与实施方案
 
-> 文档状态：阶段 5 完成，阶段 6.1 统一计时已落地，尚未允许生产启用。
+> 文档状态：阶段 5 完成，阶段 6.1 统一计时已落地，阶段 6.2 采样脚本已实现但发现预热 STOP 竞态（排查中），尚未允许生产启用。
 >
 > 当前进度日期：2026-11-18。
 >
-> 当前结论：数据库状态机、数据盘独占、真实 Runtime 接管、Control Plane 启停清理和自动补池 Worker 已经落地。Worker 已具备容量守卫、TTL 回收、稳态健康检查、重启协调、缩容、配置热重载、单进程锁和独立服务管理；超时领取已完成只读分类，四类超时全部启用安全补偿并各自通过真实 smoke test——`pre_attach_timeout`/`reserved_timeout`/`activation_timeout` 回滚，`commit_pending` 向前修复；阶段 5 压力验收已通过 100 轮「领取/停止/补位」真实 VM 循环。阶段 6.1 统一计时已完成：冷启动与预热命中均产出 `startupOperationTiming`（9 项 phase + `unattributedMs` 余数 + 里程碑），CLI 优先读取新对象并回退旧 `startupTiming`，真实回归（cli-smoke、预热专项、三轮压力）通过。阶段 6.2 A/B 性能采样尚未开始。预热功能继续默认关闭。
+> 当前结论：数据库状态机、数据盘独占、真实 Runtime 接管、Control Plane 启停清理和自动补池 Worker 已经落地。Worker 已具备容量守卫、TTL 回收、稳态健康检查、重启协调、缩容、配置热重载、单进程锁和独立服务管理；超时领取已完成只读分类，四类超时全部启用安全补偿并各自通过真实 smoke test——`pre_attach_timeout`/`reserved_timeout`/`activation_timeout` 回滚，`commit_pending` 向前修复；阶段 5 压力验收已通过 100 轮「领取/停止/补位」真实 VM 循环。阶段 6.1 统一计时已完成：冷启动与预热命中均产出 `startupOperationTiming`（9 项 phase + `unattributedMs` 余数 + 里程碑），CLI 优先读取新对象并回退旧 `startupTiming`，真实回归（cli-smoke、预热专项、三轮压力）通过。阶段 6.2 的 A/B 采样脚本（`prewarm-performance-test`）已实现并通过 10 样本冒烟，性能初步显示预热命中比冷启动快约 80%；但 30 样本正式采样暴露出「同一实例冷↔热交替时 STOP 偶发被 reconcile 误判 `instance_not_running`」的平台竞态，正在排查（详见 `docs/问题修复日志.md`），因此 6.2 的正式验收尚未完成。预热功能继续默认关闭。
 
 ## 1. 目标与边界
 
@@ -1002,8 +1002,8 @@ Worker 已支持配置热重载，但 Control Plane 当前只在启动时读取�
 | `scripts/linux/prewarm-worker-smoke-test.sh` | 已实现，真实单轮自动补池验收 |
 | `scripts/linux/prewarm-worker-service.sh` | 已实现，手动管理 Worker 服务 |
 | `scripts/linux/prewarm-worker-*-smoke-test.sh` | 已实现，补池、协调、健康、锁、服务和热重载验收 |
-| `scripts/linux/prewarm-performance-test.sh` | 阶段 6 新增，冷启动/预热 A/B 样本采集与汇总 |
-| `scripts/linux/prewarm-rollout-smoke-test.sh` | 阶段 6 新增，Allowlist、动态关闭与回滚验收 |
+| `scripts/linux/prewarm-performance-smoke.py` / `prewarm-performance-smoke-test.sh` | 已实现，冷启动/预热 A/B 样本采集与汇总（run.sh 命令 `prewarm-performance-test`）|
+| `scripts/linux/prewarm-rollout-smoke-test.sh` | 计划（阶段 6.4），Allowlist、动态关闭与回滚验收 |
 | `config/prewarm.env` | 已有且默认关闭；阶段 6.4 增加显式 rollout mode 及其对应名单或比例 |
 
 ## 17. 发布、关闭与回滚
@@ -1033,12 +1033,12 @@ PREWARM_ENABLED=0
 ### 18.1 当前可用状态
 
 - 开发分支：`prewarm-pool`；
-- 当前阶段 6.1 功能基线：`fe0b432`（统一计时收口完成）；
+- 当前功能基线：`8aa2949`（阶段 6.2 A/B 采样脚本 + 预热 STOP 竞态诊断）；
 - 总开关：`config/prewarm.env` 中 `PREWARM_ENABLED=0`，不得直接改为生产默认开启；
-- 阶段 0、1、2、2A、3、4、5、6.1 已完成；
+- 阶段 0、1、2、2A、3、4、5、6.1 已完成；阶段 6.2 采样脚本已实现、10 样本冒烟通过，但正式 30 样本验收因平台竞态未完成；
 - 阶段 6.1 已完成 `startupOperationTiming` 统一计时（冷/热两侧结构一致，CLI 优先新对象回退旧对象）；
 - 最近一次本地验收：Instance Manager 228、Control Plane 40、CLI 18 项单元测试全部通过；
-- 最近一轮真实验收已覆盖 cli-smoke、预热 Control Plane 专项与三轮压力，计时改动未破坏生命周期语义。
+- 最近一轮真实验收已覆盖 cli-smoke、预热 Control Plane 专项、三轮压力，以及 6.2 的 10 样本 A/B 冒烟（冷 P95≈5.9s、预热 P95≈1.2s、降幅约 80%）。
 
 ### 18.2 下一项开发任务
 
@@ -1048,11 +1048,20 @@ PREWARM_ENABLED=0
 `prewarm-control-plane-smoke-test`、`prewarm-pressure-test 3`）通过，instance-manager 228、
 control-plane 40、CLI 18 单元测试全绿。
 
-下一步进入阶段 6.2：开发 `prewarm-performance-test`，采集冷启动/预热命中各至少 30 个有效样本，
-按交错顺序执行并保存原始样本与汇总；6.3 再根据 localhost `clientObservedMs` 的 P95 判定是否达到
-平台侧 40% 门槛。只有性能和正确性都达标，才进入 6.4 实现 `PrewarmRolloutPolicy`，随后在 6.5
-完成动态关闭与回滚，最后按 6.6 逐级灰度。在 Control Plane 支持动态策略重载之前，不把
-`PREWARM_ENABLED=0` 描述为完整的即时关闭能力。
+阶段 6.2 的 A/B 采样脚本（`prewarm-performance-test`）已实现，10 样本冒烟通过、性能初步显示预热
+比冷启动快约 80%；但 30 样本正式采样暴露了一个平台竞态：同一实例冷↔热交替时，预热样本 `stop`
+偶发被 `reconcile` 误判 `instance_not_running`（`runtime.status()` 返回 None），已记录在
+`docs/问题修复日志.md`（状态：排查中），并在 `server.py` 的 `reconcile` 里加了临时诊断等待复现。
+
+下一项工作顺序：
+
+1. **先修复该 STOP 竞态**：通过 `RECONCILE_DIAGNOSTIC` 定位是绑定丢失还是物理元数据丢失，再在
+   `server.py` 的 `reconcile`/`stop` 或运行时状态解析处修复；修复后删除临时诊断；
+2. **重跑 6.2 的 30 样本正式采样**：冷启动/预热命中各 ≥30 有效样本，产出 `samples.jsonl` 与汇总；
+3. **进入 6.3**：按 localhost `clientObservedMs` 的 P95 判定是否达到平台侧 40% 门槛；
+4. 只有性能和正确性都达标，才进入 6.4 实现 `PrewarmRolloutPolicy`，随后 6.5 动态关闭与回滚，最后 6.6 逐级灰度。
+
+在 Control Plane 支持动态策略重载之前，不把 `PREWARM_ENABLED=0` 描述为完整的即时关闭能力。
 
 ### 18.3 接手后的基础检查
 
