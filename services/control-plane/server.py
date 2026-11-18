@@ -515,6 +515,13 @@ class ControlPlane:
             "resuming",
         }:
             return record
+        # starting/resuming/stopping/suspending 是持有实例锁的生命周期操作所拥有的
+        # 过渡状态。此时 runtime.status(logical_id) 可能仍解析到上一运行代的 stopped
+        # 元数据，或正处于 binding 切换窗口；普通 GET/monitor 不得据此覆盖业务状态。
+        # 进程重启后遗留的过渡状态应由带 operation generation 的专用恢复流程处理，
+        # 不能用一次非原子的 Runtime 读取猜测终态。
+        if record["status"] in {"starting", "stopping", "suspending", "resuming"}:
+            return record
         runtime_status = self.runtime.status(record["id"])
         if runtime_status is None:
             # 临时诊断：定位预热实例 STOP 时 runtime.status 误判 None 的原因。
@@ -536,8 +543,6 @@ class ControlPlane:
                     file=sys.stderr,
                     flush=True,
                 )
-            if record["status"] == "starting":
-                return record
             return self.store.update(record["id"], "stopped")
         if runtime_status.get("status") == "stopped" or not runtime_status.get("processAlive", False):
             return self.store.update(record["id"], "stopped")
@@ -638,6 +643,14 @@ class ControlPlane:
                     completed = self.startup_coordinator.complete_prewarm_stop(instance_id)
                     if completed is None:
                         raise PrewarmManagerError("prewarm assignment disappeared during stop")
+                    print(
+                        "PREWARM_DESTRUCTIVE_ACTION actor=control-plane-stop "
+                        f"action=destroy-runtime logical={instance_id} "
+                        f"runtime={prewarm_assignment['runtimeId']} "
+                        f"operation={prewarm_assignment['operationId']}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     self.runtime.destroy(
                         str(prewarm_assignment["runtimeId"]),
                         preserve_volume=True,
@@ -740,6 +753,14 @@ class ControlPlane:
                         raise PrewarmManagerError(
                             "prewarm assignment disappeared during destroy"
                         )
+                    print(
+                        "PREWARM_DESTRUCTIVE_ACTION actor=control-plane-destroy "
+                        f"action=destroy-runtime logical={instance_id} "
+                        f"runtime={prewarm_assignment['runtimeId']} "
+                        f"operation={prewarm_assignment['operationId']}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     self.runtime.destroy(
                         str(prewarm_assignment["runtimeId"]),
                         preserve_volume=preserve_volume,
@@ -880,23 +901,28 @@ class ControlPlane:
             if owner_id is None:
                 continue  # 无属主实例由 watcher 负责空闲停止。
             instance_id = instance["id"]
-            record = self.reconcile(instance)
-            status = record["status"]
-            if status == "running":
-                runtime = record.get("runtime")
-                idle_seconds = runtime.get("idleSeconds") if isinstance(runtime, dict) else None
-                if isinstance(idle_seconds, int) and idle_seconds >= idle_timeout:
-                    if not self.tasks.instance_has_active_tasks(instance_id):
+            # 与 start/stop/suspend/resume 共用实例锁，避免 monitor 使用操作开始前
+            # 读取的旧 record，在新运行代提交后晚到覆盖 running。
+            with self.lock_for(instance_id):
+                record = self.reconcile(self.store.get(instance_id))
+                status = record["status"]
+                if status == "running":
+                    runtime = record.get("runtime")
+                    idle_seconds = (
+                        runtime.get("idleSeconds") if isinstance(runtime, dict) else None
+                    )
+                    if isinstance(idle_seconds, int) and idle_seconds >= idle_timeout:
+                        if not self.tasks.instance_has_active_tasks(instance_id):
+                            try:
+                                self.suspend(instance_id, owner_id)
+                            except ApiError:
+                                pass
+                elif status == "suspended":
+                    if time.time() - record["updatedAt"] >= stop_timeout:
                         try:
-                            self.suspend(instance_id, owner_id)
+                            self.stop(instance_id)
                         except ApiError:
                             pass
-            elif status == "suspended":
-                if time.time() - record["updatedAt"] >= stop_timeout:
-                    try:
-                        self.stop(instance_id)
-                    except ApiError:
-                        pass
 
     def _native_conversation_messages(
         self,

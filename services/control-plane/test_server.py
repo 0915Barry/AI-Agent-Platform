@@ -699,6 +699,43 @@ class ControlPlaneTests(unittest.TestCase):
         reconciled = self.control.get("agent-dead")
         self.assertEqual(reconciled["status"], "stopped")
 
+    def test_starting_is_not_downgraded_by_previous_stopped_runtime(self) -> None:
+        """新代启动期间不能用上一代 stopped 元数据覆盖业务 starting。"""
+
+        instance_id = "agent-starting-generation"
+        self.control.create({"id": instance_id})
+        # 模拟上一轮冷启动留下的 stopped Runtime 元数据；预热 binding 尚未建立。
+        self.runtime.instances[instance_id] = {
+            "id": instance_id,
+            "status": "stopped",
+            "processAlive": False,
+            "idleSeconds": 0,
+        }
+        self.store.update(instance_id, "starting")
+
+        reconciled = self.control.get(instance_id)
+
+        self.assertEqual(reconciled["status"], "starting")
+        self.assertEqual(self.store.get(instance_id)["status"], "starting")
+
+    def test_resuming_is_not_downgraded_by_stopped_runtime(self) -> None:
+        """快照恢复过渡期同样只能由持锁操作提交终态。"""
+
+        instance_id = "agent-resuming-generation"
+        self.control.create({"id": instance_id})
+        self.runtime.instances[instance_id] = {
+            "id": instance_id,
+            "status": "stopped",
+            "processAlive": False,
+            "idleSeconds": 0,
+        }
+        self.store.update(instance_id, "resuming")
+
+        reconciled = self.control.get(instance_id)
+
+        self.assertEqual(reconciled["status"], "resuming")
+        self.assertEqual(self.store.get(instance_id)["status"], "resuming")
+
     def test_invalid_transition_is_rejected(self) -> None:
         """尚未启动的 created 实例不允许执行 stop。"""
 

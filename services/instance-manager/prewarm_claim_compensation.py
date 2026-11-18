@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -125,6 +126,14 @@ class PreActivationClaimCompensator:
             stopped = self.runtime.stop(audit.runtime_id, reason=reason)
             if stopped.get("status") != "stopped":
                 raise ClaimCompensationError("pre-activation runtime did not stop")
+        print(
+            "PREWARM_DESTRUCTIVE_ACTION actor=claim-compensator "
+            f"classification={audit.classification} action=destroy-runtime "
+            f"logical={audit.logical_instance_id} runtime={audit.runtime_id} "
+            f"operation={audit.operation_id}",
+            file=sys.stderr,
+            flush=True,
+        )
         self.runtime.destroy(audit.runtime_id, preserve_volume=True)
 
         if audit.classification == "reserved_timeout":
@@ -255,6 +264,14 @@ class ActivationTimeoutClaimCompensator:
             )
             if stopped.get("status") != "stopped":
                 raise ClaimCompensationError("activation runtime did not stop")
+        print(
+            "PREWARM_DESTRUCTIVE_ACTION actor=activation-compensator "
+            f"classification={audit.classification} action=destroy-runtime "
+            f"logical={audit.logical_instance_id} runtime={audit.runtime_id} "
+            f"operation={audit.operation_id}",
+            file=sys.stderr,
+            flush=True,
+        )
         self.runtime.destroy(audit.runtime_id, preserve_volume=True)
 
         if not self.attachment_store.release(
@@ -263,6 +280,14 @@ class ActivationTimeoutClaimCompensator:
             raise ClaimCompensationError(
                 "failed to release attached volume attachment after runtime cleanup"
             )
+        print(
+            "PREWARM_DESTRUCTIVE_ACTION actor=activation-compensator "
+            f"classification={audit.classification} action=delete-binding "
+            f"logical={audit.logical_instance_id} runtime={audit.runtime_id} "
+            f"operation={audit.operation_id}",
+            file=sys.stderr,
+            flush=True,
+        )
         self.runtime_store.delete_binding(audit.logical_instance_id)
 
         if not self.prewarm_store.mark_error(

@@ -10,6 +10,7 @@ runtime 的绑定。真实 Firecracker 热切盘由注入的 ``PrewarmActivator`
 
 from __future__ import annotations
 
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -272,6 +273,15 @@ class PrewarmManager:
         volume_path = str(item["volume_path"])
         if not attachment_store.release(volume_path, operation_id):
             raise PrewarmManagerError("volume attachment changed during stop cleanup")
+        # PREWARM_RACE_DIAGNOSTIC：定位旧代 stop 是否误删新代 binding；修复并完成
+        # 压力验收后可替换为正式结构化审计。
+        print(
+            "PREWARM_DESTRUCTIVE_ACTION actor=control-plane-stop "
+            f"action=delete-binding logical={logical_instance_id} runtime={runtime_id} "
+            f"operation={operation_id}",
+            file=sys.stderr,
+            flush=True,
+        )
         runtime_store.delete_binding(logical_instance_id)
         if not prewarm_store.retire(runtime_id):
             raise PrewarmManagerError("failed to retire stopped prewarm runtime")

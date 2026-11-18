@@ -14,9 +14,11 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 import uuid
@@ -50,9 +52,143 @@ WARMUP_SAMPLES = 5
 GROUP_SIZE = 5
 
 
+DIAGNOSTIC_TABLES = (
+    "instances",
+    "runtime_bindings",
+    "runtime_instances",
+    "runtime_sidecars",
+    "prewarm_items",
+    "volume_attachments",
+    "startup_operations",
+    "network_leases",
+)
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
+
+
+def database_snapshot(database: Path) -> dict:
+    """在同一个 SQLite 读事务中抓取竞态相关表，避免拼接不同时间点的状态。"""
+    if not database.is_file():
+        return {"database": str(database), "missing": True, "tables": {}}
+    connection = sqlite3.connect(database, timeout=10)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN")
+        existing = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        tables: dict[str, list[dict] | dict] = {}
+        for table in DIAGNOSTIC_TABLES:
+            if table not in existing:
+                tables[table] = {"missing": True}
+                continue
+            rows = connection.execute(f"SELECT * FROM {table}").fetchall()
+            tables[table] = [dict(row) for row in rows]
+        return {
+            "database": str(database),
+            "capturedAt": int(time.time()),
+            "tables": tables,
+        }
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+def copy_database(database: Path, destination: Path) -> None:
+    """使用 SQLite backup API 复制一致数据库，而不是直接复制 WAL 文件组合。"""
+    if not database.is_file():
+        return
+    source = sqlite3.connect(database, timeout=10)
+    target = sqlite3.connect(destination)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+
+
+def command_output(arguments: list[str]) -> str:
+    try:
+        completed = subprocess.run(arguments, check=False, capture_output=True, text=True)
+    except OSError as error:
+        return f"ERROR running {arguments!r}: {error}\n"
+    return (completed.stdout or "") + (completed.stderr or "")
+
+
+def archive_failure(
+    error: Exception,
+    samples: list[dict],
+    logical_id: str,
+    server_log: Path,
+    worker_log: Path,
+) -> Path:
+    """在清理测试资源之前固化失败现场，供 STOP 竞态离线复盘。"""
+    result_dir = RESULT_ROOT / (
+        "failed-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    )
+    result_dir.mkdir(parents=True, mode=0o755, exist_ok=False)
+    snapshot = database_snapshot(DATABASE)
+    (result_dir / "state-snapshot.json").write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (result_dir / "samples.partial.jsonl").write_text(
+        "".join(json.dumps(sample, ensure_ascii=False) + "\n" for sample in samples),
+        encoding="utf-8",
+    )
+    (result_dir / "failure.json").write_text(
+        json.dumps(
+            {
+                "capturedAt": int(time.time()),
+                "logicalInstanceId": logical_id,
+                "errorType": type(error).__name__,
+                "error": str(error),
+                "traceback": traceback.format_exc(),
+                "completedSamples": len(samples),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    copy_database(DATABASE, result_dir / "control-plane.db")
+    for name, source in (
+        ("control-plane.log", server_log),
+        ("worker.log", worker_log),
+    ):
+        if source.exists():
+            shutil.copy2(source, result_dir / name)
+    (result_dir / "process.txt").write_text(
+        command_output(["ps", "-eo", "pid,ppid,user,stat,lstart,args"]),
+        encoding="utf-8",
+    )
+    (result_dir / "network.txt").write_text(
+        command_output(["ip", "-details", "link", "show"])
+        + "\n--- routes ---\n"
+        + command_output(["ip", "-4", "route", "show"])
+        + "\n--- nftables ---\n"
+        + command_output(["nft", "list", "tables"]),
+        encoding="utf-8",
+    )
+    pressure = []
+    for source in (
+        Path("/proc/loadavg"),
+        Path("/proc/meminfo"),
+        Path("/proc/pressure/cpu"),
+        Path("/proc/pressure/io"),
+        Path("/proc/pressure/memory"),
+    ):
+        try:
+            pressure.append(f"--- {source} ---\n{source.read_text(encoding='utf-8')}")
+        except OSError as read_error:
+            pressure.append(f"--- {source} ---\nERROR: {read_error}\n")
+    (result_dir / "pressure.txt").write_text("\n".join(pressure), encoding="utf-8")
+    return result_dir
 
 
 def request_json(opener, method: str, route: str, payload: dict | None = None) -> dict:
@@ -206,16 +342,26 @@ def run_cycle(
     try:
         stopped = request_json(opener, "POST", f"/api/instances/{logical_id}/stop")
     except RuntimeError as error:
-        # 诊断：查询实例真实状态，区分「reconcile 误判 stopped」还是「真的非 running」。
+        # PREWARM_RACE_DIAGNOSTIC：不要再调用会触发 reconcile 的 GET；直接在
+        # 同一 SQLite 读事务中保留各层状态，避免诊断本身继续修改现场。
         try:
-            current = request_json(opener, "GET", f"/api/instances/{logical_id}")
-            runtime_status = current.get("runtime") or {}
-            detail = (
-                f" instance_status={current.get('status')} "
-                f"runtime_alive={runtime_status.get('processAlive')} "
-                f"runtime_status={runtime_status.get('status')}"
+            snapshot = database_snapshot(DATABASE)
+            tables = snapshot.get("tables") or {}
+            detail = " database_snapshot=" + json.dumps(
+                {
+                    "instances": tables.get("instances"),
+                    "runtime_bindings": tables.get("runtime_bindings"),
+                    "runtime_instances": tables.get("runtime_instances"),
+                    "prewarm_items": tables.get("prewarm_items"),
+                    "volume_attachments": tables.get("volume_attachments"),
+                    "startup_operations": tables.get("startup_operations"),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
             )
-        except Exception:
+        except Exception as diagnostic_error:
+            detail = f" diagnostic_error={diagnostic_error}"
+        if not detail:
             detail = ""
         raise RuntimeError(f"{error}; strategy={strategy} runtime_id={runtime_id}{detail}") from error
     require(stopped.get("status") == "stopped", "Control Plane did not stop instance")
@@ -268,9 +414,17 @@ def sample_group(
         )
         require(sample["strategy"] == strategy, f"sample strategy {sample['strategy']} != {strategy}")
         samples.append(sample)
+        strategy_count = sum(1 for item in samples if item["strategy"] == strategy)
+        if label.isdigit():
+            progress = (
+                f"strategyCount={strategy_count}/{label} "
+                f"totalCount={len(samples)}/{int(label) * 2}"
+            )
+        else:
+            progress = f"strategyCount={strategy_count}/{label} totalCount={len(samples)}"
         print(
             f"PREWARM_PERF_SAMPLE strategy={strategy} clientObservedMs={sample['clientObservedMs']} "
-            f"totalMs={sample['totalMs']} count={len(samples)}/{label}"
+            f"totalMs={sample['totalMs']} {progress}"
         )
         if strategy == "prewarm":
             wait_for_ready(store)
@@ -290,6 +444,11 @@ def stop_process(process: subprocess.Popen | None) -> None:
 
 
 def cleanup_runtime(runtime: InstanceRuntime, runtime_id: str) -> None:
+    print(
+        "PREWARM_DESTRUCTIVE_ACTION actor=performance-test-cleanup "
+        f"action=destroy-runtime runtime={runtime_id}",
+        file=sys.stderr,
+    )
     try:
         status = runtime.status(runtime_id)
         if status is not None and status.get("processAlive") is True:
@@ -452,7 +611,29 @@ def main() -> None:
             f"prewarmP95={summary['prewarm'].get('p95')} "
             f"output={result_dir}"
         )
-    except Exception:
+    except Exception as error:
+        # 先停止两个会继续改写数据库的服务，再固化 SQLite/日志/进程/网络现场。
+        stop_process(worker)
+        worker = None
+        stop_process(server)
+        server = None
+        try:
+            failure_archive = archive_failure(
+                error,
+                samples,
+                logical_id,
+                server_log,
+                worker_log,
+            )
+            print(
+                f"PREWARM_PERF_FAILURE_ARCHIVED path={failure_archive}",
+                file=sys.stderr,
+            )
+        except Exception as archive_error:
+            print(
+                f"PREWARM_PERF_ARCHIVE_ERROR error={archive_error}",
+                file=sys.stderr,
+            )
         for path in (server_log, worker_log):
             if path.exists():
                 print(f"--- {path.name} ---", file=sys.stderr)
@@ -461,10 +642,26 @@ def main() -> None:
     finally:
         stop_process(worker)
         stop_process(server)
+        # 即使失败现场已归档，也要清理所有登记 Runtime，避免诊断测试留下 VMM、
+        # TAP 或网络租约。先从数据库获取 ID，不能只清 ready 项。
+        runtime_ids: set[str] = set()
+        try:
+            snapshot = database_snapshot(DATABASE)
+            runtime_rows = (snapshot.get("tables") or {}).get("runtime_instances") or []
+            if isinstance(runtime_rows, list):
+                runtime_ids.update(
+                    str(row["instance_id"])
+                    for row in runtime_rows
+                    if isinstance(row, dict) and row.get("instance_id")
+                )
+        except Exception as diagnostic_error:
+            print(f"CLEANUP_WARNING database snapshot failed: {diagnostic_error}", file=sys.stderr)
         for ready in store.list_ready(PROFILE_KEY):
-            cleanup_runtime(runtime, str(ready["runtime_id"]))
+            runtime_ids.add(str(ready["runtime_id"]))
         if current_runtime_id:
-            cleanup_runtime(runtime, current_runtime_id)
+            runtime_ids.add(current_runtime_id)
+        for runtime_id in sorted(runtime_ids):
+            cleanup_runtime(runtime, runtime_id)
         if volume_path is not None:
             volume_path.unlink(missing_ok=True)
         WORKER_LOCK.unlink(missing_ok=True)

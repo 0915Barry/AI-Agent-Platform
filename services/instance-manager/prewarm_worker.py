@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import socket
+import sys
 import uuid
 from dataclasses import dataclass
 from typing import Callable, Protocol
@@ -132,6 +133,18 @@ class PrewarmWorker:
             lambda: secrets.token_urlsafe(32)
         )
 
+    def _destroy_runtime(self, runtime_id: str, reason: str) -> None:
+        """带来源记录地销毁公共 Runtime，供 STOP 竞态诊断。"""
+        if self.builder is None:
+            raise PrewarmWorkerError("prewarm builder is not configured")
+        print(
+            "PREWARM_DESTRUCTIVE_ACTION actor=worker action=destroy-runtime "
+            f"runtime={runtime_id} reason={reason}",
+            file=sys.stderr,
+            flush=True,
+        )
+        self.builder.destroy(runtime_id, preserve_volume=True)
+
     def recover_stale_claims(self) -> ClaimRecoveryResult:
         """审计超时领取，并按分类分发给对应补偿器。
 
@@ -232,7 +245,7 @@ class PrewarmWorker:
             self.prewarm_store.mark_prepare_error(runtime_id, message)
             if prepared:
                 try:
-                    self.builder.destroy(runtime_id, preserve_volume=True)
+                    self._destroy_runtime(runtime_id, "prepare-publish-failed")
                 except Exception as cleanup_error:
                     raise PrewarmWorkerError(
                         f"{message}; cleanup failed: {str(cleanup_error)[-1000:]}"
@@ -299,7 +312,7 @@ class PrewarmWorker:
                     raise PrewarmWorkerError(
                         f"expired prewarm runtime did not stop: {runtime_id}"
                     )
-                self.builder.destroy(runtime_id, preserve_volume=True)
+                self._destroy_runtime(runtime_id, "ttl-expired")
                 if not self.prewarm_store.retire(runtime_id):
                     raise PrewarmWorkerError(
                         f"expired prewarm item did not retire: {runtime_id}"
@@ -373,7 +386,7 @@ class PrewarmWorker:
                     raise PrewarmWorkerError(
                         f"reconciled prewarm runtime did not stop: {runtime_id}"
                     )
-            self.builder.destroy(runtime_id, preserve_volume=True)
+            self._destroy_runtime(runtime_id, f"reconcile-{item_status}")
             if not self.prewarm_store.retire(runtime_id):
                 raise PrewarmWorkerError(
                     f"reconciled prewarm item did not retire: {runtime_id}"
@@ -412,7 +425,7 @@ class PrewarmWorker:
 
             if not self.prewarm_store.mark_draining(runtime_id):
                 continue
-            self.builder.destroy(runtime_id, preserve_volume=True)
+            self._destroy_runtime(runtime_id, "health-check-failed")
             if not self.prewarm_store.retire(runtime_id):
                 raise PrewarmWorkerError(
                     f"unhealthy prewarm item did not retire: {runtime_id}"
@@ -453,7 +466,7 @@ class PrewarmWorker:
                         raise PrewarmWorkerError(
                             f"excess prewarm runtime did not stop: {runtime_id}"
                         )
-                self.builder.destroy(runtime_id, preserve_volume=True)
+                self._destroy_runtime(runtime_id, "pool-resize")
                 if not self.prewarm_store.retire(runtime_id):
                     raise PrewarmWorkerError(
                         f"excess prewarm item did not retire: {runtime_id}"
