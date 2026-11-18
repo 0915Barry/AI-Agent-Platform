@@ -10,6 +10,7 @@ runtime 的绑定。真实 Firecracker 热切盘由注入的 ``PrewarmActivator`
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Callable, Protocol
@@ -17,6 +18,7 @@ from typing import Callable, Protocol
 from prewarm_config import PrewarmConfig
 from prewarm_store import PrewarmStore
 from runtime_store import RuntimeStore, VolumeAttachmentStore
+from startup_operation_timing import merge_phases
 
 
 class PrewarmManagerError(RuntimeError):
@@ -59,6 +61,7 @@ class ClaimResult:
     operation_id: str | None = None
     runtime: dict | None = None
     reason: str | None = None
+    phase_report: dict | None = None
 
 
 class PrewarmManager:
@@ -125,6 +128,7 @@ class PrewarmManager:
             self._require_phase3_dependencies()
         )
         activation_id = self._new_activation_id()
+        claim_started = time.monotonic()
         item = prewarm_store.claim(
             profile_key,
             logical_instance_id,
@@ -138,6 +142,7 @@ class PrewarmManager:
 
         runtime_id = str(item["runtime_id"])
         attachment_reserved = False
+        phase_report: dict | None = None
         try:
             attachment_store.reserve(
                 volume_path,
@@ -147,6 +152,7 @@ class PrewarmManager:
                 operation_id,
             )
             attachment_reserved = True
+            claim_ms = round((time.monotonic() - claim_started) * 1000)
             runtime = activator.activate_prewarmer(
                 runtime_id,
                 logical_instance_id,
@@ -155,6 +161,10 @@ class PrewarmManager:
                 operation_id,
                 activation_id,
                 str(item.get("claim_token_hash") or ""),
+            )
+            phase_report = merge_phases(
+                {"claimMs": claim_ms},
+                (runtime or {}).get("startupOperationPhases") or {},
             )
             if not attachment_store.mark_attached(volume_path, operation_id):
                 raise PrewarmManagerError("volume attachment generation changed during activation")
@@ -183,6 +193,7 @@ class PrewarmManager:
             activation_id=activation_id,
             operation_id=operation_id,
             runtime=runtime,
+            phase_report=phase_report,
         )
 
     def commit(

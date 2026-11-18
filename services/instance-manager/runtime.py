@@ -1350,6 +1350,13 @@ class InstanceRuntime:
         ):
             raise RuntimeFailure("prewarm claim token hash mismatch")
 
+        phases = {
+            "volumePrepareMs": 0,
+            "gatewayReadyMs": 0,
+            "drivePatchMs": 0,
+            "guestActivateMs": 0,
+        }
+        volume_started = time.monotonic()
         self.adopt_legacy_volume(logical_instance_id, user_id, supplied_volume)
         self.create_volume(supplied_volume, uid, gid)
         try:
@@ -1362,6 +1369,7 @@ class InstanceRuntime:
                 f"persistent volume check failed: {filesystem_check.stderr.strip()}"
             )
         self.configure_agent_volume(supplied_volume, str(network["host_ip"]))
+        phases["volumePrepareMs"] = round((time.monotonic() - volume_started) * 1000)
 
         try:
             probe_state = self.prewarm_activation.probe(
@@ -1378,6 +1386,7 @@ class InstanceRuntime:
         os.chmod(physical_paths["activity"], 0o600)
         sidecars: list[subprocess.Popen[bytes]] = []
         try:
+            gateway_started = time.monotonic()
             sidecars = self.start_model_gateway(
                 logical_instance_id,
                 physical_paths,
@@ -1385,9 +1394,11 @@ class InstanceRuntime:
                 gateway_uid,
                 gateway_gid,
             )
+            phases["gatewayReadyMs"] = round((time.monotonic() - gateway_started) * 1000)
 
             # 原子替换 jail 内目录项；Firecracker 仍持有占位盘旧 FD，随后 PATCH
             # 才会重新打开当前 /data.ext4 对应的真实用户盘。
+            patch_started = time.monotonic()
             data_link = physical_paths["chroot"] / "data.ext4"
             staged_link = physical_paths["chroot"] / "data.ext4.next"
             staged_link.unlink(missing_ok=True)
@@ -1399,7 +1410,9 @@ class InstanceRuntime:
                 "/drives/data",
                 {"drive_id": "data", "path_on_host": "/data.ext4"},
             )
+            phases["drivePatchMs"] = round((time.monotonic() - patch_started) * 1000)
 
+            activate_started = time.monotonic()
             volume_uuid = self._volume_uuid(supplied_volume)
             try:
                 bound = self.prewarm_activation.activate(
@@ -1413,6 +1426,7 @@ class InstanceRuntime:
                 raise RuntimeFailure(str(error)) from error
             if bound.rpc_host != str(network["guest_ip"]) or bound.rpc_port != PI_RPC_PORT:
                 raise RuntimeFailure("BOUND_READY returned an unexpected Pi RPC endpoint")
+            phases["guestActivateMs"] = round((time.monotonic() - activate_started) * 1000)
 
             sidecar_rows = list(metadata.get("sidecars", []))
             for sidecar in sidecars:
@@ -1427,6 +1441,7 @@ class InstanceRuntime:
             metadata["volumePath"] = str(supplied_volume)
             stored = self.runtime_store.save(metadata)
             stored["processAlive"] = process_matches(stored)
+            stored["startupOperationPhases"] = phases
             return stored
         except Exception:
             for sidecar in sidecars:

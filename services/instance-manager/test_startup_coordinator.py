@@ -16,12 +16,17 @@ class FakeRuntime:
         self.fail = fail
         self.started: list[tuple[str, str | None]] = []
         self.resumed: list[tuple[str, str | None]] = []
+        self.phases: dict = {}
 
     def start(self, instance_id: str, owner_id: str | None) -> dict:
         self.started.append((instance_id, owner_id))
         if self.fail:
             raise RuntimeError("cold start failed")
-        return {"status": "running", "instanceId": instance_id}
+        return {
+            "status": "running",
+            "instanceId": instance_id,
+            "startupOperationPhases": dict(self.phases),
+        }
 
     def resume(self, instance_id: str, owner_id: str | None) -> dict:
         self.resumed.append((instance_id, owner_id))
@@ -89,6 +94,14 @@ class StartupCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.runtime.started, [("inst-1", "user-1")])
         self.assertEqual(self.store.get(result.operation_id)["status"], "committing")
 
+    def test_run_cold_carries_runtime_phase_report(self) -> None:
+        self.runtime.phases = {"volumePrepareMs": 80, "runtimeReadyMs": 4800}
+        result = self.coordinator.run_cold("inst-1", "user-1")
+        self.assertEqual(
+            result.phase_report,
+            {"volumePrepareMs": 80, "runtimeReadyMs": 4800},
+        )
+
     def test_run_snapshot_records_and_executes(self) -> None:
         result = self.coordinator.run_snapshot("inst-1", "user-1")
         self.assertEqual(result.strategy, "snapshot")
@@ -155,6 +168,33 @@ class StartupCoordinatorTests(unittest.TestCase):
         self.assertEqual(
             prewarm.committed,
             [("inst-1", "runtime-1", "op-1", "activation-1")],
+        )
+
+    def test_run_start_prewarm_carries_claim_phase_report(self) -> None:
+        prewarm = FakePrewarmManager()
+        prewarm.result = ClaimResult(
+            claimed=True,
+            runtime_id="runtime-1",
+            activation_id="activation-1",
+            operation_id="op-1",
+            runtime={"status": "running", "id": "runtime-1"},
+            phase_report={"claimMs": 5, "guestActivateMs": 300},
+        )
+        coordinator = StartupCoordinator(
+            self.store,
+            self.runtime,
+            prewarm_manager=prewarm,  # type: ignore[arg-type]
+            new_operation_id=lambda: "op-1",
+        )
+        result = coordinator.run_start(
+            "inst-1",
+            "user-1",
+            volume_path="/srv/fc/volumes/users/user-1.ext4",
+        )
+        self.assertEqual(result.strategy, "prewarm")
+        self.assertEqual(
+            result.phase_report,
+            {"claimMs": 5, "guestActivateMs": 300},
         )
 
     def test_run_start_falls_back_only_when_pool_is_unavailable(self) -> None:

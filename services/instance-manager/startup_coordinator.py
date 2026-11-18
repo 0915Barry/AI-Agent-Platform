@@ -40,6 +40,7 @@ class StartupResult:
     instance_id: str
     runtime_id: str | None = None
     activation_id: str | None = None
+    phase_report: dict | None = None
 
 
 class StartupCoordinator:
@@ -77,6 +78,7 @@ class StartupCoordinator:
             strategy=strategy,
             runtime=runtime,
             instance_id=instance_id,
+            phase_report=runtime.get("startupOperationPhases"),
         )
 
     def _run_prewarm(
@@ -138,6 +140,7 @@ class StartupCoordinator:
             instance_id=instance_id,
             runtime_id=claim.runtime_id,
             activation_id=claim.activation_id,
+            phase_report=claim.phase_report,
         )
 
     def run_start(

@@ -61,6 +61,7 @@ class PrewarmManagerTests(unittest.TestCase):
             self.fail_commit = False
             self.activated: list[tuple[str, str, str, str, str, str, str]] = []
             self.committed: list[tuple[str, str, str]] = []
+            self.phases: dict = {}
 
         def activate_prewarmer(
             self,
@@ -85,7 +86,11 @@ class PrewarmManagerTests(unittest.TestCase):
             )
             if self.fail:
                 raise RuntimeError("activation failed")
-            return {"id": runtime_id, "status": "running"}
+            return {
+                "id": runtime_id,
+                "status": "running",
+                "startupOperationPhases": dict(self.phases),
+            }
 
         def commit_prewarmer(
             self, runtime_id: str, operation_id: str, activation_id: str
@@ -186,6 +191,40 @@ class PrewarmManagerTests(unittest.TestCase):
             self.activator.committed,
             [("runtime-1", "operation-1", "activation-1")],
         )
+
+    def test_claim_reports_merged_phase_report(self) -> None:
+        self._ready()
+        self.activator.phases = {
+            "volumePrepareMs": 80,
+            "gatewayReadyMs": 200,
+            "drivePatchMs": 50,
+            "guestActivateMs": 300,
+        }
+        result = self.manager.claim(
+            "profile-a", "logical-1", "user-1", "/vol/user-1.ext4", "operation-1"
+        )
+        self.assertTrue(result.claimed)
+        report = result.phase_report
+        self.assertIsNotNone(report)
+        # claimMs 由 Manager 测量，非负即可（真实计时可能为 0）。
+        self.assertGreaterEqual(report["claimMs"], 0)
+        self.assertEqual(report["volumePrepareMs"], 80)
+        self.assertEqual(report["gatewayReadyMs"], 200)
+        self.assertEqual(report["drivePatchMs"], 50)
+        self.assertEqual(report["guestActivateMs"], 300)
+        # 值域：所有 phase 都是非负整数。
+        for name, value in report.items():
+            self.assertIsInstance(value, int)
+            self.assertGreaterEqual(value, 0)
+
+    def test_claim_without_runtime_phases_still_reports_claim(self) -> None:
+        self._ready()
+        result = self.manager.claim(
+            "profile-a", "logical-1", "user-1", "/vol/user-1.ext4", "operation-1"
+        )
+        self.assertTrue(result.claimed)
+        # FakeActivator 默认 phases 为空，phase_report 应只含 claimMs。
+        self.assertEqual(set(result.phase_report), {"claimMs"})
 
     def test_activation_failure_keeps_volume_locked(self) -> None:
         self._ready()

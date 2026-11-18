@@ -157,6 +157,7 @@ class FakePrewarmManager:
             runtime_id="prewarm-physical-1",
             activation_id="activation-1",
             operation_id=operation_id,
+            phase_report=None,
             runtime={
                 "id": "prewarm-physical-1",
                 "status": "running",
