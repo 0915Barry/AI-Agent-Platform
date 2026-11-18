@@ -1,10 +1,10 @@
 # microVM 预热池设计与实施方案
 
-> 文档状态：阶段 5 故障与并发验证完成，阶段 6 实施方案已明确、代码尚未开始，尚未允许生产启用。
+> 文档状态：阶段 5 完成，阶段 6.1 统一计时已落地，尚未允许生产启用。
 >
-> 当前进度日期：2026-11-17。
+> 当前进度日期：2026-11-18。
 >
-> 当前结论：数据库状态机、数据盘独占、真实 Runtime 接管、Control Plane 启停清理和自动补池 Worker 已经落地。Worker 已具备容量守卫、TTL 回收、稳态健康检查、重启协调、缩容、配置热重载、单进程锁和独立服务管理；超时领取已完成只读分类，四类超时全部启用安全补偿并各自通过真实 smoke test——`pre_attach_timeout`/`reserved_timeout`/`activation_timeout` 回滚（`prewarm-claim-compensation-smoke-test` / `prewarm-reserved-timeout-smoke-test` / `prewarm-activation-timeout-smoke-test`），`commit_pending` 向前修复（`prewarm-commit-pending-smoke-test`）；阶段 5 压力验收已通过 100 轮「领取/停止/补位」真实 VM 循环（`prewarm-pressure-test`），binding/attachment/租约/占位盘/Jailer 无残留。阶段 6 性能验收与灰度尚未开始。预热功能继续默认关闭。
+> 当前结论：数据库状态机、数据盘独占、真实 Runtime 接管、Control Plane 启停清理和自动补池 Worker 已经落地。Worker 已具备容量守卫、TTL 回收、稳态健康检查、重启协调、缩容、配置热重载、单进程锁和独立服务管理；超时领取已完成只读分类，四类超时全部启用安全补偿并各自通过真实 smoke test——`pre_attach_timeout`/`reserved_timeout`/`activation_timeout` 回滚，`commit_pending` 向前修复；阶段 5 压力验收已通过 100 轮「领取/停止/补位」真实 VM 循环。阶段 6.1 统一计时已完成：冷启动与预热命中均产出 `startupOperationTiming`（9 项 phase + `unattributedMs` 余数 + 里程碑），CLI 优先读取新对象并回退旧 `startupTiming`，真实回归（cli-smoke、预热专项、三轮压力）通过。阶段 6.2 A/B 性能采样尚未开始。预热功能继续默认关闭。
 
 ## 1. 目标与边界
 
@@ -1033,40 +1033,26 @@ PREWARM_ENABLED=0
 ### 18.1 当前可用状态
 
 - 开发分支：`prewarm-pool`；
-- 当前阶段 5 功能基线：`0290a06`（100 轮领取、停止和补位压力验收）；
+- 当前阶段 6.1 功能基线：`fe0b432`（统一计时收口完成）；
 - 总开关：`config/prewarm.env` 中 `PREWARM_ENABLED=0`，不得直接改为生产默认开启；
-- 阶段 0、1、2、2A、3、4、5 已完成；
-- 阶段 5 已完成四类超时补偿（回滚×3 + 向前修复×1）和 100 轮「领取/停止/补位」压力验收；
-- 最近一次本地验收：Instance Manager 200 项单元测试全部通过，Control Plane 40 项通过；
-- 最近一轮真实验收已覆盖 Runtime、Control Plane、自动补池、重启协调、健康补位、进程锁、独立服务、配置热重载、缩容、四类超时补偿与 100 轮压力。
+- 阶段 0、1、2、2A、3、4、5、6.1 已完成；
+- 阶段 6.1 已完成 `startupOperationTiming` 统一计时（冷/热两侧结构一致，CLI 优先新对象回退旧对象）；
+- 最近一次本地验收：Instance Manager 228、Control Plane 40、CLI 18 项单元测试全部通过；
+- 最近一轮真实验收已覆盖 cli-smoke、预热 Control Plane 专项与三轮压力，计时改动未破坏生命周期语义。
 
 ### 18.2 下一项开发任务
 
-阶段 5 已完成：四类超时补偿各自通过真实 smoke test，且 100 轮「领取/停止/补位」压力验收通过（`prewarm-pressure-test`），binding/attachment/租约/占位盘/Jailer 无残留。
+阶段 6.1「统一计时」已完成并各自提交验收：`startupOperationTiming` 版本化结构（9 项 phase +
+`unattributedMs` 余数 + `guestDeclaredRpcReadyMs` 里程碑）已由 Control Plane 收口生成，冷启动与
+预热命中两侧响应结构一致，CLI 优先读取新对象并回退旧 `startupTiming`；真实回归（`cli-smoke-test`、
+`prewarm-control-plane-smoke-test`、`prewarm-pressure-test 3`）通过，instance-manager 228、
+control-plane 40、CLI 18 单元测试全绿。
 
-- `pre_attach_timeout`（`prewarm-claim-compensation-smoke-test`）：停 VMM → 销毁 → 退休，op 置 `failed`；
-- `reserved_timeout`（`prewarm-reserved-timeout-smoke-test`）：额外释放 `reserved` 附件锁；
-- `activation_timeout`（`prewarm-activation-timeout-smoke-test`）：完整回滚，额外释放 `attached` 附件 + 删除 `binding`；
-- `commit_pending`（`prewarm-commit-pending-smoke-test`）：向前修复，只补 `mark_assigned` + `mark_succeeded`，不停 VMM。
-
-下一步只执行阶段 6.1“统一计时”，不同时修改 rollout，也不直接运行 30+30 性能样本：
-
-1. **6.1A—计时骨架**：新增版本化 `startupOperationTiming` 数据结构、phase 合并器、
-   `unattributedMs` 余数计算和不变量校验；先用纯单元测试冻结字段及求和规则；
-2. **6.1B—冷启动接入**：把现有冷启动 Host/Guest 局部计时映射为九项 phase，同时原样保留
-   `startupTiming`，验证旧 CLI 和 API 调用方不受影响；
-3. **6.1C—预热接入**：在 Runtime/PrewarmManager 内分别测量领取、数据盘、gateway、PATCH、
-   Guest 激活和提交前局部增量，通过 `StartupResult` 向上交付，不让底层生成最终总耗时；
-4. **6.1D—Control Plane 收口**：由 Control Plane 记录公共起点和最终结束点，合并 strategy、
-   局部 phases、`guestDeclaredRpcReadyMs`，并统一计算 `totalMs` 与 `unattributedMs`；
-5. **6.1E—调用方迁移与回归**：CLI 优先读取新对象、缺失时回退旧对象；执行单元测试、CLI、
-   Control Plane、预热专项和三轮压力回归，确认计时不会改变生命周期语义。
-
-阶段 6.1 完成后进入 6.2，开发 `prewarm-performance-test` 并采集冷启动/预热各 30 个有效样本；
-6.3 根据 localhost `clientObservedMs` 的 P95 判定是否达到平台侧 40% 门槛；只有性能和正确性均
-达标，才进入 6.4 实现 `PrewarmRolloutPolicy`，随后在 6.5 完成动态关闭与回滚，最后按 6.6
-逐级灰度。在 Control Plane 支持动态策略重载之前，不把 `PREWARM_ENABLED=0` 描述为完整的
-即时关闭能力。
+下一步进入阶段 6.2：开发 `prewarm-performance-test`，采集冷启动/预热命中各至少 30 个有效样本，
+按交错顺序执行并保存原始样本与汇总；6.3 再根据 localhost `clientObservedMs` 的 P95 判定是否达到
+平台侧 40% 门槛。只有性能和正确性都达标，才进入 6.4 实现 `PrewarmRolloutPolicy`，随后在 6.5
+完成动态关闭与回滚，最后按 6.6 逐级灰度。在 Control Plane 支持动态策略重载之前，不把
+`PREWARM_ENABLED=0` 描述为完整的即时关闭能力。
 
 ### 18.3 接手后的基础检查
 
