@@ -63,6 +63,7 @@ class ClaimResult:
     runtime: dict | None = None
     reason: str | None = None
     phase_report: dict | None = None
+    milestone_report: dict | None = None
 
 
 class PrewarmManager:
@@ -144,6 +145,7 @@ class PrewarmManager:
         runtime_id = str(item["runtime_id"])
         attachment_reserved = False
         phase_report: dict | None = None
+        milestone_report: dict | None = None
         try:
             attachment_store.reserve(
                 volume_path,
@@ -167,6 +169,12 @@ class PrewarmManager:
                 {"claimMs": claim_ms},
                 (runtime or {}).get("startupOperationPhases") or {},
             )
+            runtime_milestones = (runtime or {}).get("startupOperationMilestones") or {}
+            if "guestDeclaredRpcReadyMs" in runtime_milestones:
+                milestone_report = {
+                    "guestDeclaredRpcReadyMs": claim_ms
+                    + int(runtime_milestones["guestDeclaredRpcReadyMs"])
+                }
             if not attachment_store.mark_attached(volume_path, operation_id):
                 raise PrewarmManagerError("volume attachment generation changed during activation")
             runtime_store.save_binding(
@@ -195,6 +203,7 @@ class PrewarmManager:
             operation_id=operation_id,
             runtime=runtime,
             phase_report=phase_report,
+            milestone_report=milestone_report,
         )
 
     def commit(

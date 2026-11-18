@@ -108,6 +108,10 @@ class StartupTimingDiagnostic:
         self.values[stage] = round((now - self.previous_at) * 1000)
         self.previous_at = now
 
+    def elapsed_ms(self) -> int:
+        """返回从 Runtime 启动起点到当前的累计偏移。"""
+        return round((time.monotonic() - self.started_at) * 1000)
+
     def emit(self, outcome: str, guest: dict[str, int] | None = None) -> dict:
         if self.emitted:
             return self.result or {}
@@ -1014,6 +1018,7 @@ class InstanceRuntime:
                 tail = paths["console"].read_text(encoding="utf-8", errors="replace")[-8000:]
                 raise RuntimeFailure(f"guest did not become ready\n{tail}")
             timing.mark("guest_ready_ms")  # STARTUP_TIMING_DIAGNOSTIC
+            guest_declared_rpc_ready_ms = timing.elapsed_ms()
 
             register_arguments = [
                 "register",
@@ -1082,6 +1087,9 @@ class InstanceRuntime:
             status["startupOperationPhases"] = map_cold_host_stages(
                 startup_timing.get("host")
             )
+            status["startupOperationMilestones"] = {
+                "guestDeclaredRpcReadyMs": guest_declared_rpc_ready_ms
+            }
             return status
         except Exception as error:
             if process.poll() is None:
@@ -1328,6 +1336,7 @@ class InstanceRuntime:
         这些跨表状态由 ``PrewarmManager`` 统一编排。数据盘一旦 PATCH 给 VMM，
         后续失败都不能自动解锁，由上层标为 error 并进入显式补偿。
         """
+        operation_started = time.monotonic()
         runtime_id = validate_instance_id(runtime_id)
         logical_instance_id = validate_instance_id(logical_instance_id)
         user_id = validate_instance_id(user_id)
@@ -1427,6 +1436,9 @@ class InstanceRuntime:
             if bound.rpc_host != str(network["guest_ip"]) or bound.rpc_port != PI_RPC_PORT:
                 raise RuntimeFailure("BOUND_READY returned an unexpected Pi RPC endpoint")
             phases["guestActivateMs"] = round((time.monotonic() - activate_started) * 1000)
+            guest_declared_rpc_ready_ms = round(
+                (time.monotonic() - operation_started) * 1000
+            )
 
             sidecar_rows = list(metadata.get("sidecars", []))
             for sidecar in sidecars:
@@ -1442,6 +1454,9 @@ class InstanceRuntime:
             stored = self.runtime_store.save(metadata)
             stored["processAlive"] = process_matches(stored)
             stored["startupOperationPhases"] = phases
+            stored["startupOperationMilestones"] = {
+                "guestDeclaredRpcReadyMs": guest_declared_rpc_ready_ms
+            }
             return stored
         except Exception:
             for sidecar in sidecars:

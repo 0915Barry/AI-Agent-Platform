@@ -265,8 +265,8 @@ def percentile(sorted_values: list[int], ratio: float) -> int | None:
     return sorted_values[index]
 
 
-def summarize(name: str, samples: list[dict]) -> dict:
-    values = sorted(int(sample[name]) for sample in samples if sample.get("success"))
+def summarize_values(raw_values: list[int | float]) -> dict:
+    values = sorted(int(value) for value in raw_values)
     if not values:
         return {}
     mean = sum(values) / len(values)
@@ -279,6 +279,116 @@ def summarize(name: str, samples: list[dict]) -> dict:
         "p50": percentile(values, 0.5),
         "p95": percentile(values, 0.95),
         "stddev": round(math.sqrt(variance), 2),
+    }
+
+
+def summarize(name: str, samples: list[dict]) -> dict:
+    return summarize_values(
+        [sample[name] for sample in samples if sample.get("success") and sample.get(name) is not None]
+    )
+
+
+def summarize_milestone(name: str, samples: list[dict]) -> dict:
+    return summarize_values(
+        [
+            sample["milestones"][name]
+            for sample in samples
+            if sample.get("success")
+            and isinstance(sample.get("milestones"), dict)
+            and sample["milestones"].get(name) is not None
+        ]
+    )
+
+
+def read_mem_available_kib() -> int | None:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def read_process_memory_kib(pid: int) -> dict[str, int | None]:
+    result: dict[str, int | None] = {"rssKib": None, "pssKib": None}
+    try:
+        for line in Path(f"/proc/{pid}/smaps_rollup").read_text(
+            encoding="utf-8"
+        ).splitlines():
+            if line.startswith("Rss:"):
+                result["rssKib"] = int(line.split()[1])
+            elif line.startswith("Pss:"):
+                result["pssKib"] = int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return result
+
+
+def active_network_lease_count(database: Path) -> int | None:
+    try:
+        with sqlite3.connect(database, timeout=10) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM network_leases WHERE status IN ('reserved','active')"
+            ).fetchone()
+        return int(row[0]) if row is not None else None
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+
+
+def capture_pool_resource(
+    state: str,
+    *,
+    ready_item: dict | None = None,
+    prepare_wait_ms: int | None = None,
+) -> dict:
+    """记录池空/预热 ready 时的 Host 资源快照。"""
+    snapshot: dict = {
+        "state": state,
+        "capturedAt": int(time.time()),
+        "memAvailableKib": read_mem_available_kib(),
+        "activeNetworkLeases": active_network_lease_count(DATABASE),
+    }
+    if ready_item is not None:
+        snapshot["runtimeId"] = str(ready_item.get("runtime_id") or "")
+        pid = int(ready_item.get("vmm_pid") or 0)
+        snapshot["vmmPid"] = pid or None
+        snapshot["prepareWaitMs"] = prepare_wait_ms
+        if pid:
+            snapshot.update(read_process_memory_kib(pid))
+    return snapshot
+
+
+def evaluate_summary(summary: dict, expected_samples: int) -> dict:
+    cold_p95 = int((summary.get("cold") or {}).get("p95") or 0)
+    prewarm_p95 = int((summary.get("prewarm") or {}).get("p95") or 0)
+    reduction = (
+        round((cold_p95 - prewarm_p95) * 100 / cold_p95, 2)
+        if cold_p95 > 0
+        else 0.0
+    )
+    checks = {
+        "coldSampleCount": (summary.get("cold") or {}).get("count") == expected_samples,
+        "prewarmSampleCount": (summary.get("prewarm") or {}).get("count")
+        == expected_samples,
+        "coldSuccessRate": summary.get("coldSuccessRate") == 1.0,
+        "prewarmSuccessRate": summary.get("prewarmSuccessRate") == 1.0,
+        "strategyFallbackRate": summary.get("strategyFallbackRate") == 0.0,
+        "platformP95ReductionAtLeast40Percent": reduction >= 40.0,
+        "guestMilestonesPresent": int(
+            (summary.get("coldGuestDeclaredRpcReadyMs") or {}).get("p95") or 0
+        )
+        > 0
+        and int(
+            (summary.get("prewarmGuestDeclaredRpcReadyMs") or {}).get("p95") or 0
+        )
+        > 0,
+    }
+    return {
+        "passed": all(checks.values()),
+        "platformP95ReductionPercent": reduction,
+        "requiredReductionPercent": 40.0,
+        "checks": checks,
     }
 
 
@@ -382,6 +492,7 @@ def run_cycle(
         "clientObservedMs": client_observed_ms,
         "totalMs": timing.get("totalMs"),
         "phases": timing.get("phases"),
+        "milestones": timing.get("milestones"),
         "runtimeId": runtime_id,
         "timestamp": int(time.time()),
     }
@@ -399,20 +510,35 @@ def sample_group(
     strategy: str,
     count: int,
     samples: list[dict],
+    resource_samples: list[dict],
     label: str,
 ) -> None:
     """采集 count 个指定 strategy 样本；交替改写 target_ready 控制池。"""
     target_ready = 1 if strategy == "prewarm" else 0
     write_config(config_path, target_ready)
     if strategy == "prewarm":
-        wait_for_ready(store)
+        ready_wait_started = time.monotonic()
+        ready_item = wait_for_ready(store)
+        ready_wait_ms = round((time.monotonic() - ready_wait_started) * 1000)
     else:
         wait_for_pool_empty(store)
+        ready_item = None
+        ready_wait_ms = None
+        resource_samples.append(capture_pool_resource("pool-empty"))
     for _ in range(count):
+        if ready_item is not None:
+            resource_samples.append(
+                capture_pool_resource(
+                    "ready",
+                    ready_item=ready_item,
+                    prepare_wait_ms=ready_wait_ms,
+                )
+            )
         sample = run_cycle(
             opener, store, logical_id, runtime, attachment_store, runtime_store, volume_path
         )
         require(sample["strategy"] == strategy, f"sample strategy {sample['strategy']} != {strategy}")
+        sample["requestedStrategy"] = strategy
         samples.append(sample)
         strategy_count = sum(1 for item in samples if item["strategy"] == strategy)
         if label.isdigit():
@@ -427,7 +553,9 @@ def sample_group(
             f"totalMs={sample['totalMs']} {progress}"
         )
         if strategy == "prewarm":
-            wait_for_ready(store)
+            ready_wait_started = time.monotonic()
+            ready_item = wait_for_ready(store)
+            ready_wait_ms = round((time.monotonic() - ready_wait_started) * 1000)
         else:
             wait_for_pool_empty(store)
 
@@ -502,6 +630,7 @@ def main() -> None:
     runtime_store = RuntimeStore(DATABASE)
 
     samples: list[dict] = []
+    resource_samples: list[dict] = []
     try:
         user = AuthStore(DATABASE).create_user(username, password, claim_unowned=False)
         user_id = str(user["id"])
@@ -554,9 +683,11 @@ def main() -> None:
         for strategy in ("prewarm", "cold"):
             sample_group(
                 opener, store, logical_id, runtime, attachment_store, runtime_store,
-                volume_path, config_path, strategy, WARMUP_SAMPLES, samples, "warmup",
+                volume_path, config_path, strategy, WARMUP_SAMPLES, samples,
+                resource_samples, "warmup",
             )
         samples.clear()
+        resource_samples.clear()
 
         # 正式采样：按组交错，避免时间漂移偏向某一组。
         remaining = samples_per_strategy
@@ -564,11 +695,13 @@ def main() -> None:
             group = min(GROUP_SIZE, remaining)
             sample_group(
                 opener, store, logical_id, runtime, attachment_store, runtime_store,
-                volume_path, config_path, "cold", group, samples, f"{samples_per_strategy}",
+                volume_path, config_path, "cold", group, samples, resource_samples,
+                f"{samples_per_strategy}",
             )
             sample_group(
                 opener, store, logical_id, runtime, attachment_store, runtime_store,
-                volume_path, config_path, "prewarm", group, samples, f"{samples_per_strategy}",
+                volume_path, config_path, "prewarm", group, samples, resource_samples,
+                f"{samples_per_strategy}",
             )
             remaining -= group
 
@@ -579,19 +712,90 @@ def main() -> None:
         require(len(cold_samples) >= samples_per_strategy, "not enough cold samples")
         require(len(prewarm_samples) >= samples_per_strategy, "not enough prewarm samples")
 
+        ready_resources = [item for item in resource_samples if item["state"] == "ready"]
+        empty_resources = [
+            item for item in resource_samples if item["state"] == "pool-empty"
+        ]
+        ready_mem = summarize_values(
+            [item["memAvailableKib"] for item in ready_resources if item.get("memAvailableKib") is not None]
+        )
+        empty_mem = summarize_values(
+            [item["memAvailableKib"] for item in empty_resources if item.get("memAvailableKib") is not None]
+        )
+        idle_resource_cost = {
+            "sampleCount": len(ready_resources),
+            "vmmRssKib": summarize_values(
+                [item["rssKib"] for item in ready_resources if item.get("rssKib") is not None]
+            ),
+            "vmmPssKib": summarize_values(
+                [item["pssKib"] for item in ready_resources if item.get("pssKib") is not None]
+            ),
+            "replenishWaitMs": summarize_values(
+                [
+                    item["prepareWaitMs"]
+                    for item in ready_resources
+                    if item.get("prepareWaitMs") is not None
+                ]
+            ),
+            "poolEmptyMemAvailableKib": empty_mem,
+            "readyMemAvailableKib": ready_mem,
+            "estimatedHostMemoryCostKib": (
+                max(0, round(empty_mem["mean"] - ready_mem["mean"]))
+                if empty_mem and ready_mem
+                else None
+            ),
+            "activeNetworkLeases": summarize_values(
+                [
+                    item["activeNetworkLeases"]
+                    for item in ready_resources
+                    if item.get("activeNetworkLeases") is not None
+                ]
+            ),
+        }
         summary = {
             "samplesPerStrategy": samples_per_strategy,
             "cold": summarize("clientObservedMs", cold_samples),
             "prewarm": summarize("clientObservedMs", prewarm_samples),
             "coldTotalMs": summarize("totalMs", cold_samples),
             "prewarmTotalMs": summarize("totalMs", prewarm_samples),
+            "coldGuestDeclaredRpcReadyMs": summarize_milestone(
+                "guestDeclaredRpcReadyMs", cold_samples
+            ),
+            "prewarmGuestDeclaredRpcReadyMs": summarize_milestone(
+                "guestDeclaredRpcReadyMs", prewarm_samples
+            ),
+            "coldSuccessRate": round(
+                sum(1 for sample in cold_samples if sample.get("success"))
+                / samples_per_strategy,
+                4,
+            ),
+            "prewarmSuccessRate": round(
+                sum(1 for sample in prewarm_samples if sample.get("success"))
+                / samples_per_strategy,
+                4,
+            ),
+            "strategyFallbackRate": round(
+                sum(
+                    1
+                    for sample in samples
+                    if sample.get("requestedStrategy") != sample.get("strategy")
+                )
+                / len(samples),
+                4,
+            ),
+            "idlePrewarmResourceCost": idle_resource_cost,
         }
+        summary["verdict"] = evaluate_summary(summary, samples_per_strategy)
         environment = capture_environment(runtime)
 
         result_dir = RESULT_ROOT / time.strftime("%Y%m%d-%H%M%S")
         result_dir.mkdir(parents=True, mode=0o755, exist_ok=True)
         (result_dir / "samples.jsonl").write_text(
             "".join(json.dumps(sample, ensure_ascii=False) + "\n" for sample in samples),
+            encoding="utf-8",
+        )
+        (result_dir / "resource-samples.jsonl").write_text(
+            "".join(json.dumps(sample, ensure_ascii=False) + "\n" for sample in resource_samples),
             encoding="utf-8",
         )
         (result_dir / "summary.json").write_text(
@@ -609,7 +813,13 @@ def main() -> None:
             "PREWARM_PERF_READY "
             f"samples={len(samples)} coldP95={summary['cold'].get('p95')} "
             f"prewarmP95={summary['prewarm'].get('p95')} "
+            f"reductionPercent={summary['verdict']['platformP95ReductionPercent']} "
+            f"verdict={'pass' if summary['verdict']['passed'] else 'fail'} "
             f"output={result_dir}"
+        )
+        require(
+            summary["verdict"]["passed"],
+            f"stage 6.3 performance verdict failed; report={result_dir / 'summary.json'}",
         )
     except Exception as error:
         # 先停止两个会继续改写数据库的服务，再固化 SQLite/日志/进程/网络现场。

@@ -616,6 +616,7 @@ class ControlPlane:
                 strategy=result.strategy,
                 total_ms=total_ms,
                 phase_reports=(result.phase_report or {}, {"commitMs": commit_ms}),
+                milestones=result.milestone_report,
             )
             runtime_payload = dict(result.runtime or {})
             runtime_payload["startupOperationTiming"] = timing.to_dict()[

@@ -17,16 +17,22 @@ class FakeRuntime:
         self.started: list[tuple[str, str | None]] = []
         self.resumed: list[tuple[str, str | None]] = []
         self.phases: dict = {}
+        self.guest_ready_ms: int | None = None
 
     def start(self, instance_id: str, owner_id: str | None) -> dict:
         self.started.append((instance_id, owner_id))
         if self.fail:
             raise RuntimeError("cold start failed")
-        return {
+        result = {
             "status": "running",
             "instanceId": instance_id,
             "startupOperationPhases": dict(self.phases),
         }
+        if self.guest_ready_ms is not None:
+            result["startupOperationMilestones"] = {
+                "guestDeclaredRpcReadyMs": self.guest_ready_ms
+            }
+        return result
 
     def resume(self, instance_id: str, owner_id: str | None) -> dict:
         self.resumed.append((instance_id, owner_id))
@@ -100,6 +106,14 @@ class StartupCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.phase_report["volumePrepareMs"], 80)
         self.assertEqual(result.phase_report["runtimeReadyMs"], 4800)
         self.assertGreaterEqual(result.phase_report["decisionMs"], 0)
+
+    def test_run_cold_offsets_runtime_guest_ready_milestone(self) -> None:
+        self.runtime.guest_ready_ms = 4800
+        result = self.coordinator.run_cold("inst-1", "user-1")
+        self.assertIsNotNone(result.milestone_report)
+        self.assertGreaterEqual(
+            result.milestone_report["guestDeclaredRpcReadyMs"], 4800
+        )
 
     def test_run_snapshot_records_and_executes(self) -> None:
         result = self.coordinator.run_snapshot("inst-1", "user-1")
@@ -178,6 +192,7 @@ class StartupCoordinatorTests(unittest.TestCase):
             operation_id="op-1",
             runtime={"status": "running", "id": "runtime-1"},
             phase_report={"claimMs": 5, "guestActivateMs": 300},
+            milestone_report={"guestDeclaredRpcReadyMs": 385},
         )
         coordinator = StartupCoordinator(
             self.store,
@@ -194,6 +209,9 @@ class StartupCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.phase_report["claimMs"], 5)
         self.assertEqual(result.phase_report["guestActivateMs"], 300)
         self.assertGreaterEqual(result.phase_report["decisionMs"], 0)
+        self.assertGreaterEqual(
+            result.milestone_report["guestDeclaredRpcReadyMs"], 385
+        )
 
     def test_run_start_falls_back_only_when_pool_is_unavailable(self) -> None:
         prewarm = FakePrewarmManager()

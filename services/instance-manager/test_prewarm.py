@@ -62,6 +62,7 @@ class PrewarmManagerTests(unittest.TestCase):
             self.activated: list[tuple[str, str, str, str, str, str, str]] = []
             self.committed: list[tuple[str, str, str]] = []
             self.phases: dict = {}
+            self.guest_ready_ms: int | None = None
 
         def activate_prewarmer(
             self,
@@ -86,11 +87,16 @@ class PrewarmManagerTests(unittest.TestCase):
             )
             if self.fail:
                 raise RuntimeError("activation failed")
-            return {
+            result = {
                 "id": runtime_id,
                 "status": "running",
                 "startupOperationPhases": dict(self.phases),
             }
+            if self.guest_ready_ms is not None:
+                result["startupOperationMilestones"] = {
+                    "guestDeclaredRpcReadyMs": self.guest_ready_ms
+                }
+            return result
 
         def commit_prewarmer(
             self, runtime_id: str, operation_id: str, activation_id: str
@@ -225,6 +231,17 @@ class PrewarmManagerTests(unittest.TestCase):
         self.assertTrue(result.claimed)
         # FakeActivator 默认 phases 为空，phase_report 应只含 claimMs。
         self.assertEqual(set(result.phase_report), {"claimMs"})
+
+    def test_claim_offsets_runtime_guest_ready_milestone(self) -> None:
+        self._ready()
+        self.activator.guest_ready_ms = 640
+        result = self.manager.claim(
+            "profile-a", "logical-1", "user-1", "/vol/user-1.ext4", "operation-1"
+        )
+        self.assertIsNotNone(result.milestone_report)
+        self.assertGreaterEqual(
+            result.milestone_report["guestDeclaredRpcReadyMs"], 640
+        )
 
     def test_activation_failure_keeps_volume_locked(self) -> None:
         self._ready()

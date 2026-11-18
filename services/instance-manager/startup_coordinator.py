@@ -43,6 +43,7 @@ class StartupResult:
     runtime_id: str | None = None
     activation_id: str | None = None
     phase_report: dict | None = None
+    milestone_report: dict | None = None
 
 
 class StartupCoordinator:
@@ -77,6 +78,13 @@ class StartupCoordinator:
             self.startup_store.mark_failed(operation_id, str(error)[-4000:])
             raise
         self.startup_store.transition(operation_id, "executing", "committing")
+        runtime_milestones = runtime.get("startupOperationMilestones") or {}
+        milestone_report = None
+        if "guestDeclaredRpcReadyMs" in runtime_milestones:
+            milestone_report = {
+                "guestDeclaredRpcReadyMs": decision_ms
+                + int(runtime_milestones["guestDeclaredRpcReadyMs"])
+            }
         return StartupResult(
             operation_id=operation_id,
             strategy=strategy,
@@ -86,6 +94,7 @@ class StartupCoordinator:
                 {"decisionMs": decision_ms},
                 runtime.get("startupOperationPhases") or {},
             ),
+            milestone_report=milestone_report,
         )
 
     def _run_prewarm(
@@ -142,6 +151,13 @@ class StartupCoordinator:
             runtime_id=claim.runtime_id,
         ):
             raise RuntimeError("prewarm startup generation changed before commit")
+        milestone_report = None
+        claim_milestones = getattr(claim, "milestone_report", None) or {}
+        if "guestDeclaredRpcReadyMs" in claim_milestones:
+            milestone_report = {
+                "guestDeclaredRpcReadyMs": decision_ms
+                + int(claim_milestones["guestDeclaredRpcReadyMs"])
+            }
         return StartupResult(
             operation_id=operation_id,
             strategy="prewarm",
@@ -153,6 +169,7 @@ class StartupCoordinator:
                 {"decisionMs": decision_ms},
                 claim.phase_report or {},
             ),
+            milestone_report=milestone_report,
         )
 
     def run_start(
