@@ -79,6 +79,8 @@ Commands:
                          Verify stale commit-pending forward repair keeps runtime alive
   prewarm-pressure-test [cycles]
                          Run claim/stop/refill pressure loop (default 100 cycles)
+  prewarm-performance-test [samples]
+                         A/B sample cold vs prewarm startup (default 30 each)
   prewarm-worker-lock-smoke-test
                          Verify the real Worker process lock and clean rejection
   prewarm-worker-service-smoke-test
@@ -606,6 +608,20 @@ smoke_test_prewarm_pressure() {
     "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/prewarm-pressure-smoke-test.sh' ${cycles}"
 }
 
+smoke_test_prewarm_performance() {
+  sync_repo
+  samples="${1:-30}"
+  local_commit="$(git rev-parse HEAD 2>/dev/null || true)"
+  echo "Sampling ${samples} cold/prewarm startup samples in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo GIT_COMMIT='${local_commit}' '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo GIT_COMMIT='${local_commit}' '${REMOTE_DIR}/scripts/linux/prewarm-performance-smoke-test.sh' ${samples}"
+}
+
 smoke_test_prewarm_worker_lock() {
   sync_repo
   echo "Testing the real prewarm Worker process lock in ${VM_USER}@${VM_HOST}..."
@@ -833,6 +849,9 @@ case "${command}" in
     ;;
   prewarm-pressure-test)
     smoke_test_prewarm_pressure "${2:-100}"
+    ;;
+  prewarm-performance-test)
+    smoke_test_prewarm_performance "${2:-30}"
     ;;
   prewarm-worker-lock-smoke-test)
     smoke_test_prewarm_worker_lock

@@ -517,6 +517,25 @@ class ControlPlane:
             return record
         runtime_status = self.runtime.status(record["id"])
         if runtime_status is None:
+            # 临时诊断：定位预热实例 STOP 时 runtime.status 误判 None 的原因。
+            try:
+                resolved = self.runtime.runtime_store.resolve_runtime_id(record["id"])
+                binding = self.runtime.runtime_store.get_binding(record["id"])
+                physical = self.runtime.runtime_store.get(resolved)
+                print(
+                    "RECONCILE_DIAGNOSTIC "
+                    f"instance={record['id']} resolved={resolved} "
+                    f"binding={binding is not None} "
+                    f"physical_status={physical.get('status') if physical else None}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception as diagnostic_error:  # pragma: no cover - 诊断失败不阻断
+                print(
+                    f"RECONCILE_DIAGNOSTIC instance={record['id']} error={diagnostic_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if record["status"] == "starting":
                 return record
             return self.store.update(record["id"], "stopped")
