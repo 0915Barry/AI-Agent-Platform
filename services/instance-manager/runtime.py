@@ -27,6 +27,7 @@ from lifecycle import process_matches, process_start_ticks, validate_instance_id
 from network_manager import NetworkFailure, NetworkManager, SQLiteLeaseStore
 from prewarm_activation import ActivationClient, ActivationError
 from runtime_store import RuntimeStore, RuntimeStoreError, UserVolumeStore
+from startup_operation_timing import map_cold_host_stages
 
 
 DEFAULT_STATE_ROOT = Path("/var/lib/fc")
@@ -1076,6 +1077,11 @@ class InstanceRuntime:
             guest_timing = parse_guest_startup_timing(console)
             startup_timing = timing.emit("ready", guest_timing)
             status["startupTiming"] = startup_timing
+            # 阶段 6.1B：把冷启动旧 host 阶段映射为统一 phase 的局部报告，随本次
+            # StartupResult 向上传递；旧 startupTiming 原样保留。
+            status["startupOperationPhases"] = map_cold_host_stages(
+                startup_timing.get("host")
+            )
             return status
         except Exception as error:
             if process.poll() is None:

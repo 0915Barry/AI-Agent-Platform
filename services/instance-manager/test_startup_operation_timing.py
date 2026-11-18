@@ -12,6 +12,7 @@ from startup_operation_timing import (
     StartupOperationTiming,
     StartupOperationTimingError,
     compute_unattributed,
+    map_cold_host_stages,
     merge_phases,
 )
 
@@ -41,6 +42,62 @@ class MergePhasesTests(unittest.TestCase):
     def test_negative_phase_is_rejected(self) -> None:
         with self.assertRaisesRegex(StartupOperationTimingError, "negative phase"):
             merge_phases({"decisionMs": -1})
+
+
+class MapColdHostStagesTests(unittest.TestCase):
+    def test_maps_cold_stages_to_phases(self) -> None:
+        phases = map_cold_host_stages(
+            {
+                "ensure_host_ms": 5,
+                "volume_create_ms": 10,
+                "e2fsck_ms": 20,
+                "network_allocate_ms": 30,
+                "volume_config_ms": 40,
+                "network_setup_ms": 50,
+                "gateway_ready_ms": 60,
+                "jail_prepare_ms": 70,
+                "guest_ready_ms": 80,
+                "lifecycle_ms": 90,
+            }
+        )
+        self.assertEqual(
+            phases,
+            {
+                "volumePrepareMs": 70,
+                "networkReadyMs": 80,
+                "gatewayReadyMs": 60,
+                "runtimeReadyMs": 240,
+            },
+        )
+
+    def test_ensure_host_is_not_mapped(self) -> None:
+        phases = map_cold_host_stages({"ensure_host_ms": 5000})
+        self.assertEqual(
+            phases,
+            {
+                "volumePrepareMs": 0,
+                "networkReadyMs": 0,
+                "gatewayReadyMs": 0,
+                "runtimeReadyMs": 0,
+            },
+        )
+
+    def test_unknown_stage_is_ignored(self) -> None:
+        phases = map_cold_host_stages({"future_stage_ms": 999, "gateway_ready_ms": 7})
+        self.assertEqual(phases["gatewayReadyMs"], 7)
+        self.assertEqual(phases["volumePrepareMs"], 0)
+
+    def test_none_and_empty_default_to_zero(self) -> None:
+        for report in (None, {}):
+            self.assertEqual(
+                map_cold_host_stages(report),
+                {
+                    "volumePrepareMs": 0,
+                    "networkReadyMs": 0,
+                    "gatewayReadyMs": 0,
+                    "runtimeReadyMs": 0,
+                },
+            )
 
 
 class ComputeUnattributedTests(unittest.TestCase):

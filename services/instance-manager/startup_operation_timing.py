@@ -38,9 +38,43 @@ MILESTONES = ("guestDeclaredRpcReadyMs",)
 # 各 phase 独立取整到毫秒，跨 9 段累计的舍入误差允许在几毫秒内。
 ROUNDING_TOLERANCE_MS = 5
 
+# 冷启动旧 ``startupTiming.host`` 阶段到统一 phase 的映射。
+# ``ensure_host_ms`` 有意不在此表：它属于 Host 前置开销，归入 unattributedMs。
+COLD_HOST_STAGE_TO_PHASE = {
+    "volume_create_ms": "volumePrepareMs",
+    "e2fsck_ms": "volumePrepareMs",
+    "volume_config_ms": "volumePrepareMs",
+    "network_allocate_ms": "networkReadyMs",
+    "network_setup_ms": "networkReadyMs",
+    "gateway_ready_ms": "gatewayReadyMs",
+    "jail_prepare_ms": "runtimeReadyMs",
+    "guest_ready_ms": "runtimeReadyMs",
+    "lifecycle_ms": "runtimeReadyMs",
+}
+
 
 class StartupOperationTimingError(ValueError):
     """计时结构违反不变量，或输入包含未知/负数/重复字段。"""
+
+
+def map_cold_host_stages(host_stages: dict[str, int] | None) -> dict[str, int]:
+    """把冷启动旧 ``host`` 阶段映射为 Runtime 拥有的统一 phase。
+
+    只返回冷启动 Runtime 自己产出的四项 phase；``ensure_host_ms`` 及未知阶段不映射，
+    留作 Control Plane 计算的 ``unattributedMs`` 余数。旧 ``startupTiming.guest`` 是
+    Guest 内部诊断，与 ``guest_ready_ms`` 重叠，不参与 phase 映射以免重复计入。
+    """
+    phases = {
+        "volumePrepareMs": 0,
+        "networkReadyMs": 0,
+        "gatewayReadyMs": 0,
+        "runtimeReadyMs": 0,
+    }
+    for stage, value in (host_stages or {}).items():
+        target = COLD_HOST_STAGE_TO_PHASE.get(stage)
+        if target is not None:
+            phases[target] += int(value)
+    return phases
 
 
 def merge_phases(*reports: dict[str, int] | None) -> dict[str, int]:
