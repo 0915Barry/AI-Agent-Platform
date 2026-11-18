@@ -50,6 +50,7 @@ from task_store import TaskStore, TaskStoreError  # noqa: E402
 from workspace_store import WorkspaceStore, WorkspaceStoreError  # noqa: E402
 from startup_store import StartupStore  # noqa: E402
 from startup_coordinator import StartupCoordinator  # noqa: E402
+from startup_operation_timing import StartupOperationTiming  # noqa: E402
 from prewarm_config import DEFAULT_CONFIG_PATH, PrewarmConfig  # noqa: E402
 from prewarm_manager import PrewarmManager, PrewarmManagerError  # noqa: E402
 from prewarm_store import PrewarmStore  # noqa: E402
@@ -558,6 +559,7 @@ class ControlPlane:
                         )
                     # 在释放配额锁之前写入 starting；下一请求会把它计入配额。
                     self.store.update(instance_id, "starting")
+            started_at = time.monotonic()
             try:
                 volume_path = (
                     str(self.runtime.user_volume_path(owner_id))
@@ -577,13 +579,25 @@ class ControlPlane:
             ) as error:
                 self.store.update(instance_id, "failed", str(error)[-4000:])
                 raise ApiError(500, "instance_start_failed", str(error)) from error
+            commit_started = time.monotonic()
             updated = self.store.update(instance_id, "running")
             try:
                 self.startup_coordinator.commit_success(result)
             except (RuntimeFailure, PrewarmManagerError, RuntimeError) as error:
                 self.store.update(instance_id, "failed", str(error)[-4000:])
                 raise ApiError(500, "instance_start_commit_failed", str(error)) from error
-            return {**updated, "runtime": result.runtime}
+            total_ms = round((time.monotonic() - started_at) * 1000)
+            commit_ms = round((time.monotonic() - commit_started) * 1000)
+            timing = StartupOperationTiming.assemble(
+                strategy=result.strategy,
+                total_ms=total_ms,
+                phase_reports=(result.phase_report or {}, {"commitMs": commit_ms}),
+            )
+            runtime_payload = dict(result.runtime or {})
+            runtime_payload["startupOperationTiming"] = timing.to_dict()[
+                "startupOperationTiming"
+            ]
+            return {**updated, "runtime": runtime_payload}
 
     def stop(self, instance_id: str) -> dict[str, Any]:
         """执行 running → stopping → stopped；停止不会删除数据盘。"""

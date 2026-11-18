@@ -15,11 +15,13 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from prewarm_manager import ClaimResult, PrewarmManager
+from startup_operation_timing import merge_phases
 from startup_store import StartupStore
 
 
@@ -64,9 +66,11 @@ class StartupCoordinator:
         owner_id: str | None,
         execute: Callable[[], dict],
     ) -> StartupResult:
+        decision_started = time.monotonic()
         operation_id = self._new_operation_id()
         self.startup_store.begin(operation_id, instance_id, owner_id or "", strategy)
         self.startup_store.transition(operation_id, "deciding", "executing")
+        decision_ms = round((time.monotonic() - decision_started) * 1000)
         try:
             runtime = execute()
         except Exception as error:
@@ -78,7 +82,10 @@ class StartupCoordinator:
             strategy=strategy,
             runtime=runtime,
             instance_id=instance_id,
-            phase_report=runtime.get("startupOperationPhases"),
+            phase_report=merge_phases(
+                {"decisionMs": decision_ms},
+                runtime.get("startupOperationPhases") or {},
+            ),
         )
 
     def _run_prewarm(
@@ -98,9 +105,11 @@ class StartupCoordinator:
         if manager is None or not manager.config.enabled:
             return None
 
+        decision_started = time.monotonic()
         operation_id = self._new_operation_id()
         self.startup_store.begin(operation_id, instance_id, owner_id, "prewarm")
         self.startup_store.transition(operation_id, "deciding", "executing")
+        decision_ms = round((time.monotonic() - decision_started) * 1000)
         try:
             claim: ClaimResult = manager.claim(
                 profile_key,
@@ -140,7 +149,10 @@ class StartupCoordinator:
             instance_id=instance_id,
             runtime_id=claim.runtime_id,
             activation_id=claim.activation_id,
-            phase_report=claim.phase_report,
+            phase_report=merge_phases(
+                {"decisionMs": decision_ms},
+                claim.phase_report or {},
+            ),
         )
 
     def run_start(

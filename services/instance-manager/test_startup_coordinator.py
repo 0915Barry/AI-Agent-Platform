@@ -97,10 +97,9 @@ class StartupCoordinatorTests(unittest.TestCase):
     def test_run_cold_carries_runtime_phase_report(self) -> None:
         self.runtime.phases = {"volumePrepareMs": 80, "runtimeReadyMs": 4800}
         result = self.coordinator.run_cold("inst-1", "user-1")
-        self.assertEqual(
-            result.phase_report,
-            {"volumePrepareMs": 80, "runtimeReadyMs": 4800},
-        )
+        self.assertEqual(result.phase_report["volumePrepareMs"], 80)
+        self.assertEqual(result.phase_report["runtimeReadyMs"], 4800)
+        self.assertGreaterEqual(result.phase_report["decisionMs"], 0)
 
     def test_run_snapshot_records_and_executes(self) -> None:
         result = self.coordinator.run_snapshot("inst-1", "user-1")
@@ -192,10 +191,9 @@ class StartupCoordinatorTests(unittest.TestCase):
             volume_path="/srv/fc/volumes/users/user-1.ext4",
         )
         self.assertEqual(result.strategy, "prewarm")
-        self.assertEqual(
-            result.phase_report,
-            {"claimMs": 5, "guestActivateMs": 300},
-        )
+        self.assertEqual(result.phase_report["claimMs"], 5)
+        self.assertEqual(result.phase_report["guestActivateMs"], 300)
+        self.assertGreaterEqual(result.phase_report["decisionMs"], 0)
 
     def test_run_start_falls_back_only_when_pool_is_unavailable(self) -> None:
         prewarm = FakePrewarmManager()
