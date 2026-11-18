@@ -420,6 +420,18 @@ def render_startup_timing(value: Any) -> int | None:
     return total_ms if isinstance(total_ms, int) else None
 
 
+def render_operation_total_ms(runtime: Any) -> int | None:
+    """优先读取 ``startupOperationTiming.totalMs``，缺失时回退旧 ``startupTiming.totalMs``。"""
+    if not isinstance(runtime, dict):
+        return None
+    operation = runtime.get("startupOperationTiming")
+    if isinstance(operation, dict):
+        total_ms = operation.get("totalMs")
+        if isinstance(total_ms, int):
+            return total_ms
+    return render_startup_timing(runtime.get("startupTiming"))
+
+
 def authenticated_client(args: argparse.Namespace, store: SessionStore) -> ApiClient:
     cookie, _ = require_cookie(store, args.base_url)
     return ApiClient(args.base_url, cookie)
@@ -439,10 +451,14 @@ def command_start(args: argparse.Namespace, store: SessionStore, console: Consol
     console.success("实例启动完成")
     runtime = instance.get("runtime")
     if isinstance(runtime, dict):
-        total_ms = render_startup_timing(runtime.get("startupTiming"))
+        total_ms = render_operation_total_ms(runtime)
         if total_ms is not None:
-            store.remember_cold_start(args.instance_id, total_ms)
             console.timing(f"启动实例花费 {format_seconds(total_ms)} 秒")
+            operation = runtime.get("startupOperationTiming")
+            strategy = operation.get("strategy") if isinstance(operation, dict) else None
+            # 只有冷启动（或旧响应无 strategy）才更新冷启动基线。
+            if strategy is None or strategy == "cold":
+                store.remember_cold_start(args.instance_id, total_ms)
     print_instance(instance, console)
 
 

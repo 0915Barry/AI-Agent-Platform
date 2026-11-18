@@ -207,6 +207,19 @@ class AgentCtlTests(unittest.TestCase):
         self.assertEqual(total_ms, 11754)
         self.assertIsNone(cli.render_startup_timing({}))
 
+    def test_operation_total_prefers_new_object(self) -> None:
+        runtime = {
+            "startupTiming": {"totalMs": 5000},
+            "startupOperationTiming": {"version": 1, "strategy": "prewarm", "totalMs": 662},
+        }
+        self.assertEqual(cli.render_operation_total_ms(runtime), 662)
+
+    def test_operation_total_falls_back_to_old_object(self) -> None:
+        runtime = {"startupTiming": {"totalMs": 5000}}
+        self.assertEqual(cli.render_operation_total_ms(runtime), 5000)
+        self.assertIsNone(cli.render_operation_total_ms({}))
+        self.assertIsNone(cli.render_operation_total_ms(None))
+
     def test_history_renders_session_load_timing(self) -> None:
         output = io.StringIO()
         console = cli.Console(False, output)
