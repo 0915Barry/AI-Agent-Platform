@@ -81,6 +81,8 @@ Commands:
                          Run claim/stop/refill pressure loop (default 100 cycles)
   prewarm-performance-test [samples]
                          A/B sample cold vs prewarm startup (default 30 each)
+  prewarm-concurrency-test [users] [ready] [rounds]
+                         Verify real finite-pool concurrent claims (default 3/1/1)
   prewarm-worker-lock-smoke-test
                          Verify the real Worker process lock and clean rejection
   prewarm-worker-service-smoke-test
@@ -622,6 +624,31 @@ smoke_test_prewarm_performance() {
     "sudo GIT_COMMIT='${local_commit}' '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo GIT_COMMIT='${local_commit}' '${REMOTE_DIR}/scripts/linux/prewarm-performance-smoke-test.sh' ${samples}"
 }
 
+smoke_test_prewarm_concurrency() {
+  users="${1:-3}"
+  ready="${2:-1}"
+  rounds="${3:-1}"
+  for value in "${users}" "${ready}" "${rounds}"; do
+    if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "users, ready, and rounds must be positive integers" >&2
+      exit 1
+    fi
+  done
+  if (( users < 2 || users > 10 || ready < 1 || ready >= users || rounds < 1 || rounds > 20 )); then
+    echo "Expected: users=2..10, ready=1..users-1, rounds=1..20" >&2
+    exit 1
+  fi
+  sync_repo
+  echo "Testing prewarm finite-pool concurrency users=${users} ready=${ready} rounds=${rounds} in ${VM_USER}@${VM_HOST}..."
+  ssh \
+    -o ConnectTimeout=10 \
+    -o ConnectionAttempts=1 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 \
+    -t "${VM_USER}@${VM_HOST}" \
+    "sudo '${REMOTE_DIR}/scripts/linux/prepare-microvm-smoke.sh' && sudo '${REMOTE_DIR}/scripts/linux/build-agent-rootfs.sh' && sudo '${REMOTE_DIR}/scripts/linux/prewarm-concurrency-smoke-test.sh' '${users}' '${ready}' '${rounds}'"
+}
+
 smoke_test_prewarm_worker_lock() {
   sync_repo
   echo "Testing the real prewarm Worker process lock in ${VM_USER}@${VM_HOST}..."
@@ -852,6 +879,9 @@ case "${command}" in
     ;;
   prewarm-performance-test)
     smoke_test_prewarm_performance "${2:-30}"
+    ;;
+  prewarm-concurrency-test)
+    smoke_test_prewarm_concurrency "${2:-3}" "${3:-1}" "${4:-1}"
     ;;
   prewarm-worker-lock-smoke-test)
     smoke_test_prewarm_worker_lock
