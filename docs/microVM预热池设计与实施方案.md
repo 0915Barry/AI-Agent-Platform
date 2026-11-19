@@ -1039,20 +1039,20 @@ PREWARM_ENABLED=0
 ### 18.1 当前可用状态
 
 - 开发分支：`prewarm-pool`；
-- 当前功能基线：`5c84e39`（真实并发场景 A、B、C 已完成）；
+- 当前并发诊断基线：`ab98f14`（真实并发场景 A、B、C、Host 压力探针与容量记录已完成）；
 - 总开关：`config/prewarm.env` 中 `PREWARM_ENABLED=0`，不得直接改为生产默认开启；
 - 阶段 0、1、2、2A、3、4、5、6.1、6.2、6.3 已完成；
 - 阶段 6.1 已完成 `startupOperationTiming` 统一计时（冷/热两侧结构一致，CLI 优先新对象回退旧对象）；
 - 最近一次本地验收：Instance Manager 230、Control Plane 42、CLI 18 项单元测试全部通过；
-- 真实验收已覆盖 30+30 性能基准、新版 3+3 里程碑/资源成本采集，以及 `5/2/3` 多用户并发测试。
+- 真实验收已覆盖 30+30 性能基准、新版 3+3 里程碑/资源成本采集，以及 `8/2/5` 多用户并发测试。
 
 ### 18.2 下一项开发任务
 
 阶段 6.1「统一计时」已完成并各自提交验收：`startupOperationTiming` 版本化结构（9 项 phase +
 `unattributedMs` 余数 + `guestDeclaredRpcReadyMs` 里程碑）已由 Control Plane 收口生成，冷启动与
 预热命中两侧响应结构一致，CLI 优先读取新对象并回退旧 `startupTiming`；真实回归（`cli-smoke-test`、
-`prewarm-control-plane-smoke-test`、`prewarm-pressure-test 3`）通过，instance-manager 228、
-control-plane 40、CLI 18 单元测试全绿。
+`prewarm-control-plane-smoke-test`、`prewarm-pressure-test 3`）通过，最近记录的 instance-manager 230、
+control-plane 42、CLI 18 单元测试全绿。
 
 阶段 6.2、6.3 和真实并发正确性验收已完成。`8/2/5` 已在当前 UTM 环境通过；
 同一 8 用户规模早期曾超时、后续更多轮次通过，说明边界受 Host 瞬时压力影响。
