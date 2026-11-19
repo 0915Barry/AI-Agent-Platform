@@ -82,7 +82,7 @@ Commands:
   prewarm-performance-test [samples]
                          A/B sample cold vs prewarm startup (default 30 each)
   prewarm-concurrency-test [users] [ready] [rounds]
-                         Verify real finite-pool concurrent claims (default 3/1/1)
+                         Verify finite-pool claims and duplicate START (default 3/1/1)
   prewarm-worker-lock-smoke-test
                          Verify the real Worker process lock and clean rejection
   prewarm-worker-service-smoke-test
@@ -639,7 +639,7 @@ smoke_test_prewarm_concurrency() {
     exit 1
   fi
   sync_repo
-  echo "Testing prewarm finite-pool concurrency users=${users} ready=${ready} rounds=${rounds} in ${VM_USER}@${VM_HOST}..."
+  echo "Testing prewarm concurrency users=${users} ready=${ready} rounds=${rounds} in ${VM_USER}@${VM_HOST}..."
   ssh \
     -o ConnectTimeout=10 \
     -o ConnectionAttempts=1 \

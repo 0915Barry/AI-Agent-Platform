@@ -51,6 +51,13 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+class HttpRequestError(RuntimeError):
+    def __init__(self, status: int, code: str, route: str, detail: str) -> None:
+        super().__init__(f"HTTP {status}/{code} {route}: {detail}")
+        self.status = status
+        self.code = code
+
+
 def request_json(opener, method: str, route: str, payload: dict | None = None) -> dict:
     body = None if payload is None else json.dumps(payload).encode()
     request = urllib.request.Request(
@@ -64,7 +71,27 @@ def request_json(opener, method: str, route: str, payload: dict | None = None) -
             return json.load(response)
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {error.code} {route}: {detail}") from error
+        error_code = "http_error"
+        try:
+            error_payload = json.loads(detail).get("error") or {}
+            if isinstance(error_payload.get("code"), str):
+                error_code = error_payload["code"]
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        raise HttpRequestError(error.code, error_code, route, detail) from error
+
+
+def authenticated_opener(username: str, password: str):
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+    )
+    request_json(
+        opener,
+        "POST",
+        "/api/auth/login",
+        {"username": username, "password": password},
+    )
+    return opener
 
 
 def wait_for_control_plane(process: subprocess.Popen, log_path: Path) -> None:
@@ -145,22 +172,42 @@ def query_rows(table: str) -> list[dict]:
         connection.close()
 
 
-def concurrent_requests(cases: list[dict], method: str, route_suffix: str) -> list[dict]:
+def concurrent_requests(
+    cases: list[dict],
+    method: str,
+    route_suffix: str,
+    *,
+    capture_http_errors: bool = False,
+) -> list[dict]:
     """使所有工作线程在同一 Barrier 后同时发送 HTTP 请求。"""
     barrier = threading.Barrier(len(cases) + 1)
 
     def invoke(case: dict) -> dict:
         barrier.wait(timeout=15)
         started = time.monotonic()
-        response = request_json(
-            case["opener"], method, f"/api/instances/{case['instanceId']}{route_suffix}"
-        )
-        return {
-            "userId": case["userId"],
-            "instanceId": case["instanceId"],
-            "latencyMs": round((time.monotonic() - started) * 1000),
-            "response": response,
-        }
+        try:
+            response = request_json(
+                case["opener"], method, f"/api/instances/{case['instanceId']}{route_suffix}"
+            )
+            return {
+                "userId": case["userId"],
+                "instanceId": case["instanceId"],
+                "latencyMs": round((time.monotonic() - started) * 1000),
+                "httpStatus": 200,
+                "errorCode": None,
+                "response": response,
+            }
+        except HttpRequestError as error:
+            if not capture_http_errors:
+                raise
+            return {
+                "userId": case["userId"],
+                "instanceId": case["instanceId"],
+                "latencyMs": round((time.monotonic() - started) * 1000),
+                "httpStatus": error.status,
+                "errorCode": error.code,
+                "response": None,
+            }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(cases)) as executor:
         futures = [executor.submit(invoke, case) for case in cases]
@@ -313,18 +360,7 @@ def main() -> None:
         wait_for_control_plane(server, server_log)
 
         for index, identity in enumerate(identities):
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
-            )
-            request_json(
-                opener,
-                "POST",
-                "/api/auth/login",
-                {
-                    "username": identity["username"],
-                    "password": identity["password"],
-                },
-            )
+            opener = authenticated_opener(identity["username"], identity["password"])
             instance_id = f"conc-{suffix}-{index}"
             created = request_json(opener, "POST", "/api/instances", {"id": instance_id})
             require(created.get("status") == "created", f"failed to create {instance_id}")
@@ -333,6 +369,8 @@ def main() -> None:
                     "userId": identity["userId"],
                     "instanceId": instance_id,
                     "opener": opener,
+                    "username": identity["username"],
+                    "password": identity["password"],
                     "volumePath": str(runtime.user_volume_path(identity["userId"])),
                 }
             )
@@ -440,14 +478,141 @@ def main() -> None:
                 f"prewarm={len(prewarm_results)} cold={len(cold_results)} status=pass"
             )
 
+        worker = start_worker(config_path, worker_log)
+        duplicate_ready = wait_for_ready_exact(prewarm_store, ready_target)
+        duplicate_ready_ids = {str(item["runtime_id"]) for item in duplicate_ready}
+        stop_process(worker)
+        worker = None
+
+        duplicate_target = cases[0]
+        operation_count_before = len(
+            [
+                row
+                for row in query_rows("startup_operations")
+                if row["logical_instance_id"] == duplicate_target["instanceId"]
+            ]
+        )
+        lease_ids_before = {
+            str(row["instance_id"]) for row in query_rows("network_leases")
+        }
+        require(
+            lease_ids_before == duplicate_ready_ids,
+            "duplicate-start baseline network leases do not match ready pool",
+        )
+        duplicate_cases = []
+        for _ in range(2):
+            duplicate_cases.append(
+                {
+                    **duplicate_target,
+                    "opener": authenticated_opener(
+                        duplicate_target["username"], duplicate_target["password"]
+                    ),
+                }
+            )
+        duplicate_results = concurrent_requests(
+            duplicate_cases,
+            "POST",
+            "/start",
+            capture_http_errors=True,
+        )
+        all_results.extend(duplicate_results)
+        duplicate_successes = [
+            result for result in duplicate_results if result["httpStatus"] == 200
+        ]
+        duplicate_rejections = [
+            result for result in duplicate_results if result["httpStatus"] != 200
+        ]
+        require(len(duplicate_successes) == 1, "duplicate START did not produce one success")
+        require(len(duplicate_rejections) == 1, "duplicate START did not produce one rejection")
+        rejected = duplicate_rejections[0]
+        require(rejected["httpStatus"] == 409, "duplicate START rejection was not HTTP 409")
+        require(
+            rejected["errorCode"] in {"instance_busy", "instance_running"},
+            f"unexpected duplicate START error: {rejected['errorCode']}",
+        )
+        successful_response = duplicate_successes[0]["response"] or {}
+        successful_runtime = successful_response.get("runtime") or {}
+        successful_timing = successful_runtime.get("startupOperationTiming") or {}
+        successful_runtime_id = str(successful_runtime.get("id"))
+        require(
+            successful_timing.get("strategy") == "prewarm",
+            "duplicate START success did not claim a ready prewarmer",
+        )
+        require(
+            successful_runtime_id in duplicate_ready_ids,
+            "duplicate START claimed an unexpected runtime",
+        )
+
+        duplicate_bindings = [
+            row
+            for row in query_rows("runtime_bindings")
+            if row["logical_instance_id"] == duplicate_target["instanceId"]
+        ]
+        duplicate_attachments = [
+            row
+            for row in query_rows("volume_attachments")
+            if row["logical_instance_id"] == duplicate_target["instanceId"]
+        ]
+        duplicate_operations = [
+            row
+            for row in query_rows("startup_operations")
+            if row["logical_instance_id"] == duplicate_target["instanceId"]
+        ]
+        duplicate_instances = [
+            row
+            for row in query_rows("instances")
+            if row["id"] == duplicate_target["instanceId"]
+        ]
+        require(len(duplicate_bindings) == 1, "duplicate START created extra bindings")
+        require(len(duplicate_attachments) == 1, "duplicate START created extra attachments")
+        require(
+            len(duplicate_operations) == operation_count_before + 1,
+            "duplicate START created extra startup operations",
+        )
+        require(
+            len(duplicate_instances) == 1 and duplicate_instances[0]["status"] == "running",
+            "duplicate START did not leave the logical instance running",
+        )
+        require(
+            {str(row["instance_id"]) for row in query_rows("network_leases")}
+            == lease_ids_before,
+            "duplicate START created an extra network lease",
+        )
+
+        stopped_duplicate = request_json(
+            duplicate_target["opener"],
+            "POST",
+            f"/api/instances/{duplicate_target['instanceId']}/stop",
+        )
+        require(stopped_duplicate.get("status") == "stopped", "duplicate-start instance did not stop")
+        require(not query_rows("runtime_bindings"), "binding remained after duplicate-start stop")
+        require(not query_rows("volume_attachments"), "attachment remained after duplicate-start stop")
+
+        for item in prewarm_store.list_ready(PROFILE_KEY):
+            runtime_id = str(item["runtime_id"])
+            require(prewarm_store.mark_draining(runtime_id), f"failed to drain {runtime_id}")
+            cleanup_runtime(runtime, runtime_id)
+            require(prewarm_store.retire(runtime_id), f"failed to retire {runtime_id}")
+        require(not query_rows("network_leases"), "network lease remained after duplicate-start cleanup")
+        for runtime_id in duplicate_ready_ids:
+            require(not (JAILER_ROOT / runtime_id).exists(), f"jail remained: {runtime_id}")
+            require(
+                not (PLACEHOLDER_DIR / f"{runtime_id}.placeholder.ext4").exists(),
+                f"placeholder remained: {runtime_id}",
+            )
+        print(
+            "PREWARM_CONCURRENCY_SCENARIO "
+            "name=duplicate-start success=1 rejected=1 status=pass"
+        )
+
         for case in cases:
             request_json(case["opener"], "DELETE", f"/api/instances/{case['instanceId']}")
 
-        print("PASS: real prewarm finite-pool concurrency invariants remained valid")
+        print("PASS: real prewarm concurrency invariants remained valid")
         print(
             "PREWARM_CONCURRENCY_READY "
             f"users={users} ready={ready_target} rounds={rounds} "
-            "unique=verified volume=exclusive network=clean"
+            "unique=verified duplicate_start=verified volume=exclusive network=clean"
         )
     except Exception as error:
         stop_process(worker)
