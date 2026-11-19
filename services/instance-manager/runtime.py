@@ -76,9 +76,6 @@ def load_version(name: str) -> str:
     raise RuntimeFailure(f"missing {name} in {versions_path}")
 
 
-# STARTUP_TIMING_DIAGNOSTIC_BEGIN
-# 临时启动性能诊断。后续完成优化后，可按 STARTUP_TIMING_DIAGNOSTIC 全局搜索，
-# 删除本类以及 start() 中对应的 mark()/emit() 调用，不影响实例业务逻辑。
 class StartupTimingDiagnostic:
     """按启动阶段输出一行可机器检索的毫秒级耗时。"""
 
@@ -134,7 +131,7 @@ class StartupTimingDiagnostic:
 
 
 def parse_guest_startup_timing(console: str) -> dict[str, int]:
-    """从 Guest 串口日志提取临时启动计时，不解析其他不可信输出。"""
+    """从 Guest 串口日志提取启动计时。"""
 
     result: dict[str, int] = {}
     for line in console.splitlines():
@@ -154,9 +151,6 @@ def parse_guest_startup_timing(console: str) -> dict[str, int]:
         except ValueError:
             continue
     return result
-
-
-# STARTUP_TIMING_DIAGNOSTIC_END
 
 
 class InstanceRuntime:
@@ -276,7 +270,7 @@ class InstanceRuntime:
     def _resolve_runtime_id(self, instance_id: str) -> str:
         """逻辑实例 ID → 物理 runtime_id。
 
-        阶段 2（预热关闭）没有绑定时恒等于逻辑 ID，行为与现状完全一致；
+        没有预热绑定时恒等于逻辑 ID；
         预热领取落地写入 runtime_bindings 后，这里才返回真正的物理 ID。
         """
         return self.runtime_store.resolve_runtime_id(validate_instance_id(instance_id))
@@ -873,7 +867,6 @@ class InstanceRuntime:
         paths = self.paths(instance_id)
         shutil.rmtree(paths["snapshot"], ignore_errors=True)
         shutil.rmtree(paths["snapshot_next"], ignore_errors=True)
-        # 阶段 2A：释放快照保留的网络槽位；无租约或已清理时保持幂等。
         try:
             self.network_manager.release(runtime_id)
         except NetworkFailure:
@@ -887,10 +880,9 @@ class InstanceRuntime:
         """
         instance_id = validate_instance_id(instance_id)
         runtime_id = self.runtime_store.resolve_runtime_id(instance_id)
-        # STARTUP_TIMING_DIAGNOSTIC: 启动链路计时从进入 runtime.start() 开始。
         timing = StartupTimingDiagnostic(instance_id)
         uid, gid, gateway_uid, gateway_gid = self.ensure_host()
-        timing.mark("ensure_host_ms")  # STARTUP_TIMING_DIAGNOSTIC
+        timing.mark("ensure_host_ms")
         volume_owner_id = owner_id or instance_id
         paths = self.paths(instance_id, volume_owner_id)
         existing = self.status(instance_id)
@@ -908,19 +900,19 @@ class InstanceRuntime:
             self.user_volume_store.ensure(volume_owner_id, paths["volume"])
         except RuntimeStoreError as error:
             raise RuntimeFailure(str(error)) from error
-        timing.mark("volume_create_ms")  # STARTUP_TIMING_DIAGNOSTIC
+        timing.mark("volume_create_ms")
         filesystem_check = run(["e2fsck", "-f", "-y", str(paths["volume"])], check=False)
         if filesystem_check.returncode > 1:
             raise RuntimeFailure(f"persistent volume check failed: {filesystem_check.stderr.strip()}")
-        timing.mark("e2fsck_ms")  # STARTUP_TIMING_DIAGNOSTIC
+        timing.mark("e2fsck_ms")
         network: dict[str, str] | None = None
         sidecars: list[subprocess.Popen[bytes]] = []
         if self.deepseek_credential is not None:
             try:
                 network = self.network_manager.allocate(runtime_id)
-                timing.mark("network_allocate_ms")  # STARTUP_TIMING_DIAGNOSTIC
+                timing.mark("network_allocate_ms")
                 self.configure_agent_volume(paths["volume"], str(network["host_ip"]))
-                timing.mark("volume_config_ms")  # STARTUP_TIMING_DIAGNOSTIC
+                timing.mark("volume_config_ms")
                 paths["activity"].parent.mkdir(parents=True, exist_ok=True, mode=0o755)
                 paths["activity"].touch()
                 os.chown(paths["activity"], gateway_uid, gateway_gid)
@@ -930,7 +922,7 @@ class InstanceRuntime:
                     uid,
                     (GATEWAY_PORT,),
                 )
-                timing.mark("network_setup_ms")  # STARTUP_TIMING_DIAGNOSTIC
+                timing.mark("network_setup_ms")
                 sidecars = self.start_model_gateway(
                     instance_id,
                     paths,
@@ -938,9 +930,9 @@ class InstanceRuntime:
                     gateway_uid,
                     gateway_gid,
                 )
-                timing.mark("gateway_ready_ms")  # STARTUP_TIMING_DIAGNOSTIC
+                timing.mark("gateway_ready_ms")
                 self.prepare_jail(instance_id, paths, network)
-                timing.mark("jail_prepare_ms")  # STARTUP_TIMING_DIAGNOSTIC
+                timing.mark("jail_prepare_ms")
             except Exception as error:
                 for sidecar in sidecars:
                     self.terminate_process(sidecar)
@@ -949,13 +941,13 @@ class InstanceRuntime:
                         self.network_manager.release(runtime_id)
                     except NetworkFailure:
                         pass
-                timing.emit("failed")  # STARTUP_TIMING_DIAGNOSTIC
+                timing.emit("failed")
                 if isinstance(error, NetworkFailure):
                     raise RuntimeFailure(str(error)) from error
                 raise
         else:
             self.prepare_jail(instance_id, paths)
-            timing.mark("jail_prepare_ms")  # STARTUP_TIMING_DIAGNOSTIC
+            timing.mark("jail_prepare_ms")
         paths["console"].write_text("", encoding="utf-8")
         os.chmod(paths["console"], 0o640)
 
@@ -1006,7 +998,6 @@ class InstanceRuntime:
                     break
                 if process.poll() is not None:
                     break
-                # STARTUP_TIMING_DIAGNOSTIC: 100 ms兼顾就绪响应速度与日志读取开销。
                 time.sleep(0.1)
             if not ready:
                 if process.poll() is None:
@@ -1017,7 +1008,7 @@ class InstanceRuntime:
                         process.kill()
                 tail = paths["console"].read_text(encoding="utf-8", errors="replace")[-8000:]
                 raise RuntimeFailure(f"guest did not become ready\n{tail}")
-            timing.mark("guest_ready_ms")  # STARTUP_TIMING_DIAGNOSTIC
+            timing.mark("guest_ready_ms")
             guest_declared_rpc_ready_ms = timing.elapsed_ms()
 
             register_arguments = [
@@ -1077,13 +1068,10 @@ class InstanceRuntime:
             status = self.status(instance_id)
             if status is None:
                 raise RuntimeFailure("lifecycle registration did not create instance metadata")
-            timing.mark("lifecycle_ms")  # STARTUP_TIMING_DIAGNOSTIC
-            # STARTUP_TIMING_DIAGNOSTIC: READY 之前 Guest 已把全部阶段写入串口。
+            timing.mark("lifecycle_ms")
             guest_timing = parse_guest_startup_timing(console)
             startup_timing = timing.emit("ready", guest_timing)
             status["startupTiming"] = startup_timing
-            # 阶段 6.1B：把冷启动旧 host 阶段映射为统一 phase 的局部报告，随本次
-            # StartupResult 向上传递；旧 startupTiming 原样保留。
             status["startupOperationPhases"] = map_cold_host_stages(
                 startup_timing.get("host")
             )
@@ -1106,7 +1094,7 @@ class InstanceRuntime:
                 except NetworkFailure:
                     pass
             shutil.rmtree(paths["jail"], ignore_errors=True)
-            timing.emit("failed")  # STARTUP_TIMING_DIAGNOSTIC
+            timing.emit("failed")
             if isinstance(error, NetworkFailure):
                 raise RuntimeFailure(str(error)) from error
             raise

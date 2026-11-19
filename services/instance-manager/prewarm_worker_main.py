@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""预热 Worker 手动启动入口；阶段 4 暂不随 Control Plane 自动启动。"""
+"""预热 Worker 进程入口。"""
 
 from __future__ import annotations
 

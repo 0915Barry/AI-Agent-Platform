@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""阶段 5 压力验收：至少 100 轮「领取 → 停止 → 补位」真实 VM 循环。
+"""至少 100 轮「领取 → 停止 → 补位」真实 VM 压力验收。
 
 每一轮：等待 Worker 补出一台 ready 预热机 → 通过 Control Plane HTTP API 启动
 （领取并激活）→ 验证 assigned/binding/attachment → 停止（退休并释放）→ 验证

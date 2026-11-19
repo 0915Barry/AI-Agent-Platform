@@ -302,8 +302,8 @@ class RuntimeStore:
                 )
                 """
             )
-            # 逻辑实例 → 物理 runtime_id 的绑定。阶段 2 冷启动时无绑定，物理 ID
-            # 恒等于逻辑 ID；预热领取落地后才写入非恒等绑定。两个唯一约束分别
+            # 冷启动时无绑定，物理 ID 恒等于逻辑 ID；预热领取后才写入非恒等
+            # 绑定。两个唯一约束分别
             # 保证：一个逻辑实例至多一个物理运行、一个 runtime_id 至多给一个逻辑实例。
             connection.execute(
                 """
@@ -454,7 +454,7 @@ class RuntimeStore:
     def resolve_runtime_id(self, logical_instance_id: str) -> str:
         """逻辑实例 → 物理 runtime_id。
 
-        阶段 2（预热关闭）没有绑定时恒返回逻辑 ID 本身，行为与现状完全一致；
+        没有预热绑定时恒返回逻辑 ID 本身；
         预热领取落地写入绑定后，这里才返回真正的物理 ID。
         """
         with self.connect() as connection:

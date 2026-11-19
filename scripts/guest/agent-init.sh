@@ -19,9 +19,6 @@ mount_if_needed /dev/pts devpts devpts
 
 exec > /dev/ttyS0 2>&1
 
-# GUEST_STARTUP_TIMING_DIAGNOSTIC_BEGIN
-# 临时 Guest 启动性能诊断。完成优化后可按
-# GUEST_STARTUP_TIMING_DIAGNOSTIC 全局搜索并删除这一组函数和调用。
 guest_uptime_ms() {
   local uptime_seconds whole fraction
   read -r uptime_seconds _ < /proc/uptime
@@ -47,8 +44,7 @@ guest_timing_complete() {
 }
 
 # 包含 Guest 内核启动、根文件系统挂载以及进入 agent-init 前后的基础设备挂载。
-guest_timing_mark kernel_to_init  # GUEST_STARTUP_TIMING_DIAGNOSTIC
-# GUEST_STARTUP_TIMING_DIAGNOSTIC_END
+guest_timing_mark kernel_to_init
 
 cmdline_value() {
   key="$1"
@@ -76,8 +72,7 @@ if [[ "${data_disk}" == "1" ]]; then
   mount --bind /mnt/agent-data/workspace /workspace
   mount --bind /mnt/agent-data/pi-state /home/pi/.pi
 fi
-# 预热模式不设 agent_data_disk=1，故上面不会挂用户盘；但仍需 /run 与 /tmp
-# 供一次性激活状态机使用。此块为纯新增，不影响上面的冷启动分支。
+# 预热模式不挂用户盘，但仍需 /run 与 /tmp 供激活状态机使用。
 if [[ "${prewarm}" == "1" ]]; then
   mount_if_needed /run tmpfs tmpfs
   mount_if_needed /tmp tmpfs tmpfs
@@ -90,12 +85,11 @@ if [[ "${persistence_test}" == "1" ]]; then
 fi
 
 mkdir -p /workspace /home/pi/.pi/agent
-# 预热模式未挂用户卷，/workspace 与 /home/pi/.pi 仍在只读系统盘上，不能 chown；
-# 冷启动（prewarm 未设）保持原行为不变。
+# 预热等待期的目录仍在只读系统盘上，不能 chown。
 if [[ "${prewarm}" != "1" ]]; then
   chown -R pi:pi /workspace /home/pi/.pi
 fi
-guest_timing_mark data_mount  # GUEST_STARTUP_TIMING_DIAGNOSTIC
+guest_timing_mark data_mount
 
 network_test="$(cmdline_value agent_network_test || true)"
 gateway_test="$(cmdline_value agent_gateway_test || true)"
@@ -118,7 +112,7 @@ if [[ "${network_test}" == "1" || "${gateway_test}" == "1" \
     printf 'nameserver %s\noptions timeout:2 attempts:2\n' "${guest_dns}" > /etc/resolv.conf
   fi
 fi
-guest_timing_mark network  # GUEST_STARTUP_TIMING_DIAGNOSTIC
+guest_timing_mark network
 
 if [[ "${deepseek_e2e_test}" == "1" ]]; then
   gateway_host="$(cmdline_value agent_gateway_host)"
@@ -187,7 +181,7 @@ if [[ "${gateway_test}" == "1" ]]; then
 
   echo "AGENT_GATEWAY_READY credential=placeholder upstream=authorized direct_upstream=denied response=gateway-smoke-response"
 fi
-guest_timing_mark preflight_tests  # GUEST_STARTUP_TIMING_DIAGNOSTIC
+guest_timing_mark preflight_tests
 
 # Node、Pi 和 UID 已在 rootfs 构建阶段执行真实命令验证，并写入只读系统盘。
 # 正式实例启动时只读取可信构建元数据，避免每次拉起 Node/Pi CLI 再重复验收。
@@ -247,7 +241,7 @@ if [[ "${runtime_smoke}" == "1" ]]; then
   fi
   runtime_verification="executed"
 fi
-guest_timing_mark version_check  # GUEST_STARTUP_TIMING_DIAGNOSTIC
+guest_timing_mark version_check
 
 # 系统盘所有权、shadow 与 /usr/local 权限已在 rootfs 构建时验证。启动时只保留
 # 与本次数据盘挂载有关的动态检查，确保 /workspace 确实可由 pi 用户写入。
@@ -256,7 +250,7 @@ if [[ "${prewarm}" != "1" ]]; then
   runuser -u pi -- sh -c \
     'probe=/workspace/.pi-permission-probe; : > "${probe}"; rm -f "${probe}"'
 fi
-guest_timing_mark security_check  # GUEST_STARTUP_TIMING_DIAGNOSTIC
+guest_timing_mark security_check
 
 echo "AGENT_RUNTIME_READY node=${node_version} pi=${pi_version} uid=${pi_uid} verification=${runtime_verification}"
 echo "AGENT_SECURITY_READY static=build-verified workspace_write=allowed"
@@ -312,12 +306,12 @@ if [[ "${managed_runtime}" == "1" ]]; then
   fi
   # 先输出诊断计时，再输出 PI_RPC_READY。Host 看到 READY 时即可确保计时日志
   # 已经完整写入串口，不会因读取过早遗漏最后两个阶段。
-  guest_timing_mark rpc_listener  # GUEST_STARTUP_TIMING_DIAGNOSTIC
-  guest_timing_complete  # GUEST_STARTUP_TIMING_DIAGNOSTIC
+  guest_timing_mark rpc_listener
+  guest_timing_complete
   echo "PI_RPC_READY address=${rpc_bind_ip}:${rpc_port} transport=tcp protocol=jsonl provider=${rpc_provider:-unconfigured} model=${rpc_model:-unconfigured}"
 else
-  guest_timing_mark rpc_listener  # GUEST_STARTUP_TIMING_DIAGNOSTIC
-  guest_timing_complete  # GUEST_STARTUP_TIMING_DIAGNOSTIC
+  guest_timing_mark rpc_listener
+  guest_timing_complete
 fi
 
 if [[ "${persistence_test}" == "1" ]]; then
@@ -385,9 +379,7 @@ if [[ "${prewarm}" == "1" ]]; then
   activate_port="$(cmdline_value agent_activate_port)"
   activate_bind_ip="${guest_ip_cidr%/*}"
 
-  # 预热等待期：仅监听一次性激活入口（root 持有，因为挂载需要 root），
-  # 不启动业务 Pi RPC。fork 允许 Host 在响应丢失后重连查询状态。
-  # 此块为纯新增，不改动上面的 managed_runtime socat 监听循环。
+  # 激活入口由 root 持有以完成挂载；fork 允许 Host 在响应丢失后重连查询。
   (
     while true; do
       socat "TCP-LISTEN:${activate_port},bind=${activate_bind_ip},reuseaddr,fork" \

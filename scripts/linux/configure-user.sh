@@ -10,7 +10,7 @@ if [[ "${EUID}" -eq 0 ]]; then
   exit 1
 fi
 
-read -r -p "M16 username (lowercase, 3-32 characters): " username
+read -r -p "Username (lowercase, 3-32 characters): " username
 username="${username,,}"
 if [[ ! "${username}" =~ ^[a-z0-9][a-z0-9._-]{2,31}$ ]]; then
   echo "Invalid username" >&2

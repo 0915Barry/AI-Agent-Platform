@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""预热池配置：单一来源，读取并校验 config/prewarm.env。
-
-阶段 0 只提供配置解析与校验，不启动任何 VMM、TAP 或租约。``PREWARM_ENABLED=0``
-时对现有系统零影响。
-"""
+"""读取并校验 config/prewarm.env 中的预热池配置。"""
 
 from __future__ import annotations
 

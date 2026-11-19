@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""阶段 4：预热 Worker 容量决策的纯本地测试。"""
+"""预热 Worker 容量决策测试。"""
 
 import tempfile
 import unittest

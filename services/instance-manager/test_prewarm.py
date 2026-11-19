@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""预热池配置与阶段 3A 领取编排的纯本地单元测试。"""
+"""预热池配置与领取编排测试。"""
 
 import tempfile
 import unittest

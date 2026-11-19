@@ -72,7 +72,7 @@ class RuntimeStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get("agent-old")["status"], "running")
 
     def test_resolve_runtime_id_is_identity_without_binding(self) -> None:
-        """阶段 2 冷启动无绑定时，物理 runtime_id 恒等于逻辑实例 ID。"""
+        """冷启动无绑定时，物理 runtime_id 恒等于逻辑实例 ID。"""
 
         self.assertEqual(self.store.resolve_runtime_id("agent-one"), "agent-one")
 

@@ -88,8 +88,7 @@ set +e
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
 
-# 临时诊断探针：统计当前会话 JSONL 的文件数与最大字节数。
-# 输出走 stderr（串口 → Host console.log），不污染 stdout 的 RPC 协议流。
+# 会话探针写入串口，不污染 RPC 协议流。
 session_probe() {
   local stage="$1" matches=0 max_size=-1 candidate size line
   shopt -s nullglob globstar

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PrewarmStore 的本地 SQLite 单元测试（阶段 1）。"""
+"""PrewarmStore 的 SQLite 单元测试。"""
 
 import tempfile
 import threading

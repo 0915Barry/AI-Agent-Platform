@@ -1,10 +1,8 @@
 """预热项领取与激活编排。
 
-阶段 3A 先把跨表状态变化集中在这里：``PrewarmStore`` 负责预热项状态，
+``PrewarmStore`` 负责预热项状态，
 ``VolumeAttachmentStore`` 负责数据盘独占，``RuntimeStore`` 负责逻辑实例到物理
 runtime 的绑定。真实 Firecracker 热切盘由注入的 ``PrewarmActivator`` 完成。
-
-本模块不负责自动补池；``fill_if_needed``、``drain`` 和 ``reconcile`` 留给阶段 4。
 ``PREWARM_ENABLED=0`` 时领取直接返回 disabled，不改变任何数据库状态。
 """
 
@@ -27,7 +25,7 @@ class PrewarmManagerError(RuntimeError):
 
 
 class PrewarmActivator(Protocol):
-    """阶段 3B 由真实 runtime 实现的最小激活接口。"""
+    """Runtime 提供的最小预热激活接口。"""
 
     def activate_prewarmer(
         self,
@@ -282,8 +280,6 @@ class PrewarmManager:
         volume_path = str(item["volume_path"])
         if not attachment_store.release(volume_path, operation_id):
             raise PrewarmManagerError("volume attachment changed during stop cleanup")
-        # PREWARM_RACE_DIAGNOSTIC：定位旧代 stop 是否误删新代 binding；修复并完成
-        # 压力验收后可替换为正式结构化审计。
         print(
             "PREWARM_DESTRUCTIVE_ACTION actor=control-plane-stop "
             f"action=delete-binding logical={logical_instance_id} runtime={runtime_id} "
@@ -335,13 +331,10 @@ class PrewarmManager:
         return context
 
     def fill_if_needed(self) -> None:
-        """阶段 4 自动补池 Worker 才实现。"""
         raise NotImplementedError("automatic prewarm fill is not implemented yet")
 
     def drain(self) -> None:
-        """阶段 4 自动补池 Worker 才实现。"""
         raise NotImplementedError("automatic prewarm drain is not implemented yet")
 
     def reconcile(self) -> None:
-        """阶段 4 Worker 重启协调才实现。"""
         raise NotImplementedError("prewarm reconcile is not implemented yet")

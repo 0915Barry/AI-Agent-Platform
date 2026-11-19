@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""阶段 6.1：跨策略统一操作计时。
+"""跨策略统一操作计时。
 
 ``startupOperationTiming`` 是冷启动与预热命中共用的端到端计时口径。它与既有的
 ``startupTiming``（Runtime/Guest 内部诊断）并存，不改变后者的含义。
@@ -18,8 +18,6 @@ STRATEGY_PREWARM = "prewarm"
 STRATEGY_SNAPSHOT = "snapshot"
 KNOWN_STRATEGIES = (STRATEGY_COLD, STRATEGY_PREWARM, STRATEGY_SNAPSHOT)
 
-# 九个业务阶段，互不重叠的增量。不适用的阶段固定为 0，不能省略。
-# ``unattributedMs`` 是余数，不在本清单内，由 Control Plane 最终计算。
 PHASES = (
     "decisionMs",
     "claimMs",
@@ -32,14 +30,10 @@ PHASES = (
     "commitMs",
 )
 
-# 里程碑：从统一操作起点开始的累计偏移，不参与 phase 求和。
 MILESTONES = ("guestDeclaredRpcReadyMs",)
 
-# 各 phase 独立取整到毫秒，跨 9 段累计的舍入误差允许在几毫秒内。
 ROUNDING_TOLERANCE_MS = 5
 
-# 冷启动旧 ``startupTiming.host`` 阶段到统一 phase 的映射。
-# ``ensure_host_ms`` 有意不在此表：它属于 Host 前置开销，归入 unattributedMs。
 COLD_HOST_STAGE_TO_PHASE = {
     "volume_create_ms": "volumePrepareMs",
     "e2fsck_ms": "volumePrepareMs",
@@ -133,7 +127,7 @@ class StartupOperationTiming:
 
         self.strategy = strategy
         self.total_ms = total_ms
-        self.phases = normalized  # 仅九个业务阶段，不含 unattributedMs
+        self.phases = normalized
         self.unattributed_ms = compute_unattributed(total_ms, normalized)
         self.milestones = self._normalize_milestones(milestones)
 

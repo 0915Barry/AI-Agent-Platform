@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""StartupStore 启动操作代次的本地单元测试（阶段 1）。"""
+"""StartupStore 启动操作代次测试。"""
 
 import tempfile
 import unittest

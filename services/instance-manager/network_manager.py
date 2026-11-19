@@ -45,11 +45,6 @@ class NetworkRollbackFailure(NetworkFailure):
     """网络创建失败后，仍有 Linux 网络资源没有清理干净。"""
 
 
-# ---------------------------------------------------------------------------
-# 1. 租约存储接口
-# ---------------------------------------------------------------------------
-
-
 class LeaseStore:
     """租约存储的最小接口。
 
@@ -73,49 +68,34 @@ class LeaseStore:
         raise NotImplementedError
 
 
-# ---------------------------------------------------------------------------
-# 2. 租约存储实现
-# ---------------------------------------------------------------------------
-
-
 class FileLeaseStore(LeaseStore):
     """兼容旧实例的 JSON 租约存储，新受管实例不再使用。"""
 
     def __init__(self, path: Path) -> None:
-        # 仅供升级前已登记实例完成网络资源清理。
         self.path = path.resolve()
-        # 用 suffix 加个 .lock 的后缀
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
 
     @contextmanager
     def _file_lock(self):
         """在一次完整的读取或修改过程中持有独占文件锁。"""
-        # 目录/var/lib/fc/不存在就创建
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         with self.lock_path.open("a+", encoding="utf-8") as lock_file:
-            # 设置一下权限
             os.chmod(self.lock_path, 0o600)
-            # 向操作系统申请文件锁，取得打开文件的编号lock_file.fileno()，操作系统用这个编号识别文件
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
                 yield
             finally:
-                # LOCK_UN：释放锁，让等待的其他进程有机会取得锁
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _read_file(self) -> dict:
         """读取租约 JSON 文件，把内容转换成 Python 字典"""
         try:
-            # 把 JSON 字符串转换成 Python 字典
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            # 文件不存在
             return {"version": 1, "leases": {}}
         except (OSError, json.JSONDecodeError) as error:
-            # 不是json格式
             raise NetworkFailure(f"invalid network lease file: {self.path}") from error
 
-        # 判断租约的键是否有以及字典格式正确与否
         if payload.get("version") != 1 or not isinstance(payload.get("leases"), dict):
             raise NetworkFailure(f"unsupported network lease file: {self.path}")
         return payload
@@ -125,20 +105,14 @@ class FileLeaseStore(LeaseStore):
         先写临时文件再替换正式文件，避免中途退出留下半个JSON。
         实际上就是保存租约文件到硬盘中
         """
-        # tempfile.mkstemp 创建并打开一个临时文件
-        # handle: 打开文件的编号
-        # temporary_name: 临时文件的完整路径字符串
         handle, temporary_name = tempfile.mkstemp(
-            prefix=self.path.name + ".",  # 文件名前缀：network-leases.json.
-            suffix=".tmp",               # 文件名后缀：.tmp
-            dir=self.path.parent,        # 所在目录：与正式租约文件相同
+            prefix=self.path.name + ".",
+            suffix=".tmp",
+            dir=self.path.parent,
         )
-        # 转化成地址对象
         temporary_path = Path(temporary_name)
         try:
-            # 根据整数编号打开
             with os.fdopen(handle, "w", encoding="utf-8") as output:
-                # 字典转化成json
                 json.dump(payload, output, sort_keys=True, separators=(",", ":"))
                 output.write("\n")
                 output.flush()
@@ -352,56 +326,27 @@ class SQLiteLeaseStore(LeaseStore):
             )
 
 
-# ---------------------------------------------------------------------------
-# 3. 地址池计算
-# ---------------------------------------------------------------------------
-
-
 class NetworkAddressPool:
-    """
-    把一个 IPv4 地址池切分为固定大小的实例网络槽位。
-    不统计已经用了多少槽位 / 只是是初始化时算好怎么划分地址池
-    通过 build_lease() 生成某个槽位的配置
-    """
+    """把 IPv4 地址池切分为固定大小的实例网络槽位。"""
 
     def __init__(self, pool: str, prefix_length: int) -> None:
-        # 调用 Python 自带的 ipaddress 模块中的 ip_network() 函数，
-        # 把地址池字符串（如 "172.29.0.0/16"）转换成网络对象，
-        # 方便后续读取 IP 版本、前缀长度和网络起始地址；不会配置真实网络。
-        # network.version          # 4，表示 IPv4
-        # network.prefixlen        # 16，即斜杠后面的数字
-        # network.network_address  # 172.29.0.0，网络起始地址
         self.network = ipaddress.ip_network(pool)
         self.prefix_length = prefix_length
 
-        # 检查 ip 和子网掩码合规
         if self.network.version != 4:
             raise NetworkFailure("network pool must be IPv4")
         if prefix_length <= self.network.prefixlen or prefix_length > 30:
             raise NetworkFailure("network pool must contain /30-or-larger slots")
 
-
-        # 计算槽位数量
-        # 2 的 14 次方 = 16384 个槽位
         self.slot_count = 1 << (prefix_length - self.network.prefixlen)
-        # 计算每个槽位的地址数量
         self.block_size = 1 << (32 - prefix_length)
 
-    # 根据实例名字和槽位编号，生成网络配置
     def build_lease(self, instance_id: str, slot: int) -> dict:
         """根据槽位编号生成子网、Host IP、Guest IP、TAP 和 nft 表名。"""
 
-        # self.network.network_address：整个地址池的起始地址，默认是 172.29.0.0。
-        # int(...)：把 IP 地址转成整数，方便加减。
-        # slot * self.block_size：计算需要往后移动多少个地址。
         address = int(self.network.network_address) + slot * self.block_size
-        # 把算出的起始地址与前缀长度 30 组合成网络对象
         subnet = ipaddress.ip_network((address, self.prefix_length))
 
-        # 起始地址：172.29.0.4
-        # 加 1： 172.29.0.5 → Host，即 Ubuntu 宿主机
-        # 加 2： 172.29.0.6 → Guest，即 microVM
-        # subnet.network_address  得到 172.29.0.0
         host_ip = str(subnet.network_address + 1)
         guest_ip = str(subnet.network_address + 2)
 
@@ -420,11 +365,6 @@ class NetworkAddressPool:
         }
 
 
-# ---------------------------------------------------------------------------
-# 4. Linux 网络操作
-# ---------------------------------------------------------------------------
-
-
 def run_command(arguments: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     """直接执行命令，不经过 shell；测试时可以换成内存版 runner。"""
     return subprocess.run(
@@ -438,17 +378,14 @@ def run_command(arguments: list[str], *, check: bool = True) -> subprocess.Compl
 
 class LinuxNetworkDriver:
     """只负责创建和删除 Linux TAP、地址、路由及 nftables 规则。"""
-    # 记住用什么工具执行 Linux 命令，以及是否允许宿主机连接的响应
+
     def __init__(self, runner=None, *, allow_host_connections: bool = False) -> None:
         self.runner = runner or run_command
-
-        # 记住是否允许 Guest 回复宿主机主动建立的连接
         self.allow_host_connections = allow_host_connections
 
     def _resource_exists(self, arguments: list[str]) -> bool:
         """执行查询命令，判断资源是否存在"""
 
-        # arguments 是命令及参数组成的列表 ["ip", "link", "show", "dev", "fc00000000"]
         result = self.runner(arguments, check=False)
         return result.returncode == 0
 
@@ -617,11 +554,6 @@ class LinuxNetworkDriver:
         return self._find_leftovers(lease)
 
 
-# ---------------------------------------------------------------------------
-# 5. 网络租约编排
-# ---------------------------------------------------------------------------
-
-
 class NetworkManager:
     """只负责编排：分配租约、创建网络、激活租约和释放网络。"""
 
@@ -630,35 +562,28 @@ class NetworkManager:
         store: LeaseStore,
         *,
         pool: str = DEFAULT_NETWORK_POOL,
-        # 每个槽位的前缀长度
         prefix_length: int = DEFAULT_PREFIX_LENGTH,
         runner=None,
         allow_host_connections: bool = False,
     ) -> None:
-        # 记住传进来的存储工具，以后用它读取和保存租约
         self.store = store
-        # 创建地址计算器
         self.address_pool = NetworkAddressPool(pool, prefix_length)
-        # 创建 Linux 网络操作工具
         self.network = LinuxNetworkDriver(runner, allow_host_connections=allow_host_connections)
 
     def allocate(self, instance_id: str) -> dict:
         """按槽位顺序查找并预留第一个可用的 /30 网络。"""
 
-        # 先检查是不是这个实例已经有租约
         existing = self.store.get(instance_id)
         if existing is not None:
             raise NetworkFailure(
                 f"instance has an unreleased network lease: "
                 f"{instance_id} status={existing['status']}"
             )
-        # 收集 slot 成一个列表
         used_slots = {int(lease["slot"]) for lease in self.store.list()}
         for slot in range(self.address_pool.slot_count):
             if slot in used_slots:
                 continue
 
-            # 生成这个槽位的候选配置
             candidate = self.address_pool.build_lease(instance_id, slot)
             if not self.network.resources_are_free(candidate):
                 continue
@@ -677,7 +602,7 @@ class NetworkManager:
         Guest 的 IP、MAC 和虚拟网卡状态已经保存在 Firecracker 快照中，恢复时
         不能改用另一个槽位。
 
-        阶段 2A 之后，暂停时租约已保留为 ``reserved``，这里直接复用并校验一致；
+        暂停时租约保留为 ``reserved``，这里直接复用并校验一致；
         旧快照（暂停时已释放租约）则回退到重新预留原槽位，唯一约束会在槽位
         已被占用时拒绝恢复。
         """
@@ -719,7 +644,6 @@ class NetworkManager:
         """根据已经分配的租约创建真实网络，并在创建失败时处理租约记录。失败时释放租约或保留 error 记录。"""
         instance_id = str(lease["instance_id"])
         try:
-            # 真正创建网络
             self.network.create(lease, firecracker_uid, allowed_host_ports)
         except NetworkRollbackFailure:
             self.store.set_status(instance_id, "error")
@@ -739,21 +663,15 @@ class NetworkManager:
 
     def release(self, instance_id: str, *, lease: dict | None = None) -> None:
         """删除 Linux 网络资源；完全清理后再删除租约记录。"""
-        # 从租约存储中查找该实例当前使用的网络配置。
         stored_lease = self.store.get(instance_id)
-        # 这里要确认一下两个记录是不是都没有
         effective_lease = stored_lease or lease
-        # 都没有就直接返回结束
         if effective_lease is None:
             return
-        # 只要账本里有记录，就把状态从 active 改成 releasing
         if stored_lease is not None:
             self.store.set_status(instance_id, "releasing")
 
-        # 调用 Linux 网络工具删除 TAP 和防火墙表，并返回“没有删除干净的资源”。
         leftovers = self.network.remove(effective_lease)
 
-        # 看看 leftovers 里面有没有残留记录
         if leftovers:
             if stored_lease is not None:
                 self.store.set_status(instance_id, "error")

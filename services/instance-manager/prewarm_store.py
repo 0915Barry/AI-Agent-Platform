@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """预热池 ``prewarm_items`` 状态机的 SQLite 存储。
 
-阶段 1：纯数据库状态机 + 原子领取 + 条件转换。不启动 VMM、不接 Control Plane。
-只负责把并发正确性这一层做对：
+本模块不启动 VMM，也不接入 Control Plane：
 
 - 原子领取：``BEGIN IMMEDIATE`` 下 ``ready → claiming`` 只允许一个事务成功；
 - 条件转换：``transition_if_current`` 同时匹配 ``status + operation_id``，旧代次

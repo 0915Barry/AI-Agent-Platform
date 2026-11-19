@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""StartupCoordinator 的单元测试（阶段 2，用 fake runtime）。"""
+"""StartupCoordinator 的 fake Runtime 单元测试。"""
 
 import tempfile
 import unittest

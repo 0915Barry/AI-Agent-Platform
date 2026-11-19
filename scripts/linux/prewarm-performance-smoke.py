@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""阶段 6.2：冷启动 vs 预热命中的可重复 A/B 性能采样。
+"""冷启动与预热命中的可重复 A/B 性能采样。
 
 通过真实 Control Plane 交替采集冷启动与预热命中样本，每条样本记录
 ``clientObservedMs``、``startupOperationTiming.totalMs``、strategy 和分阶段计时。
@@ -452,8 +452,6 @@ def run_cycle(
     try:
         stopped = request_json(opener, "POST", f"/api/instances/{logical_id}/stop")
     except RuntimeError as error:
-        # PREWARM_RACE_DIAGNOSTIC：不要再调用会触发 reconcile 的 GET；直接在
-        # 同一 SQLite 读事务中保留各层状态，避免诊断本身继续修改现场。
         try:
             snapshot = database_snapshot(DATABASE)
             tables = snapshot.get("tables") or {}

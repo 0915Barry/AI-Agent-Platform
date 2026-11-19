@@ -291,7 +291,6 @@ class ControlPlane:
         self.agent_runtime = agent_runtime
         self.workspaces = workspaces
         self.suspended_stop_timeout_seconds = suspended_stop_timeout_seconds
-        # 统一启动协调器：记录每次启动操作的代次，并路由冷启动/快照（预热阶段 3 接入）。
         self.startup_coordinator = StartupCoordinator(
             StartupStore(self.store.database_path),
             runtime,
@@ -524,7 +523,6 @@ class ControlPlane:
             return record
         runtime_status = self.runtime.status(record["id"])
         if runtime_status is None:
-            # 临时诊断：定位预热实例 STOP 时 runtime.status 误判 None 的原因。
             try:
                 resolved = self.runtime.runtime_store.resolve_runtime_id(record["id"])
                 binding = self.runtime.runtime_store.get_binding(record["id"])
@@ -965,10 +963,6 @@ class ControlPlane:
             raise ApiError(500, "session_route_invalid", "Pi Session route is incomplete")
         try:
             self.runtime.heartbeat(instance_id)
-            # PI_SESSION_TIMING_DIAGNOSTIC_BEGIN
-            # 这段时间覆盖 Host 建立 TCP 连接、socat 启动 Guest 会话
-            # 脚本、Pi 进程启动并加载原生 Session，直到 get_messages
-            # 响应返回。它用于定位当前“打开旧会话”的等待时间。
             history_started_ns = time.monotonic_ns()
             source = self.agent_runtime.get_messages(
                 guest_ip, rpc_port, workspace_id, session_id
@@ -978,7 +972,6 @@ class ControlPlane:
                     0, (time.monotonic_ns() - history_started_ns) // 1_000_000
                 )
             }
-            # PI_SESSION_TIMING_DIAGNOSTIC_END
         except (AgentRuntimeError, RuntimeFailure, OSError) as error:
             raise ApiError(502, "session_read_failed", str(error)) from error
 
@@ -1122,7 +1115,6 @@ class ControlPlane:
                 content,
             )
             if startup_timing is not None:
-                # STARTUP_TIMING_DIAGNOSTIC: 让本次冷启动耗时先于模型事件进入 SSE。
                 self.tasks.append_event(
                     instance_id, task["id"], "startup_timing", startup_timing
                 )
@@ -1685,7 +1677,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--require-auth",
         action="store_true",
-        help="require M16 local-account sessions for every instance API",
+        help="require local-account sessions for every instance API",
     )
     return parser
 
@@ -1705,7 +1697,7 @@ def main() -> None:
     store = InstanceStore(args.database)
     auth_store = AuthStore(args.database) if args.require_auth else None
     if auth_store is not None and not auth_store.has_users():
-        raise SystemExit("no M16 user exists; run configure-user before starting the control plane")
+        raise SystemExit("no user exists; run configure-user before starting the control plane")
     tasks = TaskStore(args.database, legacy_database_path=args.task_database)
     workspaces = WorkspaceStore(args.database)
     runtime = InstanceRuntime(

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 预热池阶段1技术探针：验证「空白 Guest 等待 → PATCH /drives/data 热切盘 →
+# 验证「空白 Guest 等待 → PATCH /drives/data 热切盘 →
 # 一次性激活挂载 → Pi RPC READY」，并覆盖错误 token/UUID/重复激活/响应丢失。
 set -euo pipefail
 

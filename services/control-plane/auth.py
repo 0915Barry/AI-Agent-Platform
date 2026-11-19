@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M16 本地账户与短期会话存储。
+"""本地账户与短期会话存储。
 
 密码使用独立随机盐和 PBKDF2-SHA256；HTTP客户端只持有随机会话令牌，数据库只保存
 令牌的 SHA-256 摘要。该模块不提供公网身份系统，控制面仍必须绑定 loopback。
@@ -116,7 +116,7 @@ class AuthStore:
                     "VALUES(?,?,?,?,?,?)",
                     (user_id, username, salt, password_hash, PBKDF2_ITERATIONS, now),
                 )
-                # 首次启用 M16 时保留旧实例：尚无 owner 的记录归给首个创建的用户。
+                # 尚无 owner 的历史实例归给首个创建的用户。
                 if claim_unowned:
                     has_instances = connection.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='instances'"

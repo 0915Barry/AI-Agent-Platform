@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M16 密码、会话和旧实例归属迁移测试。"""
+"""密码、会话和历史实例归属迁移测试。"""
 
 import sqlite3
 import tempfile

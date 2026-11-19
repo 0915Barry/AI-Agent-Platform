@@ -243,7 +243,7 @@ if [[ "${forbidden_status}" != "404" ]]; then
   exit 1
 fi
 
-# M15：用模拟上游验证 SSE 字节能穿过 Gateway，而不是等完整回答后一次性返回。
+# 用模拟上游验证 SSE 字节能穿过 Gateway，而不是等完整回答后一次性返回。
 stream_response="$(
   curl --fail --silent --show-error --no-buffer --max-time 10 \
     --request POST \

@@ -1,9 +1,4 @@
-"""预热池后台 Worker 的容量决策层。
-
-阶段 4 的第一步只实现无副作用的补池计划：读取 SQLite 状态快照和 Host 容量，
-计算本轮最多可以创建多少台预热机。真实 VMM 创建、定时循环、TTL 回收与 reconcile
-将在后续小步接入，避免容量公式和资源操作同时变化。
-"""
+"""预热池后台 Worker 的容量决策与资源协调。"""
 
 from __future__ import annotations
 

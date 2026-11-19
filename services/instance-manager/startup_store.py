@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
-"""启动操作 ``startup_operations`` 代次存储。
+"""启动操作 ``startup_operations`` 的代次存储。
 
-阶段 1：只实现表与条件转换，用于审计与代次隔离。StartupCoordinator（阶段 2）
-才真正编排 ``snapshot/prewarm/cold`` 策略并调用这里的 ``begin`` / ``transition``。
-
-关键约束：同一 ``logical_instance_id`` 同时最多存在一个未结束操作
+同一 ``logical_instance_id`` 同时最多存在一个未结束操作
 （``deciding/executing/committing/compensating``）；``succeeded/failed`` 是历史
 终态，不阻止后续新操作。
 """

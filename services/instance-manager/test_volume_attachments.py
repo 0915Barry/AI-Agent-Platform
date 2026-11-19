@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VolumeAttachmentStore 数据盘独占的本地单元测试（阶段 1）。"""
+"""VolumeAttachmentStore 数据盘独占测试。"""
 
 import tempfile
 import unittest

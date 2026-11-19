@@ -117,7 +117,7 @@ fi
 if ss -H -ltn "sport = :${listen_port}" \
   | awk '{print $4}' \
   | grep -qE '^(0\.0\.0\.0|\*):'; then
-  echo "FAIL: unauthenticated M10 API is exposed on a wildcard address" >&2
+  echo "FAIL: unauthenticated API is exposed on a wildcard address" >&2
   exit 1
 fi
 
