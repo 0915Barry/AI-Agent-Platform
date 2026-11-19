@@ -584,16 +584,25 @@ def main() -> None:
             "POST",
             f"/api/instances/{duplicate_target['instanceId']}/stop",
         )
-        require(stopped_duplicate.get("status") == "stopped", "duplicate-start instance did not stop")
+        require(
+            stopped_duplicate.get("status") == "stopped",
+            "duplicate-start instance did not stop",
+        )
         require(not query_rows("runtime_bindings"), "binding remained after duplicate-start stop")
-        require(not query_rows("volume_attachments"), "attachment remained after duplicate-start stop")
+        require(
+            not query_rows("volume_attachments"),
+            "attachment remained after duplicate-start stop",
+        )
 
         for item in prewarm_store.list_ready(PROFILE_KEY):
             runtime_id = str(item["runtime_id"])
             require(prewarm_store.mark_draining(runtime_id), f"failed to drain {runtime_id}")
             cleanup_runtime(runtime, runtime_id)
             require(prewarm_store.retire(runtime_id), f"failed to retire {runtime_id}")
-        require(not query_rows("network_leases"), "network lease remained after duplicate-start cleanup")
+        require(
+            not query_rows("network_leases"),
+            "network lease remained after duplicate-start cleanup",
+        )
         for runtime_id in duplicate_ready_ids:
             require(not (JAILER_ROOT / runtime_id).exists(), f"jail remained: {runtime_id}")
             require(
@@ -605,6 +614,151 @@ def main() -> None:
             "name=duplicate-start success=1 rejected=1 status=pass"
         )
 
+        worker = start_worker(config_path, worker_log)
+        for round_number in range(1, rounds + 1):
+            wait_for_ready_exact(prewarm_store, ready_target)
+            live_started = concurrent_requests(cases, "POST", "/start")
+            all_results.extend(live_started)
+            require(
+                all(result["response"].get("status") == "running" for result in live_started),
+                "one or more live-worker starts failed",
+            )
+            live_runtime_ids = []
+            live_strategies = []
+            for result in live_started:
+                runtime_payload = result["response"].get("runtime") or {}
+                timing = runtime_payload.get("startupOperationTiming") or {}
+                runtime_id = runtime_payload.get("id")
+                require(
+                    isinstance(runtime_id, str) and runtime_id,
+                    "live-worker start omitted runtime ID",
+                )
+                require(
+                    timing.get("strategy") in {"prewarm", "cold"},
+                    "live-worker start returned an unexpected strategy",
+                )
+                require(result["latencyMs"] <= 90_000, "live-worker start exceeded 90 seconds")
+                live_runtime_ids.append(runtime_id)
+                live_strategies.append(str(timing["strategy"]))
+            require(
+                len(set(live_runtime_ids)) == users,
+                "live-worker starts reused a physical runtime",
+            )
+
+            runtime_rows = {
+                str(row["instance_id"]): row for row in query_rows("runtime_instances")
+            }
+            live_runtime_rows = [
+                runtime_rows.get(runtime_id) for runtime_id in live_runtime_ids
+            ]
+            require(
+                all(row is not None for row in live_runtime_rows),
+                "live Runtime metadata is missing",
+            )
+            require(
+                len({int(row["pid"]) for row in live_runtime_rows if row is not None}) == users,
+                "live-worker starts reused a Firecracker PID",
+            )
+            require(
+                len({str(row["volume_path"]) for row in live_runtime_rows if row is not None})
+                == users,
+                "live-worker starts reused a data volume",
+            )
+            lease_runtime_ids = {
+                str(row["instance_id"]) for row in query_rows("network_leases")
+            }
+            require(
+                set(live_runtime_ids).issubset(lease_runtime_ids),
+                "a live user runtime has no network lease",
+            )
+            prewarm_hits = live_strategies.count("prewarm")
+            require(
+                len(query_rows("runtime_bindings")) == prewarm_hits,
+                "live-worker binding count does not match prewarm hits",
+            )
+            attachments = query_rows("volume_attachments")
+            require(
+                len(attachments) == prewarm_hits,
+                "live-worker attachment count does not match prewarm hits",
+            )
+            require(
+                len({str(row["volume_path"]) for row in attachments}) == len(attachments),
+                "live-worker created duplicate volume attachments",
+            )
+            require(worker.poll() is None, "prewarm Worker exited during concurrent starts")
+
+            live_stopped = concurrent_requests(cases, "POST", "/stop")
+            all_results.extend(live_stopped)
+            require(
+                all(result["response"].get("status") == "stopped" for result in live_stopped),
+                "one or more live-worker stops failed",
+            )
+            replenished = wait_for_ready_exact(prewarm_store, ready_target)
+            replenished_ids = {str(item["runtime_id"]) for item in replenished}
+            require(worker.poll() is None, "prewarm Worker exited before replenishment")
+            require(not query_rows("runtime_bindings"), "binding remained after live-worker stop")
+            require(
+                not query_rows("volume_attachments"),
+                "attachment remained after live-worker stop",
+            )
+            active_items = [
+                item
+                for item in query_rows("prewarm_items")
+                if item["status"] in {"claiming", "assigned"}
+            ]
+            require(not active_items, "active prewarm item remained after live-worker stop")
+            stopped_instances = [
+                row
+                for row in query_rows("instances")
+                if row["id"] in {case["instanceId"] for case in cases}
+            ]
+            require(
+                len(stopped_instances) == users
+                and all(row["status"] == "stopped" for row in stopped_instances),
+                "logical instance state did not settle at stopped",
+            )
+            require(
+                {str(row["instance_id"]) for row in query_rows("network_leases")}
+                == replenished_ids,
+                "network leases do not match the replenished pool",
+            )
+            running_runtime_ids = {
+                str(row["instance_id"])
+                for row in query_rows("runtime_instances")
+                if row["status"] == "running"
+            }
+            require(
+                running_runtime_ids == replenished_ids,
+                "running Runtime metadata does not match the replenished pool",
+            )
+            for runtime_id in live_runtime_ids:
+                require(
+                    not (JAILER_ROOT / runtime_id).exists(),
+                    f"retired jail remained: {runtime_id}",
+                )
+                require(
+                    not (PLACEHOLDER_DIR / f"{runtime_id}.placeholder.ext4").exists(),
+                    f"retired placeholder remained: {runtime_id}",
+                )
+            print(
+                "PREWARM_CONCURRENCY_SCENARIO "
+                f"name=live-worker round={round_number}/{rounds} users={users} "
+                f"prewarm={prewarm_hits} cold={live_strategies.count('cold')} "
+                "pool=replenished status=pass"
+            )
+
+        stop_process(worker)
+        worker = None
+        for item in prewarm_store.list_ready(PROFILE_KEY):
+            runtime_id = str(item["runtime_id"])
+            require(prewarm_store.mark_draining(runtime_id), f"failed to drain {runtime_id}")
+            cleanup_runtime(runtime, runtime_id)
+            require(prewarm_store.retire(runtime_id), f"failed to retire {runtime_id}")
+        require(
+            not query_rows("network_leases"),
+            "network lease remained after live-worker cleanup",
+        )
+
         for case in cases:
             request_json(case["opener"], "DELETE", f"/api/instances/{case['instanceId']}")
 
@@ -612,7 +766,8 @@ def main() -> None:
         print(
             "PREWARM_CONCURRENCY_READY "
             f"users={users} ready={ready_target} rounds={rounds} "
-            "unique=verified duplicate_start=verified volume=exclusive network=clean"
+            "unique=verified duplicate_start=verified live_worker=verified "
+            "volume=exclusive network=clean pool=replenished"
         )
     except Exception as error:
         stop_process(worker)
