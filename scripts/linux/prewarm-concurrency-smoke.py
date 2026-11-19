@@ -231,7 +231,137 @@ def cleanup_runtime(runtime: InstanceRuntime, runtime_id: str) -> None:
     shutil.rmtree(JAILER_ROOT / runtime_id, ignore_errors=True)
 
 
-def archive_failure(error: Exception, results: list[dict], server_log: Path, worker_log: Path) -> Path:
+def capture_host_diagnostics() -> dict[str, str]:
+    diagnostics: dict[str, str] = {}
+    for name, path in (
+        ("loadavg.txt", Path("/proc/loadavg")),
+        ("meminfo.txt", Path("/proc/meminfo")),
+        ("proc-stat.txt", Path("/proc/stat")),
+        ("diskstats.txt", Path("/proc/diskstats")),
+        ("pressure-cpu.txt", Path("/proc/pressure/cpu")),
+        ("pressure-io.txt", Path("/proc/pressure/io")),
+        ("pressure-memory.txt", Path("/proc/pressure/memory")),
+    ):
+        try:
+            diagnostics[name] = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            diagnostics[name] = f"unavailable: {error}\n"
+
+    for name, command in (
+        ("uptime.txt", ["uptime"]),
+        ("vmstat.txt", ["vmstat", "1", "3"]),
+        (
+            "process.txt",
+            [
+                "ps",
+                "-eo",
+                "pid,ppid,user,stat,psr,pcpu,pmem,rss,vsz,etimes,args",
+                "--sort=-pcpu",
+            ],
+        ),
+        ("firecracker.txt", ["pgrep", "-af", "(^|/)firecracker( |$)"]),
+        (
+            "platform-processes.txt",
+            ["pgrep", "-af", "firecracker|jailer|socat|prewarm_worker"],
+        ),
+        ("filesystem.txt", ["df", "-h"]),
+        ("mounts.txt", ["findmnt"]),
+        ("socket-summary.txt", ["ss", "-s"]),
+        ("network.txt", ["ip", "-details", "link", "show"]),
+        ("routes.txt", ["ip", "-4", "route", "show"]),
+        ("nftables.txt", ["nft", "list", "tables"]),
+    ):
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            diagnostics[name] = (completed.stdout or "") + (completed.stderr or "")
+        except (OSError, subprocess.TimeoutExpired) as error:
+            diagnostics[name] = f"unavailable: {error}\n"
+
+    database_state: dict[str, dict] = {}
+    if DATABASE.is_file():
+        try:
+            connection = sqlite3.connect(DATABASE, timeout=10)
+            connection.row_factory = sqlite3.Row
+            try:
+                for table in (
+                    "instances",
+                    "runtime_instances",
+                    "runtime_bindings",
+                    "volume_attachments",
+                    "prewarm_items",
+                    "startup_operations",
+                    "network_leases",
+                ):
+                    columns = {
+                        str(row["name"])
+                        for row in connection.execute(f"PRAGMA table_info({table})")
+                    }
+                    total = int(
+                        connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    )
+                    states = {}
+                    if "status" in columns:
+                        states = {
+                            str(row["status"]): int(row["count"])
+                            for row in connection.execute(
+                                f"SELECT status,COUNT(*) AS count FROM {table} GROUP BY status"
+                            )
+                        }
+                    database_state[table] = {"total": total, "status": states}
+            finally:
+                connection.close()
+        except sqlite3.Error as error:
+            database_state = {"error": {"message": str(error)}}
+    diagnostics["database-state.json"] = json.dumps(
+        database_state,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    return diagnostics
+
+
+def host_pressure_summary(diagnostics: dict[str, str]) -> str:
+    def pressure(name: str) -> str:
+        for line in diagnostics.get(name, "").splitlines():
+            if not line.startswith("some "):
+                continue
+            for token in line.split():
+                if token.startswith("avg10="):
+                    return token.split("=", 1)[1]
+        return "unknown"
+
+    mem_available = "unknown"
+    for line in diagnostics.get("meminfo.txt", "").splitlines():
+        if line.startswith("MemAvailable:"):
+            mem_available = "_".join(line.split()[1:])
+            break
+    load = diagnostics.get("loadavg.txt", "").strip().split()
+    load_value = "/".join(load[:3]) if len(load) >= 3 else "unknown"
+    active_vmm = len(
+        [line for line in diagnostics.get("firecracker.txt", "").splitlines() if line.strip()]
+    )
+    return (
+        f"load={load_value} cpu_some_avg10={pressure('pressure-cpu.txt')} "
+        f"io_some_avg10={pressure('pressure-io.txt')} "
+        f"memory_some_avg10={pressure('pressure-memory.txt')} "
+        f"mem_available={mem_available} active_vmm={active_vmm}"
+    )
+
+
+def archive_failure(
+    error: Exception,
+    results: list[dict],
+    server_log: Path,
+    worker_log: Path,
+    live_diagnostics: dict[str, str],
+) -> Path:
     result_dir = RESULT_ROOT / (
         "failed-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     )
@@ -259,15 +389,38 @@ def archive_failure(error: Exception, results: list[dict], server_log: Path, wor
     for name, path in (("control-plane.log", server_log), ("worker.log", worker_log)):
         if path.exists():
             shutil.copy2(path, result_dir / name)
+    diagnostics_dir = result_dir / "host-before-stop"
+    diagnostics_dir.mkdir(mode=0o755)
+    for name, content in live_diagnostics.items():
+        (diagnostics_dir / name).write_text(content, encoding="utf-8")
     for name, command in (
-        ("process.txt", ["ps", "-eo", "pid,ppid,user,stat,lstart,args"]),
-        ("network.txt", ["ip", "-details", "link", "show"]),
-        ("nftables.txt", ["nft", "list", "tables"]),
+        ("process-after-stop.txt", ["ps", "-eo", "pid,ppid,user,stat,lstart,args"]),
+        ("network-after-stop.txt", ["ip", "-details", "link", "show"]),
+        ("nftables-after-stop.txt", ["nft", "list", "tables"]),
     ):
-        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            content = (completed.stdout or "") + (completed.stderr or "")
+        except (OSError, subprocess.TimeoutExpired) as command_error:
+            content = f"unavailable: {command_error}\n"
         (result_dir / name).write_text(
-            (completed.stdout or "") + (completed.stderr or ""), encoding="utf-8"
+            content,
+            encoding="utf-8",
         )
+    console_dir = result_dir / "guest-consoles"
+    for console_path in (STATE_ROOT / "control-plane").glob("*/console.log"):
+        console_dir.mkdir(mode=0o755, exist_ok=True)
+        try:
+            content = console_path.read_bytes()[-262_144:]
+        except OSError as console_error:
+            content = f"unavailable: {console_error}\n".encode()
+        (console_dir / f"{console_path.parent.name}.log").write_bytes(content)
     return result_dir
 
 
@@ -770,11 +923,23 @@ def main() -> None:
             "volume=exclusive network=clean pool=replenished"
         )
     except Exception as error:
+        live_diagnostics = capture_host_diagnostics()
+        print(
+            "PREWARM_CONCURRENCY_HOST_PRESSURE "
+            + host_pressure_summary(live_diagnostics),
+            file=sys.stderr,
+        )
         stop_process(worker)
         worker = None
         stop_process(server)
         server = None
-        archive = archive_failure(error, all_results, server_log, worker_log)
+        archive = archive_failure(
+            error,
+            all_results,
+            server_log,
+            worker_log,
+            live_diagnostics,
+        )
         print(f"PREWARM_CONCURRENCY_FAILURE_ARCHIVED path={archive}", file=sys.stderr)
         raise
     finally:
